@@ -225,14 +225,8 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
     all_params.extend(mixer.parameters())
     optimizer = optim.Adam(all_params, lr=lr)
     
-    # VROOM: Compile if available
-    if hasattr(torch, 'compile'):
-        try:
-            print("Compiling models...")
-            agent_q_networks = [torch.compile(net) for net in agent_q_networks]
-            mixer = torch.compile(mixer)
-        except:
-            pass
+    agent_q_networks = [torch.compile(net) for net in agent_q_networks] #blijkbaar sneller
+    mixer = torch.compile(mixer) #blijkbaar sneller
 
     epsilon = 1.0
     epsilon_min = 0.01
@@ -402,13 +396,16 @@ rewards_exp, scores_exp = train_qmix(
     mixer, 
     target_mixer, 
     replay_buffer,
-    n_episodes=300,       # Increased episodes because A100 is fast!
-    batch_size=512,        # VROOM: Saturate the GPU
-    updates_per_step=1,    # VROOM: Do more learning per game step
+    n_episodes=100,        # Try fewer episodes, see if it converges faster
+    
+    # --- A100 SETTINGS ---
+    batch_size=4096,       # Huge batch
+    lr=0.002,              # Higher LR to learn faster from the stable batch
+    # ---------------------
+    
     gamma=0.99,
-    lr=0.0005,             # Slightly lower LR often helps with large batches
-    exploration_beta=0,  # change to 0 to disable
-    exploration_type='simple' # Change to 'food' or 'teammate' for advanced parts
+    exploration_beta=0.1,
+    exploration_type='simple'
 )
 
 
