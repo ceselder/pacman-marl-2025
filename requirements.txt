@@ -1,0 +1,4 @@
+python-dotenv
+numpy
+torch==2.7.0
+matplotlib
