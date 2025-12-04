@@ -258,20 +258,24 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
                updates_per_step=1,
                shaping_weight=0.05):
     
-    # Optimizer setup (using shared network params)
-    # Since agent_q_networks[0] and [1] are the SAME object, we just take params from the first one
+    # 1. SETUP OPTIMIZER
+    # Use the shared network parameters
     all_params = list(agent_q_networks[0].parameters()) + list(mixer.parameters())
     optimizer = optim.Adam(all_params, lr=lr)
+
+    # --- NEW: LEARNING RATE SCHEDULER ---
+    # Decays the LR by 0.99 every episode.
+    # Ep 1: 0.001 -> Ep 100: 0.00036 -> Ep 500: 0.000006
+    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
+    # ------------------------------------
     
-    # # Compilation
-    # if hasattr(torch, 'compile'):
-    #     try:
-    #         # Note: We only compile the unique network instance
-    #         agent_q_networks[0] = torch.compile(agent_q_networks[0])
-    #         # Update list to point to compiled version
-    #         agent_q_networks[1] = agent_q_networks[0] 
-    #         mixer = torch.compile(mixer)
-    #     except: pass
+    # Compilation
+    if hasattr(torch, 'compile'):
+        try:
+            agent_q_networks[0] = torch.compile(agent_q_networks[0])
+            agent_q_networks[1] = agent_q_networks[0] 
+            mixer = torch.compile(mixer)
+        except: pass
 
     epsilon = 1.0
     epsilon_min = 0.01
@@ -291,7 +295,6 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
         episode_reward = 0
         score = 0
         
-        # Track previous distances for Reward Shaping
         prev_dists = {}
 
         while not all(done.values()):
@@ -302,10 +305,8 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
             for i, agent_index in enumerate(agent_indexes):
                 obs_agent = env.get_Observation(agent_index)
                 
-                # Store for Exploration + Shaping
                 if exploration_beta > 0 or shaping_weight > 0:
                     current_observations[agent_index] = obs_agent 
-                    # Calculate Distance BEFORE move
                     prev_dists[agent_index] = get_min_food_dist(obs_agent, agent_index)
 
                 state = torch.as_tensor(obs_agent, dtype=torch.float32).to(device)
@@ -325,7 +326,6 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
                 total_extra = 0.0
                 obs_curr = list(next_states.values())[agent_index]
 
-                # 1. EXPLORATION (Shared Counts)
                 if exploration_beta > 0:
                     bonus = get_exploration_bonus(current_observations[agent_index], 
                                                 visit_counts,
@@ -333,11 +333,9 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
                                                 beta=exploration_beta)
                     total_extra += bonus
                 
-                # 2. REWARD SHAPING (Manhattan Pull)
                 if shaping_weight > 0:
                     curr_dist = get_min_food_dist(obs_curr, agent_index)
                     prev_dist = prev_dists[agent_index]
-                    # Improvement = Prev - Curr. (10 -> 9 = +1 reward)
                     shaping = (prev_dist - curr_dist) * shaping_weight
                     total_extra += shaping
 
@@ -374,13 +372,20 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
                     soft_update_target_network(agent_q_networks, target_q_networks, tau=0.01)
                     soft_update_mixer(mixer, target_mixer, tau=0.01)
 
+        # --- UPDATE SCHEDULER & EPSILON ---
         epsilon = max(epsilon_min, epsilon * epsilon_decay)
+        
+        # Step the learning rate down
+        scheduler.step()
+        
         episode_rewards.append(episode_reward)
         episode_scores.append(score)
         
         if (episode + 1) % 5 == 0:
             avg_reward = np.mean(episode_rewards[-10:])
-            print(f"Episode {episode + 1}/{n_episodes} | Avg Real Reward: {avg_reward:.2f} | Epsilon: {epsilon:.3f}")
+            # Print current LR to verify it's working
+            curr_lr = scheduler.get_last_lr()[0]
+            print(f"Ep {episode + 1}/{n_episodes} | Rew: {avg_reward:.2f} | Eps: {epsilon:.3f} | LR: {curr_lr:.5f}")
     
     return episode_rewards, episode_scores
 
