@@ -214,30 +214,25 @@ def get_exploration_bonus(obs, visit_counts, beta=0.1, state_type='simple'):
     
 def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer, 
                replay_buffer, n_episodes=500, 
-               # VROOM: Increased default batch size significantly
                batch_size=512, 
                gamma=0.95, lr=0.001,
-               # code celeste for exploration
                exploration_beta=0.1, exploration_type='simple',
-               # VROOM: New param - updates per step
                updates_per_step=4):
     
-    # Single optimizer for all parameters
     all_params = []
     for net in agent_q_networks:
         all_params.extend(net.parameters())
     all_params.extend(mixer.parameters())
     optimizer = optim.Adam(all_params, lr=lr)
     
-    # VROOM: Compile the models if using PyTorch 2.0+
-    # This fuses operations and makes execution much faster on A100
+    # VROOM: Compile if available
     if hasattr(torch, 'compile'):
         try:
-            print("Compiling models for A100...")
+            print("Compiling models...")
             agent_q_networks = [torch.compile(net) for net in agent_q_networks]
             mixer = torch.compile(mixer)
-        except Exception as e:
-            print(f"Compilation failed (continuing without): {e}")
+        except:
+            pass
 
     epsilon = 1.0
     epsilon_min = 0.01
@@ -246,9 +241,7 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
     info = None
     agent_indexes = [1, 3]
     
-    # code celeste for exploration
     visit_counts = {} 
-    
     episode_rewards = []
     episode_scores = []
 
@@ -262,16 +255,17 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
             actions = [-1 for _ in env.agents]
             states = []
             
-            # code celeste for exploration
+            # Helper to store obs for exploration calculation
             current_observations = {} 
 
             for i, agent_index in enumerate(agent_indexes):
                 obs_agent = env.get_Observation(agent_index)
                 
-                # code celeste for exploration
-                current_observations[agent_index] = obs_agent 
+                # Only store if we are actually doing exploration to save CPU time
+                if exploration_beta > 0:
+                    current_observations[agent_index] = obs_agent 
 
-                state = torch.tensor(obs_agent, dtype=torch.float32).to(device)
+                state = torch.as_tensor(obs_agent, dtype=torch.float32).to(device)
                 states.append(state)
                 
                 current_legal = info["legal_actions"][agent_index] if info is not None else legal_actions
@@ -281,17 +275,19 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
             next_states, rewards, terminations, info = env.step(actions)
             score -= info["score_change"]
             done = {key: value for key, value in terminations.items() if key in agent_indexes}
-            
             episode_reward += rewards[1] + rewards[3]
 
-            # code celeste for exploration
             augmented_rewards = {}
             for agent_index in agent_indexes:
-                bonus = get_exploration_bonus(current_observations[agent_index], 
-                                              visit_counts, 
-                                              beta=exploration_beta, 
-                                              state_type=exploration_type)
-                augmented_rewards[agent_index] = rewards[agent_index] + bonus
+                # If beta is 0, skip the calculation entirely!
+                if exploration_beta > 0:
+                    bonus = get_exploration_bonus(current_observations[agent_index], 
+                                                  visit_counts, 
+                                                  beta=exploration_beta, 
+                                                  state_type=exploration_type)
+                    augmented_rewards[agent_index] = rewards[agent_index] + bonus
+                else:
+                    augmented_rewards[agent_index] = rewards[agent_index]
 
             next_states_converted = []
             rewards_converted = []
@@ -300,7 +296,6 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
 
             for index in agent_indexes:
                 next_states_converted.append(list(next_states.values())[index])
-                # code celeste for exploration
                 rewards_converted.append(augmented_rewards[index]) 
                 terminations_converted.append(terminations[index])
                 actions_converted.append(actions[index])
@@ -313,37 +308,26 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
             replay_buffer.add((states_converted, actions_converted, rewards_converted, 
                               next_states_converted, terminations_converted))
 
-            # VROOM: Optimization Logic
-            # Instead of 1 update, we do 'updates_per_step' loops.
-            # This allows the A100 to crunch data while the CPU prepares the next game step.
+            # Training steps
             if replay_buffer.size() >= batch_size:
                 for _ in range(updates_per_step):
                     batch = replay_buffer.sample(batch_size)
-                    
                     loss = compute_td_loss(agent_q_networks, target_q_networks,
                                            mixer, target_mixer, batch, gamma=gamma)
-                    
                     optimizer.zero_grad()
                     loss.backward()
-                    
                     torch.nn.utils.clip_grad_norm_(all_params, max_norm=10.0)
                     optimizer.step()
-
-                    # Soft update (doing this inside the loop makes convergence smoother)
                     soft_update_target_network(agent_q_networks, target_q_networks, tau=0.01)
                     soft_update_mixer(mixer, target_mixer, tau=0.01)
 
         epsilon = max(epsilon_min, epsilon * epsilon_decay)
-        
         episode_rewards.append(episode_reward)
         episode_scores.append(score)
         
         if (episode + 1) % 10 == 0:
             avg_reward = np.mean(episode_rewards[-10:])
-            avg_score = np.mean(episode_scores[-10:])
-            print(f"Episode {episode + 1}/{n_episodes} | "
-                  f"Avg Real Reward: {avg_reward:.2f} | Avg Score: {avg_score:.2f} | "
-                  f"Epsilon: {epsilon:.3f}")
+            print(f"Episode {episode + 1}/{n_episodes} | Avg Real Reward: {avg_reward:.2f} | Epsilon: {epsilon:.3f}")
     
     return episode_rewards, episode_scores
 
@@ -423,7 +407,7 @@ rewards_exp, scores_exp = train_qmix(
     updates_per_step=4,    # VROOM: Do more learning per game step
     gamma=0.99,
     lr=0.0005,             # Slightly lower LR often helps with large batches
-    exploration_beta=0.5,  # Adjust this (0.1 to 1.0) to see effect
+    exploration_beta=0,  # change to 0 to disable
     exploration_type='simple' # Change to 'food' or 'teammate' for advanced parts
 )
 
