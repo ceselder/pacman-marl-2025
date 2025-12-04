@@ -34,37 +34,49 @@ env = gymPacMan_parallel_env(layout_file=layout_path,
                              random_layout = False)
 env.reset()
 
+#Implemented double DQN
 class AgentQNetwork(nn.Module):
-    def __init__(self, obs_shape, action_dim, hidden_dim=128):
+    def __init__(self, obs_shape, action_dim, hidden_dim=256):
         super(AgentQNetwork, self).__init__()
 
-        # Convolutional layers
+        # We go 16 -> 32 -> 64. This helps detect complex patterns (corners, tunnels)
+        #LLM default
         self.conv1 = nn.Conv2d(obs_shape[0], 16, kernel_size=3, stride=1, padding=1)
         self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)
-        self.conv3 = nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1)
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
 
-        conv_output_shape = obs_shape[1] * obs_shape[2] * 32 # assuming obs shape (C, H, W)
-
-        # Flatten layer
+        conv_output_shape = obs_shape[1] * obs_shape[2] * 64 
         self.flatten = nn.Flatten()
 
-        # Fully connected layers
-        self.fc1 = nn.Linear(conv_output_shape, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, action_dim)
+        # Value Head (Estimates V(s)) -> Outputs 1 scalar
+        self.fc_val = nn.Sequential(
+            nn.Linear(conv_output_shape, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+        # Advantage Head (Estimates A(s, a)) -> Outputs action_dim scalars
+        self.fc_adv = nn.Sequential(
+            nn.Linear(conv_output_shape, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim)
+        )
 
     def forward(self, obs):
-        # Pass through convolutional layers
+        # Features
         x = F.relu(self.conv1(obs))
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
-
-        # Flatten the output
         x = self.flatten(x)
 
-        x = F.relu(self.fc1(x))
+        # Split
+        val = self.fc_val(x) # Shape: (Batch, 1)
+        adv = self.fc_adv(x) # Shape: (Batch, Actions)
 
-        # Output Q-values
-        q_values = self.fc2(x)
+        # Recombine: Q(s,a) = V(s) + (A(s,a) - mean(A(s,a)))
+        # The subtraction of the mean is a stability trick
+        q_values = val + adv - adv.mean(dim=1, keepdim=True)
+        
         return q_values
 
 class SimpleQMixer(nn.Module):
@@ -254,7 +266,7 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
                replay_buffer, n_episodes=500, 
                batch_size=512, 
                gamma=0.95, lr=0.001,
-               exploration_beta=0.1, exploration_type='simple',
+               exploration_beta=0.15,
                updates_per_step=4):
     
     all_params = []
@@ -435,12 +447,11 @@ rewards_exp, scores_exp = train_qmix(
     mixer, 
     target_mixer, 
     replay_buffer,
-    n_episodes=300,        # Try fewer episodes, see if it converges faster
+    n_episodes=80,        # Try fewer episodes, see if it converges faster
     batch_size=512,
-    lr=0.001,
+    lr=0.0015,
     gamma=0.99,
-    exploration_beta=1,
-    exploration_type='simple',
+    exploration_beta=0.15,
     updates_per_step=1
 )
 
