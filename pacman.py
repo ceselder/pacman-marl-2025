@@ -21,7 +21,7 @@ if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision('high')
 
-layout_name = 'tinyCapture.lay'
+layout_name = 'bloxCapture.lay'
 layout_path = os.path.join('layouts', layout_name)
 env = gymPacMan_parallel_env(layout_file=layout_path,
                              display=False,
@@ -294,7 +294,7 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
     all_params = list(agent_q_networks[0].parameters()) + list(mixer.parameters())
     optimizer = optim.Adam(all_params, lr=lr)
     
-    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_episodes, eta_min=1e-5)
     
     if hasattr(torch, 'compile'):
         try:
@@ -405,7 +405,7 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
         episode_rewards.append(episode_reward)
         episode_scores.append(score)
         
-        if (episode + 1) % 5 == 0:
+        if (episode + 1) % 10 == 0:
             avg_reward = np.mean(episode_rewards[-10:])
             print(f"Ep {episode + 1}/{n_episodes} | Rew: {avg_reward:.2f} | Eps: {epsilon:.3f} | LR: {scheduler.get_last_lr()[0]:.5f}")
     
@@ -457,12 +457,12 @@ replay_buffer = PrioritizedReplayBuffer(buffer_size=100_000, alpha=0.6)
 
 rewards_exp, scores_exp = train_qmix(
     env, agent_q_networks, target_q_networks, mixer, target_mixer, replay_buffer,
-    n_episodes=2000,
+    n_episodes=2500,
     batch_size=1024,
     lr=0.0005,
-    gamma=0.99,
+    gamma=0.999,
     updates_per_step=1,
-    exploration_beta=0.12,
+    exploration_beta=0.1,
     shaping_weight=0.01,
 )
 
