@@ -17,6 +17,11 @@ elif torch.backends.mps.is_available():
     device = torch.device("mps")
 print(f"Device: {device}")
 
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision('high')  # VROOM 'high' or 'medium' are good for A100 Tensor Cores. 'highest' is slower.
+
+
 layout_name = 'tinyCapture.lay'
 layout_path = os.path.join('layouts', layout_name)
 env = gymPacMan_parallel_env(layout_file=layout_path,
@@ -385,7 +390,7 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
             avg_reward = np.mean(episode_rewards[-10:])
             # Print current LR to verify it's working
             curr_lr = scheduler.get_last_lr()[0]
-            print(f"Ep {episode + 1}/{n_episodes} | Rew: {avg_reward:.2f} | Eps: {epsilon:.3f} | LR: {curr_lr:.5f}")
+            print(f"Ep {episode + 1}/{n_episodes} | Real average reward: {avg_reward:.2f} | Eps: {epsilon:.3f} | LR: {curr_lr:.5f}")
     
     return episode_rewards, episode_scores
 
@@ -456,8 +461,6 @@ target_mixer = SimpleQMixer(n_agents=n_agents, state_shape=obs_shape, embed_dim=
 hard_update_mixer(mixer, target_mixer)
 
 replay_buffer = ReplayBuffer(buffer_size=50_000)
-
-print("Starting Training with: Dueling DQN + Reward Shaping + Shared Parameters")
 
 rewards_exp, scores_exp = train_qmix(
     env, 
