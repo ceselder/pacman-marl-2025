@@ -409,11 +409,11 @@ rewards_exp, scores_exp = train_qmix(
     mixer, 
     target_mixer, 
     replay_buffer,
-    n_episodes=50,        # Try fewer episodes, see if it converges faster
-    batch_size=128,
-    lr=0.002,
+    n_episodes=100,        # Try fewer episodes, see if it converges faster
+    batch_size=512,
+    lr=0.001,
     gamma=0.99,
-    exploration_beta=0,
+    exploration_beta=0.15,
     exploration_type='simple',
     updates_per_step=1
 )
