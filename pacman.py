@@ -222,13 +222,10 @@ def get_exploration_bonus(obs, visit_counts, agent_index, beta=0.1):
     except:
         pass
 
-    # --- 2. Determine Target Food Count (Team Dependent) ---
-    # Blue Agents (1, 3) hunt Red Food (Channel 7)
-    # Red Agents (0, 2) hunt Blue Food (Channel 6)
+    # food reward shaping
     target_food_count = 0
     
     try:
-        print(agent_index)
         if agent_index in [1, 3]: 
             # Blue Team -> Count Channel 7 (Red Food)
             if 7 < obs.shape[0]: 
@@ -442,7 +439,7 @@ rewards_exp, scores_exp = train_qmix(
     batch_size=512,
     lr=0.001,
     gamma=0.99,
-    exploration_beta=0.25,
+    exploration_beta=1,
     exploration_type='simple',
     updates_per_step=1
 )
