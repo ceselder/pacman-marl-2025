@@ -201,29 +201,54 @@ def epsilon_greedy_action(agent_q_network, state, epsilon, legal_actions):
         action = np.random.choice(np.flatnonzero(q_values == q_values.max()))
     return action
 
-def get_exploration_bonus(obs, visit_counts, beta=0.1, state_type='simple'):
+def get_exploration_bonus(obs, visit_counts, agent_index, beta=0.1):
     """
-    code celeste for exploration
+    Unified Exploration Logic.
+    State Key = (Agent_ID, Position, Remaining_Target_Food)
+    
+    Why this works for Reward Shaping:
+    1. Moving to new spots gives a bonus (Exploration).
+    2. Eating food changes 'Remaining_Target_Food', effectively resetting 
+       the visit count for the map. This gives a fresh burst of curiosity 
+       immediately after scoring, preventing the agent from becoming lazy.
     """
+    # --- 1. Find Self Position (Always Channel 1) ---
     pos = (0, 0)
     try:
-        # friend is 4 or 1, idk
+        # Fast extraction of (y, x) from the one-hot layer
         ys, xs = np.nonzero(obs[1])
-        pos = (ys[0], xs[0])
-    except: #dead? todo
-        pos = (0, 0)
+        if len(ys) > 0:
+            pos = (int(ys[0]), int(xs[0]))
+    except:
+        pass
 
-    if state_type == 'simple':
-        key = pos
-    elif state_type == 'food':
-        food_count = int(np.sum(obs[6]) + np.sum(obs[7]))
-        key = (pos, food_count)
-    else:
-        key = pos
+    # --- 2. Determine Target Food Count (Team Dependent) ---
+    # Blue Agents (1, 3) hunt Red Food (Channel 7)
+    # Red Agents (0, 2) hunt Blue Food (Channel 6)
+    target_food_count = 0
+    
+    try:
+        if agent_index in [1, 3]: 
+            # Blue Team -> Count Channel 7 (Red Food)
+            if 7 < obs.shape[0]: 
+                target_food_count = int(np.sum(obs[7]))
+        else: 
+            # Red Team -> Count Channel 6 (Blue Food)
+            if 6 < obs.shape[0]: 
+                target_food_count = int(np.sum(obs[6]))
+    except:
+        pass
 
+    # --- 3. Construct the State Key ---
+    # We include agent_index so agents don't share their exploration memory.
+    key = (agent_index, pos, target_food_count)
+
+    # --- 4. Calculate & Update ---
+    # Retrieve current count (default 0), increment, and save back
     current_count = visit_counts.get(key, 0) + 1
     visit_counts[key] = current_count
     
+    # Return 1/sqrt(N) bonus
     return beta / np.sqrt(current_count)
 
     
@@ -289,12 +314,12 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
 
             augmented_rewards = {}
             for agent_index in agent_indexes:
-                # If beta is 0, skip the calculation entirely!
                 if exploration_beta > 0:
                     bonus = get_exploration_bonus(current_observations[agent_index], 
-                                                  visit_counts, 
-                                                  beta=exploration_beta, 
-                                                  state_type=exploration_type)
+                                                visit_counts,
+                                                agent_index, 
+                                                beta=exploration_beta)
+                    # Add to reward
                     augmented_rewards[agent_index] = rewards[agent_index] + bonus
                 else:
                     augmented_rewards[agent_index] = rewards[agent_index]
