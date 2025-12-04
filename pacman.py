@@ -9,18 +9,13 @@ from gymPacMan import gymPacMan_parallel_env
 from collections import deque
 import random
 
+# --- SETUP ---
 device = "cpu"
 if torch.cuda.is_available():
     device = torch.device("cuda:0")
 elif torch.backends.mps.is_available():
     device = torch.device("mps")
 print(f"Device: {device}")
-
-
-if torch.cuda.is_available():
-    torch.backends.cudnn.benchmark = True
-    torch.set_float32_matmul_precision('high')  # VROOM 'high' or 'medium' are good for A100 Tensor Cores. 'highest' is slower.
-
 
 layout_name = 'tinyCapture.lay'
 layout_path = os.path.join('layouts', layout_name)
@@ -34,13 +29,12 @@ env = gymPacMan_parallel_env(layout_file=layout_path,
                              random_layout = False)
 env.reset()
 
-#Implemented double DQN
+# --- DUELING DQN ARCHITECTURE ---
 class AgentQNetwork(nn.Module):
     def __init__(self, obs_shape, action_dim, hidden_dim=256):
         super(AgentQNetwork, self).__init__()
 
-        # We go 16 -> 32 -> 64. This helps detect complex patterns (corners, tunnels)
-        #LLM default
+        # Feature Extractor
         self.conv1 = nn.Conv2d(obs_shape[0], 16, kernel_size=3, stride=1, padding=1)
         self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)
         self.conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
@@ -48,14 +42,14 @@ class AgentQNetwork(nn.Module):
         conv_output_shape = obs_shape[1] * obs_shape[2] * 64 
         self.flatten = nn.Flatten()
 
-        # Value Head (Estimates V(s)) -> Outputs 1 scalar
+        # Value Head (Estimates V(s))
         self.fc_val = nn.Sequential(
             nn.Linear(conv_output_shape, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1)
         )
 
-        # Advantage Head (Estimates A(s, a)) -> Outputs action_dim scalars
+        # Advantage Head (Estimates A(s, a))
         self.fc_adv = nn.Sequential(
             nn.Linear(conv_output_shape, hidden_dim),
             nn.ReLU(),
@@ -63,20 +57,16 @@ class AgentQNetwork(nn.Module):
         )
 
     def forward(self, obs):
-        # Features
         x = F.relu(self.conv1(obs))
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
         x = self.flatten(x)
 
-        # Split
-        val = self.fc_val(x) # Shape: (Batch, 1)
-        adv = self.fc_adv(x) # Shape: (Batch, Actions)
+        val = self.fc_val(x) 
+        adv = self.fc_adv(x) 
 
-        # Recombine: Q(s,a) = V(s) + (A(s,a) - mean(A(s,a)))
-        # The subtraction of the mean is a stability trick
+        # Dueling Combination: Q = V + (A - mean(A))
         q_values = val + adv - adv.mean(dim=1, keepdim=True)
-        
         return q_values
 
 class SimpleQMixer(nn.Module):
@@ -129,11 +119,59 @@ class SimpleQMixer(nn.Module):
         
         return q_tot.view(bs, -1, 1)
 
-def compute_td_loss(agent_q_networks, target_q_networks, mixer, target_mixer, 
-                    batch, gamma=0.99):
+# --- HELPERS ---
+
+def get_min_food_dist(obs, agent_index):
+    """
+    Calculates Manhattan distance to the NEAREST target food pellet.
+    Used for Reward Shaping (Pulling the agent towards food).
+    """
+    try:
+        # 1. Find Self (Channel 1)
+        ys, xs = np.nonzero(obs[1])
+        if len(ys) == 0: return 0 
+        my_pos = np.array([ys[0], xs[0]])
+
+        # 2. Identify Target Food
+        # Blue (1,3) eats Red Food (Ch 7). Red (0,2) eats Blue Food (Ch 6)
+        target_ch = 7 if agent_index in [1, 3] else 6
+        if target_ch >= obs.shape[0]: return 0
+        
+        # 3. Find Food Pixels
+        f_ys, f_xs = np.nonzero(obs[target_ch])
+        if len(f_ys) == 0: return 0 # No food left
+        
+        # 4. Vectorized Manhattan Distance
+        food_positions = np.stack([f_ys, f_xs], axis=1)
+        # Sum of absolute differences (|dy| + |dx|)
+        dists = np.sum(np.abs(food_positions - my_pos), axis=1)
+        
+        return np.min(dists)
+    except:
+        return 0
+
+def get_exploration_bonus(obs, visit_counts, agent_index, beta=0.1):
+    """
+    Shared-Memory Count-Based Exploration.
+    Key is (Team_ID, Position).
+    """
+    pos = (0, 0)
+    try:
+        ys, xs = np.nonzero(obs[1]) # Self is Ch 1
+        if len(ys) > 0:
+            pos = (int(ys[0]), int(xs[0]))
+    except: pass
+
+    # Shared Key: Team ID (0 or 1) + Position
+    team_id = agent_index % 2
+    key = (team_id, pos)
+
+    visit_counts[key] = visit_counts.get(key, 0) + 1
+    return beta / np.sqrt(visit_counts[key])
+
+def compute_td_loss(agent_q_networks, target_q_networks, mixer, target_mixer, batch, gamma=0.99):
     states, actions, rewards, next_states, dones = batch
     
-    # Convert to tensors
     states = torch.tensor(states, dtype=torch.float32).to(device)
     actions = torch.tensor(actions, dtype=torch.long).to(device)
     rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
@@ -154,7 +192,6 @@ def compute_td_loss(agent_q_networks, target_q_networks, mixer, target_mixer,
         for agent_idx, (q_net, target_net) in enumerate(zip(agent_q_networks, target_q_networks)):
             next_q_vals = q_net(next_states[:, agent_idx])
             max_actions = next_q_vals.argmax(dim=1, keepdim=True)
-            
             target_q_vals = target_net(next_states[:, agent_idx])
             next_q_taken = target_q_vals.gather(1, max_actions)
             next_agent_q_values.append(next_q_taken)
@@ -185,6 +222,15 @@ def update_target_network(agent_q_networks, target_q_networks):
     for target, source in zip(target_q_networks, agent_q_networks):
         target.load_state_dict(source.state_dict())
 
+def epsilon_greedy_action(agent_q_network, state, epsilon, legal_actions):
+    if random.random() < epsilon:
+        action = random.choice(legal_actions)
+    else:
+        state = torch.unsqueeze(state.clone().detach(), 0).to(device)
+        q_values = agent_q_network(state).cpu().detach().numpy()
+        action = np.random.choice(np.flatnonzero(q_values == q_values.max()))
+    return action
+
 class ReplayBuffer:
     def __init__(self, buffer_size=50_000): 
         self.buffer = deque(maxlen=buffer_size)
@@ -204,79 +250,28 @@ class ReplayBuffer:
     def size(self):
         return len(self.buffer)
 
-def epsilon_greedy_action(agent_q_network, state, epsilon, legal_actions):
-    if random.random() < epsilon:
-        action = random.choice(legal_actions)
-    else:
-        state = torch.unsqueeze(state.clone().detach(), 0).to(device)
-        q_values = agent_q_network(state).cpu().detach().numpy()
-        action = np.random.choice(np.flatnonzero(q_values == q_values.max()))
-    return action
-
-def get_exploration_bonus(obs, visit_counts, agent_index, beta=0.08):
-    """
-    Unified Exploration Logic.
-    State Key = (Agent_ID, Position, Remaining_Target_Food)
-    
-    Why this works for Reward Shaping:
-    1. Moving to new spots gives a bonus (Exploration).
-    2. Eating food changes 'Remaining_Target_Food', effectively resetting 
-       the visit count for the map. This gives a fresh burst of curiosity 
-       immediately after scoring, preventing the agent from becoming lazy.
-    """
-    # --- 1. Find Self Position (Always Channel 1) ---
-    pos = (0, 0)
-    try:
-        # Fast extraction of (y, x) from the one-hot layer
-        ys, xs = np.nonzero(obs[1])
-        if len(ys) > 0:
-            pos = (int(ys[0]), int(xs[0]))
-    except:
-        pass
-
-    # # food reward shaping
-    # target_food_count = 0
-    
-    # try:
-    #     if agent_index in [1, 3]: 
-    #         # Blue Team -> Count Channel 7 (Red Food)
-    #         if 7 < obs.shape[0]: 
-    #             target_food_count = int(np.sum(obs[7]))
-    #     else: 
-    #         # Red Team -> Count Channel 6 (Blue Food)
-    #         if 6 < obs.shape[0]: 
-    #             target_food_count = int(np.sum(obs[6]))
-    # except:
-    #     pass
-
-    # --- 3. Construct the State Key ---
-    # We include agent_index so agents don't share their exploration memory.
-    key = (pos)
-
-    # --- 4. Calculate & Update ---
-    # Retrieve current count (default 0), increment, and save back
-    current_count = visit_counts.get(key, 0) + 1
-    visit_counts[key] = current_count
-    
-    # Return 1/sqrt(N) bonus
-    return beta / np.sqrt(current_count)
-
-    
 def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer, 
                replay_buffer, n_episodes=500, 
                batch_size=512, 
                gamma=0.95, lr=0.001,
-               exploration_beta=0.08,
-               updates_per_step=4):
+               exploration_beta=0.1,
+               updates_per_step=1,
+               shaping_weight=0.05):
     
-    all_params = []
-    for net in agent_q_networks:
-        all_params.extend(net.parameters())
-    all_params.extend(mixer.parameters())
+    # Optimizer setup (using shared network params)
+    # Since agent_q_networks[0] and [1] are the SAME object, we just take params from the first one
+    all_params = list(agent_q_networks[0].parameters()) + list(mixer.parameters())
     optimizer = optim.Adam(all_params, lr=lr)
     
-    agent_q_networks = [torch.compile(net) for net in agent_q_networks] #blijkbaar sneller
-    mixer = torch.compile(mixer) #blijkbaar sneller
+    # # Compilation
+    # if hasattr(torch, 'compile'):
+    #     try:
+    #         # Note: We only compile the unique network instance
+    #         agent_q_networks[0] = torch.compile(agent_q_networks[0])
+    #         # Update list to point to compiled version
+    #         agent_q_networks[1] = agent_q_networks[0] 
+    #         mixer = torch.compile(mixer)
+    #     except: pass
 
     epsilon = 1.0
     epsilon_min = 0.01
@@ -296,19 +291,22 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
         episode_reward = 0
         score = 0
         
+        # Track previous distances for Reward Shaping
+        prev_dists = {}
+
         while not all(done.values()):
             actions = [-1 for _ in env.agents]
             states = []
-            
-            # Helper to store obs for exploration calculation
             current_observations = {} 
 
             for i, agent_index in enumerate(agent_indexes):
                 obs_agent = env.get_Observation(agent_index)
                 
-                # Only store if we are actually doing exploration to save CPU time
-                if exploration_beta > 0:
+                # Store for Exploration + Shaping
+                if exploration_beta > 0 or shaping_weight > 0:
                     current_observations[agent_index] = obs_agent 
+                    # Calculate Distance BEFORE move
+                    prev_dists[agent_index] = get_min_food_dist(obs_agent, agent_index)
 
                 state = torch.as_tensor(obs_agent, dtype=torch.float32).to(device)
                 states.append(state)
@@ -324,15 +322,26 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
 
             augmented_rewards = {}
             for agent_index in agent_indexes:
+                total_extra = 0.0
+                obs_curr = list(next_states.values())[agent_index]
+
+                # 1. EXPLORATION (Shared Counts)
                 if exploration_beta > 0:
                     bonus = get_exploration_bonus(current_observations[agent_index], 
                                                 visit_counts,
                                                 agent_index, 
                                                 beta=exploration_beta)
-                    # Add to reward
-                    augmented_rewards[agent_index] = rewards[agent_index] + bonus
-                else:
-                    augmented_rewards[agent_index] = rewards[agent_index]
+                    total_extra += bonus
+                
+                # 2. REWARD SHAPING (Manhattan Pull)
+                if shaping_weight > 0:
+                    curr_dist = get_min_food_dist(obs_curr, agent_index)
+                    prev_dist = prev_dists[agent_index]
+                    # Improvement = Prev - Curr. (10 -> 9 = +1 reward)
+                    shaping = (prev_dist - curr_dist) * shaping_weight
+                    total_extra += shaping
+
+                augmented_rewards[agent_index] = rewards[agent_index] + total_extra
 
             next_states_converted = []
             rewards_converted = []
@@ -353,7 +362,6 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
             replay_buffer.add((states_converted, actions_converted, rewards_converted, 
                               next_states_converted, terminations_converted))
 
-            # Training steps
             if replay_buffer.size() >= batch_size:
                 for _ in range(updates_per_step):
                     batch = replay_buffer.sample(batch_size)
@@ -376,16 +384,17 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
     
     return episode_rewards, episode_scores
 
-
-
 def plot_training_curves(rewards, scores, filename="training_results.png", window=20):
+    # Set backend to avoid display errors on HPC
+    import matplotlib
+    matplotlib.use('Agg')
+    
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     
     def moving_avg(data, w):
         if len(data) < w: return data
         return np.convolve(data, np.ones(w)/w, mode='valid')
     
-    # Plot Rewards
     axes[0].plot(rewards, alpha=0.3, color='blue')
     if len(rewards) >= window:
         axes[0].plot(range(window-1, len(rewards)), moving_avg(rewards, window), 
@@ -396,7 +405,6 @@ def plot_training_curves(rewards, scores, filename="training_results.png", windo
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
     
-    # Plot Scores
     axes[1].plot(scores, alpha=0.3, color='green')
     if len(scores) >= window:
         axes[1].plot(range(window-1, len(scores)), moving_avg(scores, window),
@@ -408,55 +416,9 @@ def plot_training_curves(rewards, scores, filename="training_results.png", windo
     axes[1].grid(True, alpha=0.3)
     
     plt.tight_layout()
-    
-    # Save to file
     plt.savefig(filename)
     print(f"Plot saved successfully to: {os.path.abspath(filename)}")
-    plt.close(fig) # Close memory to prevent leaks
-
-n_agents = int(len(env.agents) / 2)
-action_dim_individual_agent = 5  # North, South, East, West, Stop
-
-obs_individual_agent = env.get_Observation(0)
-obs_shape = obs_individual_agent.shape
-
-# Create agent Q-networks
-agent_q_networks = [AgentQNetwork(obs_shape=obs_shape, action_dim=action_dim_individual_agent).to(device) 
-                    for _ in range(n_agents)]
-target_q_networks = [AgentQNetwork(obs_shape=obs_shape, action_dim=action_dim_individual_agent).to(device) 
-                     for _ in range(n_agents)]
-
-# Initialize target networks
-update_target_network(agent_q_networks, target_q_networks)
-
-# Create mixing networks
-mixer = SimpleQMixer(n_agents=n_agents, state_shape=obs_shape, embed_dim=32).to(device)
-target_mixer = SimpleQMixer(n_agents=n_agents, state_shape=obs_shape, embed_dim=32).to(device)
-
-# Initialize target mixer
-hard_update_mixer(mixer, target_mixer)
-
-# Create replay buffer
-replay_buffer = ReplayBuffer(buffer_size=50_000)
-
-# Train QMIX
-rewards_exp, scores_exp = train_qmix(
-    env, 
-    agent_q_networks, 
-    target_q_networks, 
-    mixer, 
-    target_mixer, 
-    replay_buffer,
-    n_episodes=80,        # Try fewer episodes, see if it converges faster
-    batch_size=512,
-    lr=0.0015,
-    gamma=0.99,
-    exploration_beta=0.08,
-    updates_per_step=1
-)
-
-
-
+    plt.close(fig)
 
 def save_models(agent_nets, mixer, filename="my_best_pacman.pt"):
     checkpoint = {
@@ -466,7 +428,47 @@ def save_models(agent_nets, mixer, filename="my_best_pacman.pt"):
     torch.save(checkpoint, filename)
     print(f"Model saved to {filename}")
 
-# Save the final model
-save_models(agent_q_networks, mixer, filename="final_model.pt")
+# --- MAIN EXECUTION BLOCK (PARAMETER SHARING) ---
 
+n_agents = int(len(env.agents) / 2)
+action_dim_individual_agent = 5
+obs_individual_agent = env.get_Observation(0)
+obs_shape = obs_individual_agent.shape
+
+# 1. PARAMETER SHARING: Create ONE network
+shared_agent = AgentQNetwork(obs_shape=obs_shape, action_dim=action_dim_individual_agent).to(device)
+shared_target = AgentQNetwork(obs_shape=obs_shape, action_dim=action_dim_individual_agent).to(device)
+shared_target.load_state_dict(shared_agent.state_dict())
+
+# 2. Create lists pointing to the SAME object
+# This means Agent 1 and Agent 3 share the exact same brain!
+agent_q_networks = [shared_agent, shared_agent]
+target_q_networks = [shared_target, shared_target]
+
+# 3. Create Mixers (These are still global/centralized)
+mixer = SimpleQMixer(n_agents=n_agents, state_shape=obs_shape, embed_dim=32).to(device)
+target_mixer = SimpleQMixer(n_agents=n_agents, state_shape=obs_shape, embed_dim=32).to(device)
+hard_update_mixer(mixer, target_mixer)
+
+replay_buffer = ReplayBuffer(buffer_size=50_000)
+
+print("Starting Training with: Dueling DQN + Reward Shaping + Shared Parameters")
+
+rewards_exp, scores_exp = train_qmix(
+    env, 
+    agent_q_networks, 
+    target_q_networks, 
+    mixer, 
+    target_mixer, 
+    replay_buffer,
+    n_episodes=100,
+    batch_size=512,
+    lr=0.0005,
+    gamma=0.99,
+    exploration_beta=0.1, # Count-based bonus weight
+    shaping_weight=0.05,   # Manhattan distance pull weight
+    updates_per_step=1
+)
+
+save_models(agent_q_networks, mixer, filename="final_model.pt")
 plot_training_curves(rewards_exp, scores_exp, filename="A100_Exploration_Run.png")
