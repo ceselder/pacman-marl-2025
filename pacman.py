@@ -213,7 +213,7 @@ def epsilon_greedy_action(agent_q_network, state, epsilon, legal_actions):
         action = np.random.choice(np.flatnonzero(q_values == q_values.max()))
     return action
 
-def get_exploration_bonus(obs, visit_counts, agent_index, beta=0.1):
+def get_exploration_bonus(obs, visit_counts, agent_index, beta=0.08):
     """
     Unified Exploration Logic.
     State Key = (Agent_ID, Position, Remaining_Target_Food)
@@ -266,7 +266,7 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
                replay_buffer, n_episodes=500, 
                batch_size=512, 
                gamma=0.95, lr=0.001,
-               exploration_beta=0.15,
+               exploration_beta=0.08,
                updates_per_step=4):
     
     all_params = []
@@ -451,7 +451,7 @@ rewards_exp, scores_exp = train_qmix(
     batch_size=512,
     lr=0.0015,
     gamma=0.99,
-    exploration_beta=0.15,
+    exploration_beta=0.08,
     updates_per_step=1
 )
 
