@@ -204,24 +204,26 @@ def epsilon_greedy_action(agent_q_network, state, epsilon, legal_actions):
 def get_exploration_bonus(obs, visit_counts, beta=0.1, state_type='simple'):
     """
     code celeste for exploration
-    Calculates exploration bonus and updates the visit_counts dictionary in-place.
     """
+    pos = (0, 0)
     try:
+        # friend is 4 or 1, idk
         ys, xs = np.nonzero(obs[4])
-        pos = (ys[0], xs[0]) if len(ys) > 0 else (0, 0)
-    except:
+        pos = (ys[0], xs[0])
+    except: #dead? todo
         pos = (0, 0)
 
     if state_type == 'simple':
         key = pos
     elif state_type == 'food':
-        food_count = int(np.sum(obs[1]))
+        food_count = int(np.sum(obs[6]) + np.sum(obs[7]))
         key = (pos, food_count)
     else:
         key = pos
 
     current_count = visit_counts.get(key, 0) + 1
     visit_counts[key] = current_count
+    
     return beta / np.sqrt(current_count)
 
     
@@ -252,7 +254,15 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
     episode_rewards = []
     episode_scores = []
 
+    debug_printed = False
+
     for episode in range(n_episodes):
+        if not debug_printed:
+            # Grab observation from the first controlled agent (usually index 1)
+            first_agent_obs = env.get_Observation(1) 
+            debug_print_observation_channels(first_agent_obs, agent_id=1)
+            debug_printed = True
+        
         done = {agent_id: False for agent_id in agent_indexes}
         env.reset()
         episode_reward = 0
@@ -410,13 +420,14 @@ rewards_exp, scores_exp = train_qmix(
     target_mixer, 
     replay_buffer,
     n_episodes=100,        # Try fewer episodes, see if it converges faster
-    batch_size=512,
+    batch_size=256,
     lr=0.001,
     gamma=0.99,
-    exploration_beta=5,
+    exploration_beta=5.0,
     exploration_type='simple',
     updates_per_step=1
 )
+
 
 
 
