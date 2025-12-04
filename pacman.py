@@ -34,24 +34,33 @@ env = gymPacMan_parallel_env(layout_file=layout_path,
                              random_layout = False)
 env.reset()
 
-class AgentQNetwork(nn.Module):
-    def __init__(self, obs_shape, action_dim, hidden_dim=128):
+class AgentQNetwork(nn.Module): #we got a100... why use stupid small network
+    def __init__(self, obs_shape, action_dim, hidden_dim=512): # 
         super(AgentQNetwork, self).__init__()
-        self.conv1 = nn.Conv2d(obs_shape[0], 16, kernel_size=3, stride=1, padding=1)
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)
-        self.conv3 = nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1)
-        conv_output_shape = obs_shape[1] * obs_shape[2] * 32 
+
+        self.conv1 = nn.Conv2d(obs_shape[0], 32, kernel_size=3, stride=1, padding=1) # 16 -> 32
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)           # 32 -> 64
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1)           # 32 -> 64
+
+        conv_output_shape = obs_shape[1] * obs_shape[2] * 64 
+
         self.flatten = nn.Flatten()
+
         self.fc1 = nn.Linear(conv_output_shape, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, action_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.fc3 = nn.Linear(hidden_dim // 2, action_dim)
 
     def forward(self, obs):
         x = F.relu(self.conv1(obs))
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
+        
         x = self.flatten(x)
+        
         x = F.relu(self.fc1(x))
-        q_values = self.fc2(x)
+        x = F.relu(self.fc2(x)) # Extra non-linearity
+        
+        q_values = self.fc3(x)
         return q_values
 
 class SimpleQMixer(nn.Module):
@@ -399,13 +408,14 @@ rewards_exp, scores_exp = train_qmix(
     n_episodes=100,        # Try fewer episodes, see if it converges faster
     
     # --- A100 SETTINGS ---
-    batch_size=64,       # Huge batch
-    lr=0.002,              # Higher LR to learn faster from the stable batch
+    batch_size=1024,       # Huge batch
+    lr=0.001,              # Higher LR to learn faster from the stable batch
     # ---------------------
     
     gamma=0.99,
     exploration_beta=0,
-    exploration_type='simple'
+    exploration_type='simple',
+    updates_per_step=1
 )
 
 
