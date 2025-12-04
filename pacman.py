@@ -35,27 +35,35 @@ env = gymPacMan_parallel_env(layout_file=layout_path,
 env.reset()
 
 class AgentQNetwork(nn.Module):
-    def __init__(self, obs_shape, action_dim, hidden_dim=32): # Tiny hidden dim
+    def __init__(self, obs_shape, action_dim, hidden_dim=128):
         super(AgentQNetwork, self).__init__()
 
-        # SINGLE Convolution layer
-        # Only 8 filters (vs 32/64 in normal models)
-        self.conv1 = nn.Conv2d(obs_shape[0], 8, kernel_size=3, stride=1, padding=1)
+        # Convolutional layers
+        self.conv1 = nn.Conv2d(obs_shape[0], 16, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)
+        self.conv3 = nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1)
 
-        # Output is just H * W * 8
-        conv_output_shape = obs_shape[1] * obs_shape[2] * 8 
+        conv_output_shape = obs_shape[1] * obs_shape[2] * 32 # assuming obs shape (C, H, W)
 
+        # Flatten layer
         self.flatten = nn.Flatten()
 
-        # Tiny Dense Layer
+        # Fully connected layers
         self.fc1 = nn.Linear(conv_output_shape, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, action_dim)
 
     def forward(self, obs):
-        # Forward pass is extremely short
+        # Pass through convolutional layers
         x = F.relu(self.conv1(obs))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+
+        # Flatten the output
         x = self.flatten(x)
+
         x = F.relu(self.fc1(x))
+
+        # Output Q-values
         q_values = self.fc2(x)
         return q_values
 
@@ -324,7 +332,7 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
         episode_rewards.append(episode_reward)
         episode_scores.append(score)
         
-        if (episode + 1) % 10 == 0:
+        if (episode + 1) % 5 == 0:
             avg_reward = np.mean(episode_rewards[-10:])
             print(f"Episode {episode + 1}/{n_episodes} | Avg Real Reward: {avg_reward:.2f} | Epsilon: {epsilon:.3f}")
     
@@ -404,7 +412,7 @@ rewards_exp, scores_exp = train_qmix(
     n_episodes=100,        # Try fewer episodes, see if it converges faster
     
     # --- A100 SETTINGS ---
-    batch_size=1024,       # Huge batch
+    batch_size=512,       # Huge batch
     lr=0.001,              # Higher LR to learn faster from the stable batch
     # ---------------------
     
@@ -414,5 +422,17 @@ rewards_exp, scores_exp = train_qmix(
     updates_per_step=1
 )
 
+
+
+def save_models(agent_nets, mixer, filename="my_best_pacman.pt"):
+    checkpoint = {
+        'agent_nets': [net.state_dict() for net in agent_nets],
+        'mixer': mixer.state_dict()
+    }
+    torch.save(checkpoint, filename)
+    print(f"Model saved to {filename}")
+
+# Save the final model
+save_models(agent_q_networks, mixer, filename="final_model.pt")
 
 plot_training_curves(rewards_exp, scores_exp, filename="A100_Exploration_Run.png")
