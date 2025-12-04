@@ -462,7 +462,7 @@ rewards_exp, scores_exp = train_qmix(
     lr=0.0005,
     gamma=0.999,
     updates_per_step=1,
-    exploration_beta=0.1,
+    exploration_beta=0.08,
     shaping_weight=0.01,
 )
 
