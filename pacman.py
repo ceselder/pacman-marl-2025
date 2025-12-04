@@ -34,33 +34,29 @@ env = gymPacMan_parallel_env(layout_file=layout_path,
                              random_layout = False)
 env.reset()
 
-class AgentQNetwork(nn.Module): #we got a100... why use stupid small network
-    def __init__(self, obs_shape, action_dim, hidden_dim=512): # 
+class AgentQNetwork(nn.Module):
+    def __init__(self, obs_shape, action_dim, hidden_dim=32): # Tiny hidden dim
         super(AgentQNetwork, self).__init__()
 
-        self.conv1 = nn.Conv2d(obs_shape[0], 32, kernel_size=3, stride=1, padding=1) # 16 -> 32
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)           # 32 -> 64
-        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1)           # 32 -> 64
+        # SINGLE Convolution layer
+        # Only 8 filters (vs 32/64 in normal models)
+        self.conv1 = nn.Conv2d(obs_shape[0], 8, kernel_size=3, stride=1, padding=1)
 
-        conv_output_shape = obs_shape[1] * obs_shape[2] * 64 
+        # Output is just H * W * 8
+        conv_output_shape = obs_shape[1] * obs_shape[2] * 8 
 
         self.flatten = nn.Flatten()
 
+        # Tiny Dense Layer
         self.fc1 = nn.Linear(conv_output_shape, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim // 2)
-        self.fc3 = nn.Linear(hidden_dim // 2, action_dim)
+        self.fc2 = nn.Linear(hidden_dim, action_dim)
 
     def forward(self, obs):
+        # Forward pass is extremely short
         x = F.relu(self.conv1(obs))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        
         x = self.flatten(x)
-        
         x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x)) # Extra non-linearity
-        
-        q_values = self.fc3(x)
+        q_values = self.fc2(x)
         return q_values
 
 class SimpleQMixer(nn.Module):
