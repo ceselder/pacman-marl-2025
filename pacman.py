@@ -1,11 +1,3 @@
-import os
-
-os.system("git init")
-os.system("git clone https://... --branch student_version")
-os.system("mv ./rl-lab-3-pacman/* ./")
-os.system("rm -rf ./rl-lab-3-pacman/")
-
-import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -20,6 +12,18 @@ if torch.cuda.is_available():
 elif torch.backends.mps.is_available():
     device = torch.device("mps")
 print(f"Device: {device}")
+
+layout_name = 'tinyCapture.lay'                       # see 'layouts/' dir for other options
+layout_path = os.path.join('layouts', layout_name)
+env = gymPacMan_parallel_env(layout_file=layout_path, # see class def for options
+                             display=False,
+                             reward_forLegalAction=True,
+                             defenceReward=False,
+                             length=299,
+                             enemieName = 'randomTeam',
+                             self_play=False,
+                             random_layout = False)
+env.reset()
 
 class AgentQNetwork(nn.Module):
     def __init__(self, obs_shape, action_dim, hidden_dim=128):
