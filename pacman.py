@@ -404,7 +404,7 @@ rewards_exp, scores_exp = train_qmix(
     replay_buffer,
     n_episodes=300,       # Increased episodes because A100 is fast!
     batch_size=512,        # VROOM: Saturate the GPU
-    updates_per_step=4,    # VROOM: Do more learning per game step
+    updates_per_step=1,    # VROOM: Do more learning per game step
     gamma=0.99,
     lr=0.0005,             # Slightly lower LR often helps with large batches
     exploration_beta=0,  # change to 0 to disable
