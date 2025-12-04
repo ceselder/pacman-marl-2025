@@ -388,9 +388,8 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
         
         if (episode + 1) % 5 == 0:
             avg_reward = np.mean(episode_rewards[-10:])
-            # Print current LR to verify it's working
             curr_lr = scheduler.get_last_lr()[0]
-            print(f"Ep {episode + 1}/{n_episodes} | Real average reward: {avg_reward:.2f} | Eps: {epsilon:.3f} | LR: {curr_lr:.5f}")
+            print(f"Ep {episode + 1}/{n_episodes} | Real average reward: {avg_reward:.2f} | Epsilon: {epsilon:.3f} | LR: {curr_lr:.5f}")
     
     return episode_rewards, episode_scores
 
@@ -438,29 +437,24 @@ def save_models(agent_nets, mixer, filename="my_best_pacman.pt"):
     torch.save(checkpoint, filename)
     print(f"Model saved to {filename}")
 
-# --- MAIN EXECUTION BLOCK (PARAMETER SHARING) ---
-
 n_agents = int(len(env.agents) / 2)
 action_dim_individual_agent = 5
 obs_individual_agent = env.get_Observation(0)
 obs_shape = obs_individual_agent.shape
 
-# 1. PARAMETER SHARING: Create ONE network
+# 1. PARAMETER SHARING: Create ONE network, why not? agents are same anyway
 shared_agent = AgentQNetwork(obs_shape=obs_shape, action_dim=action_dim_individual_agent).to(device)
 shared_target = AgentQNetwork(obs_shape=obs_shape, action_dim=action_dim_individual_agent).to(device)
 shared_target.load_state_dict(shared_agent.state_dict())
 
-# 2. Create lists pointing to the SAME object
-# This means Agent 1 and Agent 3 share the exact same brain!
 agent_q_networks = [shared_agent, shared_agent]
 target_q_networks = [shared_target, shared_target]
 
-# 3. Create Mixers (These are still global/centralized)
 mixer = SimpleQMixer(n_agents=n_agents, state_shape=obs_shape, embed_dim=32).to(device)
 target_mixer = SimpleQMixer(n_agents=n_agents, state_shape=obs_shape, embed_dim=32).to(device)
 hard_update_mixer(mixer, target_mixer)
 
-replay_buffer = ReplayBuffer(buffer_size=50_000)
+replay_buffer = ReplayBuffer(buffer_size=100_000)
 
 rewards_exp, scores_exp = train_qmix(
     env, 
@@ -469,12 +463,12 @@ rewards_exp, scores_exp = train_qmix(
     mixer, 
     target_mixer, 
     replay_buffer,
-    n_episodes=100,
-    batch_size=512,
+    n_episodes=300,
+    batch_size=1024,
     lr=0.001,
-    gamma=0.99,
-    exploration_beta=0.1, # Count-based bonus weight
-    shaping_weight=0.05,   # Manhattan distance pull weight
+    gamma=0.995,
+    exploration_beta=0.15, # Count-based bonus weight
+    shaping_weight=0.00,   # Manhattan distance pull weight
     updates_per_step=1
 )
 
