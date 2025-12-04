@@ -402,7 +402,7 @@ rewards_exp, scores_exp = train_qmix(
     mixer, 
     target_mixer, 
     replay_buffer,
-    n_episodes=1000,       # Increased episodes because A100 is fast!
+    n_episodes=300,       # Increased episodes because A100 is fast!
     batch_size=512,        # VROOM: Saturate the GPU
     updates_per_step=4,    # VROOM: Do more learning per game step
     gamma=0.99,
