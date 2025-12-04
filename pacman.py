@@ -222,24 +222,24 @@ def get_exploration_bonus(obs, visit_counts, agent_index, beta=0.1):
     except:
         pass
 
-    # food reward shaping
-    target_food_count = 0
+    # # food reward shaping
+    # target_food_count = 0
     
-    try:
-        if agent_index in [1, 3]: 
-            # Blue Team -> Count Channel 7 (Red Food)
-            if 7 < obs.shape[0]: 
-                target_food_count = int(np.sum(obs[7]))
-        else: 
-            # Red Team -> Count Channel 6 (Blue Food)
-            if 6 < obs.shape[0]: 
-                target_food_count = int(np.sum(obs[6]))
-    except:
-        pass
+    # try:
+    #     if agent_index in [1, 3]: 
+    #         # Blue Team -> Count Channel 7 (Red Food)
+    #         if 7 < obs.shape[0]: 
+    #             target_food_count = int(np.sum(obs[7]))
+    #     else: 
+    #         # Red Team -> Count Channel 6 (Blue Food)
+    #         if 6 < obs.shape[0]: 
+    #             target_food_count = int(np.sum(obs[6]))
+    # except:
+    #     pass
 
     # --- 3. Construct the State Key ---
     # We include agent_index so agents don't share their exploration memory.
-    key = (agent_index, pos, target_food_count)
+    key = (pos)
 
     # --- 4. Calculate & Update ---
     # Retrieve current count (default 0), increment, and save back
