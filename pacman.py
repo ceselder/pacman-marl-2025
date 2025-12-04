@@ -108,7 +108,7 @@ def compute_td_loss(agent_q_networks, target_q_networks, mixer, target_mixer,
                     batch, gamma=0.99):
     states, actions, rewards, next_states, dones = batch
     
-    # Move to device (fast on A100 due to high bandwidth)
+    # Convert to tensors
     states = torch.tensor(states, dtype=torch.float32).to(device)
     actions = torch.tensor(actions, dtype=torch.long).to(device)
     rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
@@ -161,7 +161,6 @@ def update_target_network(agent_q_networks, target_q_networks):
         target.load_state_dict(source.state_dict())
 
 class ReplayBuffer:
-    # VROOM: Increased buffer size default to support larger batches
     def __init__(self, buffer_size=50_000): 
         self.buffer = deque(maxlen=buffer_size)
 
@@ -386,6 +385,32 @@ def plot_training_curves(rewards, scores, filename="training_results.png", windo
     print(f"Plot saved successfully to: {os.path.abspath(filename)}")
     plt.close(fig) # Close memory to prevent leaks
 
+n_agents = int(len(env.agents) / 2)
+action_dim_individual_agent = 5  # North, South, East, West, Stop
+
+obs_individual_agent = env.get_Observation(0)
+obs_shape = obs_individual_agent.shape
+
+# Create agent Q-networks
+agent_q_networks = [AgentQNetwork(obs_shape=obs_shape, action_dim=action_dim_individual_agent).to(device) 
+                    for _ in range(n_agents)]
+target_q_networks = [AgentQNetwork(obs_shape=obs_shape, action_dim=action_dim_individual_agent).to(device) 
+                     for _ in range(n_agents)]
+
+# Initialize target networks
+update_target_network(agent_q_networks, target_q_networks)
+
+# Create mixing networks
+mixer = SimpleQMixer(n_agents=n_agents, state_shape=obs_shape, embed_dim=32).to(device)
+target_mixer = SimpleQMixer(n_agents=n_agents, state_shape=obs_shape, embed_dim=32).to(device)
+
+# Initialize target mixer
+hard_update_mixer(mixer, target_mixer)
+
+# Create replay buffer
+replay_buffer = ReplayBuffer(buffer_size=50_000)
+
+# Train QMIX
 rewards_exp, scores_exp = train_qmix(
     env, 
     agent_q_networks, 
@@ -402,7 +427,5 @@ rewards_exp, scores_exp = train_qmix(
     exploration_type='simple' # Change to 'food' or 'teammate' for advanced parts
 )
 
-# Run the plot
+
 plot_training_curves(rewards_exp, scores_exp, filename="A100_Exploration_Run.png")
-# To run it with VROOM settings:
-# train_qmix(..., batch_size=512, updates_per_step=4)
