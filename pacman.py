@@ -298,16 +298,46 @@ def soft_update_target_network(agent_q_networks, target_q_networks, tau=0.01):
             target_param.data.copy_(
                 tau * source_param.data + (1 - tau) * target_param.data
             )
-def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
-               replay_buffer, n_episodes=500, batch_size=32, gamma=0.95, lr=0.001):
+
+
+def get_exploration_bonus(obs, visit_counts, beta=0.1, state_type='simple'):
     """
-    Training loop for QMIX.
+    Calculates exploration bonus and updates the visit_counts dictionary in-place.
+    """
+    # --- 1. Extract Position (State Key) ---
+    # We assume Channel 4 is the agent (standard for this env). 
+    # np.nonzero returns indices of non-zero elements.
+    try:
+        # obs is (Channels, Height, Width). obs[4] is the agent layer.
+        ys, xs = np.nonzero(obs[4])
+        pos = (ys[0], xs[0]) if len(ys) > 0 else (0, 0)
+    except:
+        pos = (0, 0) # Fallback
+
+    # Define the key based on strategy
+    if state_type == 'simple':
+        key = pos
+    elif state_type == 'food':
+        # Channel 1 is usually food. Add food count to state.
+        food_count = int(np.sum(obs[1]))
+        key = (pos, food_count)
+    else:
+        key = pos
+
+    # --- 2. Update Counts & Calculate Bonus ---
+    # Get current count (default 0), add 1
+    current_count = visit_counts.get(key, 0) + 1
+    visit_counts[key] = current_count
+
+    # Bonus formula: beta / sqrt(count)
+    return beta / np.sqrt(current_count)
+
     
-    Key changes from IQL:
-    1. Single optimizer for both agent networks AND mixer
-    2. Single loss computed on Q_tot (not separate per-agent losses)
-    3. Must update target mixer alongside target agent networks
-    """
+def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer, 
+               replay_buffer, n_episodes=500, batch_size=32, gamma=0.95, lr=0.001,
+               # code celeste for exploration
+               exploration_beta=0.1, exploration_type='simple'):
+    
     # Single optimizer for all parameters
     all_params = []
     for net in agent_q_networks:
@@ -321,6 +351,10 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
     legal_actions = [0, 1, 2, 3, 4]
     info = None
     agent_indexes = [1, 3]  # Blue team agent indices
+    
+    # code celeste for exploration
+    # Initialize dictionary to track visits across the entire training run
+    visit_counts = {} 
     
     # For logging
     episode_rewards = []
@@ -336,9 +370,17 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
             actions = [-1 for _ in env.agents]
             states = []
             
+            # code celeste for exploration
+            # We need to store the raw numpy observations to calculate bonuses later
+            current_observations = {} 
+
             # Collect observations and select actions for each agent
             for i, agent_index in enumerate(agent_indexes):
                 obs_agent = env.get_Observation(agent_index)
+                
+                # code celeste for exploration
+                current_observations[agent_index] = obs_agent 
+
                 state = torch.tensor(obs_agent, dtype=torch.float32).to(device)
                 states.append(state)
                 
@@ -351,7 +393,23 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
             next_states, rewards, terminations, info = env.step(actions)
             score -= info["score_change"]
             done = {key: value for key, value in terminations.items() if key in agent_indexes}
-            episode_reward += rewards[1] + rewards[3]  # Sum of team rewards
+            
+            # Log the REAL reward (without bonus) for the graph
+            episode_reward += rewards[1] + rewards[3]
+
+            # code celeste for exploration
+            # --- Calculate Augmented Rewards (Real Reward + Exploration Bonus) ---
+            augmented_rewards = {}
+            for agent_index in agent_indexes:
+                # Calculate bonus using the helper function
+                bonus = get_exploration_bonus(current_observations[agent_index], 
+                                              visit_counts, 
+                                              beta=exploration_beta, 
+                                              state_type=exploration_type)
+                
+                # The agent learns from (Reward + Bonus)
+                augmented_rewards[agent_index] = rewards[agent_index] + bonus
+            # -------------------------------------------------------------------
 
             # Prepare experience for replay buffer
             next_states_converted = []
@@ -361,7 +419,11 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
 
             for index in agent_indexes:
                 next_states_converted.append(list(next_states.values())[index])
-                rewards_converted.append(rewards[index])
+                
+                # code celeste for exploration
+                # Push the AUGMENTED reward to the buffer
+                rewards_converted.append(augmented_rewards[index]) 
+                
                 terminations_converted.append(terminations[index])
                 actions_converted.append(actions[index])
 
@@ -377,7 +439,7 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
             if replay_buffer.size() >= batch_size:
                 batch = replay_buffer.sample(batch_size)
                 
-                # Compute QMIX loss (single loss for the team)
+                # Compute QMIX loss
                 loss = compute_td_loss(agent_q_networks, target_q_networks,
                                        mixer, target_mixer, batch, gamma=gamma)
                 
@@ -404,74 +466,7 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
             avg_reward = np.mean(episode_rewards[-10:])
             avg_score = np.mean(episode_scores[-10:])
             print(f"Episode {episode + 1}/{n_episodes} | "
-                  f"Avg Reward: {avg_reward:.2f} | Avg Score: {avg_score:.2f} | "
+                  f"Avg Real Reward: {avg_reward:.2f} | Avg Score: {avg_score:.2f} | "
                   f"Epsilon: {epsilon:.3f}")
     
     return episode_rewards, episode_scores
-n_agents = int(len(env.agents) / 2)
-action_dim_individual_agent = 5  # North, South, East, West, Stop
-
-obs_individual_agent = env.get_Observation(0)
-obs_shape = obs_individual_agent.shape
-
-# Create agent Q-networks
-agent_q_networks = [AgentQNetwork(obs_shape=obs_shape, action_dim=action_dim_individual_agent).to(device) 
-                    for _ in range(n_agents)]
-target_q_networks = [AgentQNetwork(obs_shape=obs_shape, action_dim=action_dim_individual_agent).to(device) 
-                     for _ in range(n_agents)]
-
-# Initialize target networks
-update_target_network(agent_q_networks, target_q_networks)
-
-# Create mixing networks
-mixer = SimpleQMixer(n_agents=n_agents, state_shape=obs_shape, embed_dim=32).to(device)
-target_mixer = SimpleQMixer(n_agents=n_agents, state_shape=obs_shape, embed_dim=32).to(device)
-
-# Initialize target mixer
-hard_update_mixer(mixer, target_mixer)
-
-# Create replay buffer
-replay_buffer = ReplayBuffer(buffer_size=10_000)
-
-# Train QMIX
-episode_rewards, episode_scores = train_qmix(
-    env, agent_q_networks, target_q_networks, 
-    mixer, target_mixer, replay_buffer,
-    n_episodes=500, batch_size=32, gamma=0.95, lr=0.001
-)
-
-
-# plot code
-def plot_training_curves(rewards, scores, window=20):
-    """Plot training progress."""
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    
-    # Smooth curves with moving average
-    def moving_avg(data, w):
-        return np.convolve(data, np.ones(w)/w, mode='valid')
-    
-    # Rewards
-    axes[0].plot(rewards, alpha=0.3, color='blue')
-    if len(rewards) >= window:
-        axes[0].plot(range(window-1, len(rewards)), moving_avg(rewards, window), 
-                     color='blue', linewidth=2, label=f'{window}-ep avg')
-    axes[0].set_xlabel('Episode')
-    axes[0].set_ylabel('Episode Reward')
-    axes[0].set_title('Training Rewards')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
-    
-    # Scores
-    axes[1].plot(scores, alpha=0.3, color='green')
-    if len(scores) >= window:
-        axes[1].plot(range(window-1, len(scores)), moving_avg(scores, window),
-                     color='green', linewidth=2, label=f'{window}-ep avg')
-    axes[1].set_xlabel('Episode')
-    axes[1].set_ylabel('Score')
-    axes[1].set_title('Training Scores')
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.show()
-
