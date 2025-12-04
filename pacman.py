@@ -409,7 +409,7 @@ rewards_exp, scores_exp = train_qmix(
     mixer, 
     target_mixer, 
     replay_buffer,
-    n_episodes=100,        # Try fewer episodes, see if it converges faster
+    n_episodes=50,        # Try fewer episodes, see if it converges faster
     
     # --- A100 SETTINGS ---
     batch_size=512,       # Huge batch
