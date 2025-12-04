@@ -228,6 +228,7 @@ def get_exploration_bonus(obs, visit_counts, agent_index, beta=0.1):
     target_food_count = 0
     
     try:
+        print(agent_index)
         if agent_index in [1, 3]: 
             # Blue Team -> Count Channel 7 (Red Food)
             if 7 < obs.shape[0]: 
