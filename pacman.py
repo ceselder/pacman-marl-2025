@@ -208,7 +208,7 @@ def get_exploration_bonus(obs, visit_counts, beta=0.1, state_type='simple'):
     pos = (0, 0)
     try:
         # friend is 4 or 1, idk
-        ys, xs = np.nonzero(obs[4])
+        ys, xs = np.nonzero(obs[1])
         pos = (ys[0], xs[0])
     except: #dead? todo
         pos = (0, 0)
@@ -254,14 +254,7 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
     episode_rewards = []
     episode_scores = []
 
-    debug_printed = False
-
     for episode in range(n_episodes):
-        if not debug_printed:
-            # Grab observation from the first controlled agent (usually index 1)
-            first_agent_obs = env.get_Observation(1) 
-            debug_print_observation_channels(first_agent_obs, agent_id=1)
-            debug_printed = True
         
         done = {agent_id: False for agent_id in agent_indexes}
         env.reset()
@@ -419,11 +412,11 @@ rewards_exp, scores_exp = train_qmix(
     mixer, 
     target_mixer, 
     replay_buffer,
-    n_episodes=100,        # Try fewer episodes, see if it converges faster
-    batch_size=256,
+    n_episodes=300,        # Try fewer episodes, see if it converges faster
+    batch_size=512,
     lr=0.001,
     gamma=0.99,
-    exploration_beta=5.0,
+    exploration_beta=0.25,
     exploration_type='simple',
     updates_per_step=1
 )
