@@ -372,7 +372,7 @@ def train_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer,
                                            mixer, target_mixer, batch, gamma=gamma)
                     optimizer.zero_grad()
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(all_params, max_norm=10.0)
+                    torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0) #changed to 1.0, LLM advice
                     optimizer.step()
                     soft_update_target_network(agent_q_networks, target_q_networks, tau=0.01)
                     soft_update_mixer(mixer, target_mixer, tau=0.01)
@@ -456,6 +456,7 @@ hard_update_mixer(mixer, target_mixer)
 
 replay_buffer = ReplayBuffer(buffer_size=100_000)
 
+    
 rewards_exp, scores_exp = train_qmix(
     env, 
     agent_q_networks, 
@@ -463,13 +464,17 @@ rewards_exp, scores_exp = train_qmix(
     mixer, 
     target_mixer, 
     replay_buffer,
-    n_episodes=300,
-    batch_size=1024,
-    lr=0.001,
-    gamma=0.995,
-    exploration_beta=0.15, # Count-based bonus weight
-    shaping_weight=0.00,   # Manhattan distance pull weight
-    updates_per_step=1
+    
+    n_episodes=2000, # big overnight run lets see
+    
+    batch_size=1024, # a100 can handle it anyway
+    lr=0.0005, # huge batch size long training run
+    gamma=0.99, # Keep standard.
+    
+    updates_per_step=1,
+    
+    exploration_beta=0.12, # subtle, itll figure it out
+    shaping_weight=0.01, # Very subtle pull (1% effect) just to guide pathing.
 )
 
 save_models(agent_q_networks, mixer, filename="final_model.pt")
