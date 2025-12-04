@@ -416,7 +416,7 @@ rewards_exp, scores_exp = train_qmix(
     lr=0.001,              # Higher LR to learn faster from the stable batch
     # ---------------------
     
-    gamma=0.99,
+    gamma=0.98,
     exploration_beta=0,
     exploration_type='simple',
     updates_per_step=1
