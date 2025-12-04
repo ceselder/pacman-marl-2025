@@ -410,14 +410,10 @@ rewards_exp, scores_exp = train_qmix(
     target_mixer, 
     replay_buffer,
     n_episodes=50,        # Try fewer episodes, see if it converges faster
-    
-    # --- A100 SETTINGS ---
-    batch_size=512,       # Huge batch
-    lr=0.001,              # Higher LR to learn faster from the stable batch
-    # ---------------------
-    
-    gamma=0.98,
-    exploration_beta=0,
+    batch_size=256,
+    lr=0.005,
+    gamma=0.99,
+    exploration_beta=0.15,
     exploration_type='simple',
     updates_per_step=1
 )
