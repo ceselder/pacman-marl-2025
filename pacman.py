@@ -468,7 +468,7 @@ rewards_exp, scores_exp = train_qmix(
     replay_buffer,
     n_episodes=100,
     batch_size=512,
-    lr=0.0005,
+    lr=0.001,
     gamma=0.99,
     exploration_beta=0.1, # Count-based bonus weight
     shaping_weight=0.05,   # Manhattan distance pull weight
