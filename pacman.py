@@ -201,7 +201,6 @@ class NaivePrioritizedBuffer:
 
 # --- HELPERS ---
 def get_min_food_dist(obs, agent_index):
-    return 0 #remove me!
     ys, xs = np.nonzero(obs[1]).tolist()[0]
     pos = (int(ys), int(xs))
     target_ch = 7 if agent_index in [1, 3] else 6 
