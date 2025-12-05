@@ -159,6 +159,8 @@ def train_ppo(env):
             
             # Check if ANY of our agents died/finished
             any_done = any([dones_dict[i] for i in agent_ids])
+            if len(any_done > 0):
+                print("someone died!")
             next_done = torch.tensor([float(any_done)] * num_agents, device=device)
             
             if any_done:
