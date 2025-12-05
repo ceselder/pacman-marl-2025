@@ -16,7 +16,7 @@ BATCH_SIZE = 256          # Smaller batches = more updates = smoother
 LR = 1.5e-4                 # Reduced
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
-CLIP_EPS = 0.17           # Reduced from 0.2 for stability
+CLIP_EPS = 0.02           # Reduced from 0.2 for stability
 ENT_COEF = 0.15           # Higher entropy for exploration
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
@@ -296,7 +296,7 @@ def train():
     
     for update in range(1, TOTAL_UPDATES + 1):
         # Random side selection
-        play_as_red = np.random.rand() > 0.5
+        play_as_red = np.random.rand() > 0.9
         if play_as_red:
             learner_ids = [0, 2]
             opponent_ids = [1, 3]
