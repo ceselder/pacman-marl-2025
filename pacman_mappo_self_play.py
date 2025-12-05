@@ -13,7 +13,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 NUM_STEPS = 2048        # Steps to collect per agent per update
 BATCH_SIZE = 256        # Minibatch size
-LR = 5e-5               # Learning Rate (Kept low for stability)
+LR = 1e-4               # Learning Rate (Kept low for stability)
 GAMMA = 0.99            # Discount factor
 GAE_LAMBDA = 0.95       # GAE parameter
 CLIP_EPS = 0.15         # PPO Clip range
@@ -226,6 +226,7 @@ def train_mappo(env, eval_env):
         # 1. Evaluate
         if update % EVAL_FREQ == 0:
             eval_score = evaluate_vs_random(agent, eval_env, num_episodes=EVAL_EPISODES)
+            print(f"score: {eval_score}")
             log['eval_reward'].append(eval_score)
         else:
             if log['eval_reward']: log['eval_reward'].append(log['eval_reward'][-1])
