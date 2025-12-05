@@ -21,7 +21,7 @@ print(f"Device: {device}")
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
 
-layout_name = 'bloxCapture.lay'
+layout_name = 'tinyCapture.lay'
 layout_path = os.path.join('layouts', layout_name)
 env = gymPacMan_parallel_env(layout_file=layout_path,
                              display=False,
@@ -551,7 +551,7 @@ replay_buffer = NaivePrioritizedBuffer(capacity=100_000, alpha=0.6)
 print("Starting Upgraded Rainbow Training (Separate Nets, 512-dim, Ortho-Init)...")
 rewards_exp, scores_exp = train_rainbow_qmix(
     env, agent_q_networks, target_q_networks, mixer, target_mixer, replay_buffer,
-    n_episodes=500,
+    n_episodes=100,
     batch_size=512,
     lr=0.0001,
     gamma=0.99,
