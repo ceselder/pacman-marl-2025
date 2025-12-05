@@ -11,7 +11,7 @@ import matplotlib as plt
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-NUM_STEPS = 1024       # Steps to collect per agent before updating
+NUM_STEPS = 2048      # Steps to collect per agent before updating
 BATCH_SIZE = 128        # Minibatch size for PPO update
 LR = 2.5e-4
 GAMMA = 0.98
@@ -241,12 +241,14 @@ def plot_training(log):
     plt.savefig('training_curves.png', dpi=150)
 
 if __name__ == "__main__":
+
     env = gymPacMan_parallel_env(
         layout_file=os.path.join('layouts', 'tinyCapture.lay'),
         display=False, reward_forLegalAction=True, defenceReward=True,
-        length=300, enemieName='randomTeam',
+        length=500, enemieName='randomTeam',
         self_play=True,  # <-- Enable self-play mode
         random_layout=False
     )
+    
     log = train_ppo_selfplay(env)
     plot_training(log)
