@@ -13,11 +13,11 @@ print(f"Using device: {device}")
 # --- Hyperparameters (more conservative) ---
 NUM_STEPS = 2048
 BATCH_SIZE = 256          # Smaller batches = more updates = smoother
-LR = 3e-4                 # Reduced from 5e-4
+LR = 2e-4                 # Reduced from 5e-4
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.15           # Reduced from 0.2 for stability
-ENT_COEF = 0.03           # Slightly lower entropy
+ENT_COEF = 0.01           # Slightly lower entropy
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
