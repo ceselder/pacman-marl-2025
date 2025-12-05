@@ -246,7 +246,7 @@ def train():
     agent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
     optimizer = torch.optim.Adam(agent.parameters(), lr=LR, eps=1e-5)
 
-    state_dict = torch.load("mappo_cehckpoint.pt", map_location=device) # load from checkpoint
+    state_dict = torch.load("mappo_checkpoint.pt", map_location=device) # load from checkpoint
     agent.load_state_dict(state_dict)
 
 
