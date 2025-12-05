@@ -7,16 +7,16 @@ from torch.distributions import Categorical
 from gymPacMan import gymPacMan_parallel_env
 from collections import deque
 import copy
-import matplotlib as plt
+import matplotlib.pyplot as plt
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 NUM_STEPS = 2048      # Steps to collect per agent before updating
 BATCH_SIZE = 128        # Minibatch size for PPO update
 LR = 2.5e-4
-GAMMA = 0.97
+GAMMA = 0.975
 GAE_LAMBDA = 0.95
-CLIP_EPS = 0.2
+CLIP_EPS = 0.15
 ENT_COEF = 0.01 #entropy penalty
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
@@ -224,7 +224,7 @@ def train_ppo_selfplay(env):
         log['entropy'].append(np.mean(entropies))
         log['clip_frac'].append(np.mean(clip_fracs))
         
-        print(f"Update {update}/{TOTAL_UPDATES} | Reward: {mean_reward:.2f} | EpRet: {mean_ep_return:.2f} | Ent: {np.mean(entropies):.3f} | Clip: {np.mean(clip_fracs):.3f}")
+        print(f"Update {update}/{TOTAL_UPDATES} | Reward: {mean_reward:.2f} | mu episodic retur : {mean_ep_return:.2f} | entropy: {np.mean(entropies):.3f} | Clip: {np.mean(clip_fracs):.3f}")
 
     torch.save(agent.state_dict(), "ppo_pacman_selfplay.pt")
     return log
