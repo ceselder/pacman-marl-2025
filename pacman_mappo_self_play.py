@@ -13,24 +13,24 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 NUM_STEPS = 2048        # Steps to collect per agent per update
 BATCH_SIZE = 256        # Minibatch size
-LR = 2e-4             # Learning Rate
-GAMMA = 0.98            # Discount factor
+LR = 5e-5               # Learning Rate (Kept low for stability)
+GAMMA = 0.99            # Discount factor
 GAE_LAMBDA = 0.95       # GAE parameter
 CLIP_EPS = 0.15         # PPO Clip range
-ENT_COEF = 0.02        # Entropy coefficient
+ENT_COEF = 0.025        # Entropy coefficient
 VF_COEF = 0.5           # Value Function coefficient
 MAX_GRAD_NORM = 0.5     # Gradient clipping
 UPDATE_EPOCHS = 5       # PPO Update epochs
-TOTAL_UPDATES = 120     # Total training iterations
+TOTAL_UPDATES = 1000    # Total training iterations (Increased to demonstrate snapshots)
 
-VALUE_HIDDEN_DIM = 512
-CRITIC_HIDDEN_DIM = 512        # Network hidden size
+HIDDEN_DIM = 512
 
 OPPONENT_UPDATE_FREQ = 10  # Add current agent to pool every N updates
 OPPONENT_POOL_SIZE = 5     # Max opponents to keep
 SELF_PLAY_PROB = 0.5       # Probability of playing against older versions
-EVAL_FREQ = 20             # Evaluate against random every N updates
+EVAL_FREQ = 10             # Evaluate against random every N updates
 EVAL_EPISODES = 5          # Number of episodes for evaluation
+SNAPSHOT_FREQ = 100        # <--- NEW: Save model every N updates
 
 # --- Agent Architecture ---
 class MAPPOAgent(nn.Module):
@@ -38,7 +38,6 @@ class MAPPOAgent(nn.Module):
         super().__init__()
         
         # --- Decentralized Actor (Local Observation) ---
-        # Input: (C, H, W) -> Output: Action logits
         self.actor_conv = nn.Sequential(
             nn.Conv2d(obs_shape[0], 32, 3, padding=1), nn.ReLU(),
             nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
@@ -51,12 +50,11 @@ class MAPPOAgent(nn.Module):
             actor_flat = self.actor_conv(dummy_obs).shape[1]
             
         self.actor = nn.Sequential(
-            nn.Linear(actor_flat, VALUE_HIDDEN_DIM), nn.ReLU(), 
-            nn.Linear(VALUE_HIDDEN_DIM, action_dim)
+            nn.Linear(actor_flat, HIDDEN_DIM), nn.ReLU(), 
+            nn.Linear(HIDDEN_DIM, action_dim)
         )
 
         # --- Centralized Critic (Global State) ---
-        # Input: (C * num_agents, H, W) -> Output: Value scalar
         critic_input_channels = obs_shape[0] * num_agents
         
         self.critic_conv = nn.Sequential(
@@ -71,12 +69,11 @@ class MAPPOAgent(nn.Module):
             critic_flat = self.critic_conv(dummy_state).shape[1]
 
         self.critic = nn.Sequential(
-            nn.Linear(critic_flat, CRITIC_HIDDEN_DIM), nn.ReLU(), 
-            nn.Linear(CRITIC_HIDDEN_DIM, 1)
+            nn.Linear(critic_flat, HIDDEN_DIM), nn.ReLU(), 
+            nn.Linear(HIDDEN_DIM, 1)
         )
 
     def get_action(self, x):
-        """Inference: Actor only (Decentralized)"""
         hidden = self.actor_conv(x)
         logits = self.actor(hidden)
         dist = Categorical(logits=logits)
@@ -84,12 +81,10 @@ class MAPPOAgent(nn.Module):
         return action, dist.log_prob(action)
 
     def get_value(self, state):
-        """Helper: Get value from Global State"""
         hidden = self.critic_conv(state)
         return self.critic(hidden).squeeze(-1)
 
     def evaluate(self, obs, state, action):
-        """Training: Get values, log_probs, and entropy"""
         a_hidden = self.actor_conv(obs)
         logits = self.actor(a_hidden)
         dist = Categorical(logits=logits)
@@ -119,37 +114,48 @@ def compute_gae(rewards, values, dones, last_value, last_done):
     return advantages, advantages + values
 
 def process_obs(obs, is_red_team): 
-    #yeah okay so they said I dont have to do this but im pretty sure if I wanna do self play I do actually
-    return obs
+    """
+    Standardizes observations:
+    1. Swaps Channels (Red Food <-> Blue Food)
+    2. Flips Board 180 (Red Position <-> Blue Position)
+    """
     if not is_red_team:
-        return obs # Blue is already default
+        return obs 
 
     new_obs = obs.clone()
     
-    # Swap Capsules: Blue(2) <-> Red(3)
-    new_obs[:, 2, :, :] = obs[:, 3, :, :]
+    # 1. Swap Channels (Color Inversion)
+    new_obs[:, 2, :, :] = obs[:, 3, :, :] # Capsules
     new_obs[:, 3, :, :] = obs[:, 2, :, :]
-    
-    # Swap Food: Blue(6) <-> Red(7)
-    new_obs[:, 6, :, :] = obs[:, 7, :, :]
+    new_obs[:, 6, :, :] = obs[:, 7, :, :] # Food
     new_obs[:, 7, :, :] = obs[:, 6, :, :]
     
-    return obs #without flipping
+    # 2. SPATIAL FLIP (180 degree rotation)
+    new_obs = torch.flip(new_obs, [2, 3])
+    
+    return new_obs
+
+def invert_actions(actions):
+    """
+    Maps actions to their 180-degree opposite.
+    0 (North) <-> 2 (South)
+    1 (East)  <-> 3 (West)
+    4 (Stop)  <-> 4 (Stop)
+    """
+    mapper = torch.tensor([2, 3, 0, 1, 4], device=actions.device)
+    return mapper[actions]
 
 def evaluate_vs_random(agent, eval_env, num_episodes=5):
     agent.eval()
     total_rewards = []
     
-    # Blue Team IDs
-    learner_ids = [1, 3]
+    learner_ids = [1, 3] # Blue
     
     for _ in range(num_episodes):
         obs_dict, _ = eval_env.reset(enemieName='randomTeam')
         
-        # Get raw observations for Blue agents
         obs = torch.stack([obs_dict[eval_env.agents[i]] for i in learner_ids]).float()
-        
-        # Blue obs do not need processing (is_red_team=False)
+        # Blue doesn't need processing
         processed_obs = process_obs(obs, is_red_team=False)
         
         done = False
@@ -157,20 +163,16 @@ def evaluate_vs_random(agent, eval_env, num_episodes=5):
         
         while not done:
             with torch.no_grad():
-                # Get action from Policy
                 actions, _ = agent.get_action(processed_obs.to(device))
                 actions = actions.cpu()
             
-            # Create Action Dictionary for Env
-            # Note: We only provide actions for [1, 3]. 
-            # The Env's internal 'randomTeam' handles [0, 2] automatically because self_play=False.
+            # Blue is naturally aligned
             env_actions = {}
             for i, ag_id in enumerate(learner_ids):
                 env_actions[eval_env.agents[ag_id]] = actions[i].item()
                 
             next_obs_dict, rewards_dict, dones_dict, _ = eval_env.step(env_actions)
             
-            # Sum reward for Blue Team
             step_reward = sum(rewards_dict[eval_env.agents[i]] for i in learner_ids)
             episode_reward += step_reward
             
@@ -183,13 +185,12 @@ def evaluate_vs_random(agent, eval_env, num_episodes=5):
         total_rewards.append(episode_reward)
         
     avg_reward = np.mean(total_rewards)
-    agent.train() # Switch back to train mode
+    agent.train()
     return avg_reward
 
 # --- Main Training Loop ---
 
 def train_mappo(env, eval_env):
-    # Initialize info
     dummy_obs = env.get_Observation(0)
     obs_shape = dummy_obs.shape
     num_agents = 2
@@ -198,11 +199,9 @@ def train_mappo(env, eval_env):
     agent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
     optimizer = torch.optim.Adam(agent.parameters(), lr=LR, eps=1e-5)
     
-    # Self-play pool
     opponent_pool = deque(maxlen=OPPONENT_POOL_SIZE)
     opponent_pool.append(copy.deepcopy(agent.state_dict()))
     
-    # Logs
     log = {
         'update': [], 'reward': [], 'eval_reward': [], 'episode_return': [],
         'pg_loss': [], 'v_loss': [], 'entropy': [], 'clip_frac': []
@@ -220,34 +219,27 @@ def train_mappo(env, eval_env):
         return opp
 
     for update in range(1, TOTAL_UPDATES + 1):
-        # 1. Evaluate periodically
+        # 1. Evaluate
         if update % EVAL_FREQ == 0:
-            print(f"--- Evaluating vs Random (Update {update}) ---")
             eval_score = evaluate_vs_random(agent, eval_env, num_episodes=EVAL_EPISODES)
             log['eval_reward'].append(eval_score)
-            print(f"    Mean Eval Reward: {eval_score:.2f}")
         else:
-            # Fill with NaN or previous to keep array lengths consistent (optional)
-            if log['eval_reward']:
-                log['eval_reward'].append(log['eval_reward'][-1])
-            else:
-                log['eval_reward'].append(0)
+            if log['eval_reward']: log['eval_reward'].append(log['eval_reward'][-1])
+            else: log['eval_reward'].append(0)
 
-        # 2. Setup Self-Play Match
+        # 2. Setup Self-Play
         opponent = get_opponent()
         
-        # I know it sais you dont have to do this but for self play im pretty sure we do
-        # for self play atleast
+        # Randomize Sides
         if np.random.rand() > 0.5:
-            train_ids = [1, 3] # We are Blue
+            train_ids = [1, 3] # Learner is Blue
             opp_ids = [0, 2]   # Opponent is Red
             is_red_learner = False
         else:
-            train_ids = [0, 2] # We are Red
+            train_ids = [0, 2] # Learner is Red
             opp_ids = [1, 3]   # Opponent is Blue
             is_red_learner = True
         
-        # Buffers
         obs_buf = torch.zeros((NUM_STEPS, num_agents, *obs_shape))
         state_buf = torch.zeros((NUM_STEPS, num_agents, *state_shape))
         actions_buf = torch.zeros((NUM_STEPS, num_agents), dtype=torch.long)
@@ -256,15 +248,13 @@ def train_mappo(env, eval_env):
         dones_buf = torch.zeros((NUM_STEPS, num_agents))
         values_buf = torch.zeros((NUM_STEPS, num_agents))
 
-        # Reset Env
         env.reset()
         
         # Initial Obs
         raw_obs = torch.stack([env.get_Observation(i) for i in train_ids]).float()
-        # Canonicalize
         next_obs = process_obs(raw_obs, is_red_team=is_red_learner)
         
-        # Create Global State (Concatenate Canonical Obs)
+        # Global State
         curr_global_state = torch.cat([next_obs[0], next_obs[1]], dim=0)
         next_state = torch.stack([curr_global_state] * num_agents) 
 
@@ -284,24 +274,37 @@ def train_mappo(env, eval_env):
             
             actions_buf[step], logprobs_buf[step], values_buf[step] = action, logprob, value
 
-            # Opponent Logic (Frozen)
+            # Learner Action Inversion (Red -> Blue logic)
+            if is_red_learner:
+                real_learner_actions = invert_actions(action)
+            else:
+                real_learner_actions = action
+
+            # Opponent Logic
             opp_raw_obs = torch.stack([env.get_Observation(i) for i in opp_ids]).float()
-            # Opponent is the OTHER team, so invert 'is_red_learner'
-            opp_obs = process_obs(opp_raw_obs, is_red_team=(not is_red_learner)).to(device)
-            opp_actions, _ = opponent.get_action(opp_obs)
-            opp_actions = opp_actions.cpu()
+            opp_is_red = not is_red_learner
+            opp_obs = process_obs(opp_raw_obs, is_red_team=opp_is_red).to(device)
+            opp_actions_net, _ = opponent.get_action(opp_obs)
+            opp_actions_net = opp_actions_net.cpu()
+
+            if opp_is_red:
+                real_opp_actions = invert_actions(opp_actions_net)
+            else:
+                real_opp_actions = opp_actions_net
 
             # Execute
             env_actions = {}
             for i, ag_id in enumerate(train_ids):
-                env_actions[env.agents[ag_id]] = action[i].item()
+                env_actions[env.agents[ag_id]] = real_learner_actions[i].item()
             for i, ag_id in enumerate(opp_ids):
-                env_actions[env.agents[ag_id]] = opp_actions[i].item()
+                env_actions[env.agents[ag_id]] = real_opp_actions[i].item()
 
             next_obs_dict, rewards_dict, dones_dict, _ = env.step(env_actions)
             
+            # --- NO REWARD SCALING HERE ---
             team_reward = sum(rewards_dict[env.agents[i]] for i in train_ids)
-            rewards_buf[step] = team_reward
+            rewards_buf[step] = team_reward 
+            
             current_ep_reward += team_reward
             
             any_done = any(dones_dict[env.agents[i]] for i in train_ids)
@@ -379,18 +382,24 @@ def train_mappo(env, eval_env):
 
         if update % OPPONENT_UPDATE_FREQ == 0:
             opponent_pool.append(copy.deepcopy(agent.state_dict()))
+            
+        # --- SNAPSHOT SAVING ---
+        if update % SNAPSHOT_FREQ == 0:
+            filename = f"mappo_pacman_update_{update}.pt"
+            torch.save(agent.state_dict(), filename)
+            print(f"--- Saved Snapshot: {filename} ---")
 
         # Console Log
         mean_reward = rewards_buf.sum().item() / num_agents
         mean_ep_return = np.mean(episode_returns[-10:]) if episode_returns else 0
+        mean_eval = log['eval_reward'][-1] if log['eval_reward'] else 0
         side = "Red" if is_red_learner else "Blue"
         
-        print(f"Update {update:3d}/{TOTAL_UPDATES} [{side:<4}] | "
-              f"Reward: {mean_reward:6.2f} | "
-              f"Mean Episodic return: {mean_ep_return:6.2f} | "
-              f"Entropy: {np.mean(entropies):.3f} | "
-              f"PLoss: {np.mean(pg_losses):6.3f} | "
-              f"VLoss: {np.mean(v_losses):6.3f} | "
+        print(f"Upd {update:3d}/{TOTAL_UPDATES} [{side:<4}] | "
+              f"Rwd: {mean_reward:6.2f} | "
+              f"EpRet: {mean_ep_return:6.2f} | "
+              f"Eval: {mean_eval:6.2f} | "
+              f"Ent: {np.mean(entropies):.3f} | "
               f"Clip: {np.mean(clip_fracs):.3f}")
 
         # Store logs
@@ -408,24 +417,20 @@ def train_mappo(env, eval_env):
 def plot_training(log):
     fig, axes = plt.subplots(2, 3, figsize=(14, 8))
     
-    # 1. Rollout Reward
     axes[0,0].plot(log['update'], log['reward'])
     axes[0,0].set_title('Rollout Reward')
     axes[0,0].set_xlabel('Update')
     
-    # 2. Episode Return vs Eval Return
     axes[0,1].plot(log['update'], log['episode_return'], label='Self-Play')
     axes[0,1].plot(log['update'], log['eval_reward'], label='vs Random', color='orange')
-    axes[0,1].set_title('Episode Return (10-ep avg)')
+    axes[0,1].set_title('Episode Return')
     axes[0,1].legend()
     axes[0,1].set_xlabel('Update')
     
-    # 3. Entropy
     axes[0,2].plot(log['update'], log['entropy'])
     axes[0,2].set_title('Entropy')
     axes[0,2].set_xlabel('Update')
     
-    # 4. Losses
     axes[1,0].plot(log['update'], log['pg_loss'])
     axes[1,0].set_title('Policy Loss')
     axes[1,0].set_xlabel('Update')
@@ -434,7 +439,6 @@ def plot_training(log):
     axes[1,1].set_title('Value Loss')
     axes[1,1].set_xlabel('Update')
     
-    # 5. Clip Fraction
     axes[1,2].plot(log['update'], log['clip_frac'])
     axes[1,2].set_title('Clip Fraction')
     axes[1,2].set_xlabel('Update')
@@ -443,7 +447,6 @@ def plot_training(log):
     plt.savefig('mappo_training_curves.png', dpi=150)
 
 if __name__ == "__main__":
-    # 1. Create Training Environment (Self-Play enabled)
     train_env = gymPacMan_parallel_env(
         layout_file=os.path.join('layouts', 'tinyCapture.lay'),
         display=False, 
@@ -451,12 +454,10 @@ if __name__ == "__main__":
         defenceReward=True,
         length=300, 
         enemieName='randomTeam',
-        self_play=True,  # Crucial for training
+        self_play=True, 
         random_layout=False
     )
     
-    # 2. Create Evaluation Environment (Self-Play disabled)
-    # This allows 'randomTeam' to control the opponent logic natively
     eval_env = gymPacMan_parallel_env(
         layout_file=os.path.join('layouts', 'tinyCapture.lay'),
         display=False,
@@ -464,11 +465,10 @@ if __name__ == "__main__":
         defenceReward=True,
         length=300,
         enemieName='randomTeam',
-        self_play=False, # Crucial for valid evaluation
+        self_play=False, 
         random_layout=False
     )
     
-    print("Starting MAPPO Training with Self-Play and Periodic Evaluation...")
+    print("Starting MAPPO Training (Spatial Flip Enabled, No Reward Scaling)...")
     log = train_mappo(train_env, eval_env)
     plot_training(log)
-    print("Training Complete.")
