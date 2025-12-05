@@ -201,30 +201,20 @@ class NaivePrioritizedBuffer:
 
 # --- HELPERS ---
 def get_min_food_dist(obs, agent_index):
-    try:
-        ys, xs = np.nonzero(obs[1]) 
-        if len(ys) == 0: return 0 
-        my_pos = np.array([ys[0], xs[0]])
-        target_ch = 7 if agent_index in [1, 3] else 6 
-        if target_ch >= obs.shape[0]: return 0
-        f_ys, f_xs = np.nonzero(obs[target_ch])
-        if len(f_ys) == 0: return 0 
-        dists = np.sum(np.abs(np.stack([f_ys, f_xs], axis=1) - my_pos), axis=1)
-        return np.min(dists)
-    except: 
-        print("issue food distance")
-        return 0
+    return 0 #remove me!
+    ys, xs = np.nonzero(obs[1]).tolist()[0]
+    pos = (int(ys), int(xs))
+    target_ch = 7 if agent_index in [1, 3] else 6 
+    print(np.nonzero(obs[target_ch]))
+    f_ys, f_xs = np.nonzero(obs[target_ch])
+    dists = np.sum(np.abs(np.stack([f_ys, f_xs], axis=1) - pos), axis=1)
+    print(np.min(dists))
+    return np.min(dists)
 
 def get_exploration_bonus(obs, visit_counts, agent_index, beta=0.1):
-    pos = (0, 0)
-    try:
-        ys, xs = np.nonzero(obs[1])
-        if len(ys) > 0: 
-            pos = (int(ys[0]), int(xs[0]))
-    except: 
-        print("issue exploration distance")
-        print(np.nonzero(obs[1]))
-        pass
+    ys, xs = np.nonzero(obs[1]).tolist()[0]
+    pos = (int(ys), int(xs)) #todo we may not even have to use ints
+
     team_id = agent_index % 2
     key = (team_id, pos)
     visit_counts[key] = visit_counts.get(key, 0) + 1
