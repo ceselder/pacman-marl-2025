@@ -26,8 +26,8 @@ TOTAL_UPDATES = 1000
 # Settings
 OPPONENT_POOL_SIZE = 5
 OPPONENT_UPDATE_FREQ = 20
-SHAPING_SCALE = 0.1
-WARMUP_UPDATES = 0
+SHAPING_SCALE = 0
+WARMUP_UPDATES = 50
 
 
 def canonicalize_obs(obs, is_red_agent):
@@ -35,17 +35,26 @@ def canonicalize_obs(obs, is_red_agent):
         return obs
     
     canon = obs.clone()
-    canon = torch.flip(canon, dims=[-1])
+    canon = torch.flip(canon, dims=[-1])  # Horizontal flip
     
     # Swap capsules: blue (2) <-> red (3)
-    temp = canon[..., 2, :, :].clone()
-    canon[..., 2, :, :] = canon[..., 3, :, :]
-    canon[..., 3, :, :] = temp
-    
-    # Swap food: blue (6) <-> red (7)
-    temp = canon[..., 6, :, :].clone()
-    canon[..., 6, :, :] = canon[..., 7, :, :]
-    canon[..., 7, :, :] = temp
+    # Handle both (C, H, W) and (1, C, H, W) shapes
+    if canon.dim() == 3:
+        temp = canon[2, :, :].clone()
+        canon[2, :, :] = canon[3, :, :]
+        canon[3, :, :] = temp
+        
+        temp = canon[6, :, :].clone()
+        canon[6, :, :] = canon[7, :, :]
+        canon[7, :, :] = temp
+    else:  # dim == 4, shape is (1, C, H, W)
+        temp = canon[:, 2, :, :].clone()
+        canon[:, 2, :, :] = canon[:, 3, :, :]
+        canon[:, 3, :, :] = temp
+        
+        temp = canon[:, 6, :, :].clone()
+        canon[:, 6, :, :] = canon[:, 7, :, :]
+        canon[:, 7, :, :] = temp
     
     return canon
 
