@@ -23,8 +23,7 @@ MAX_GRAD_NORM = 0.5     # Gradient clipping
 UPDATE_EPOCHS = 5       # PPO Update epochs
 TOTAL_UPDATES = 500     # Total training iterations
 
-VALUE_HIDDEN_DIM = 512
-CRITIC_HIDDEN_DIM = 512        # Network hidden size
+HIDDEN_DIM = 512
 
 OPPONENT_UPDATE_FREQ = 10  # Add current agent to pool every N updates
 OPPONENT_POOL_SIZE = 5     # Max opponents to keep
@@ -37,8 +36,7 @@ class MAPPOAgent(nn.Module):
     def __init__(self, obs_shape, action_dim, num_agents=2):
         super().__init__()
         
-        # --- Decentralized Actor (Local Observation) ---
-        # Input: (C, H, W) -> Output: Action logits
+        # --- Decentralized Actor ---
         self.actor_conv = nn.Sequential(
             nn.Conv2d(obs_shape[0], 32, 3, padding=1), nn.ReLU(),
             nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
@@ -51,15 +49,13 @@ class MAPPOAgent(nn.Module):
             actor_flat = self.actor_conv(dummy_obs).shape[1]
             
         self.actor = nn.Sequential(
-            nn.Linear(actor_flat, VALUE_HIDDEN_DIM), nn.ReLU(), 
-            nn.Linear(VALUE_HIDDEN_DIM, VALUE_HIDDEN_DIM), nn.ReLU(), 
-            nn.Linear(VALUE_HIDDEN_DIM, action_dim)
+            nn.Linear(actor_flat, HIDDEN_DIM),   nn.ReLU(),  # Layer 1
+            nn.Linear(HIDDEN_DIM, HIDDEN_DIM),   nn.ReLU(),  # Layer 2 (Input must match Prev Output)
+            nn.Linear(HIDDEN_DIM, action_dim)                # Output
         )
 
-        # --- Centralized Critic (Global State) ---
-        # Input: (C * num_agents, H, W) -> Output: Value scalar
+        # --- Centralized Critic ---
         critic_input_channels = obs_shape[0] * num_agents
-        
         self.critic_conv = nn.Sequential(
             nn.Conv2d(critic_input_channels, 32, 3, padding=1), nn.ReLU(),
             nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
@@ -72,36 +68,10 @@ class MAPPOAgent(nn.Module):
             critic_flat = self.critic_conv(dummy_state).shape[1]
 
         self.critic = nn.Sequential(
-            nn.Linear(critic_flat, CRITIC_HIDDEN_DIM), nn.ReLU(), 
-            nn.Linear(critic_flat, CRITIC_HIDDEN_DIM), nn.ReLU(), 
-            nn.Linear(CRITIC_HIDDEN_DIM, 1)
+            nn.Linear(critic_flat, HIDDEN_DIM),  nn.ReLU(),
+            nn.Linear(HIDDEN_DIM, HIDDEN_DIM),   nn.ReLU(),
+            nn.Linear(HIDDEN_DIM, 1)
         )
-
-    def get_action(self, x):
-        """Inference: Actor only (Decentralized)"""
-        hidden = self.actor_conv(x)
-        logits = self.actor(hidden)
-        dist = Categorical(logits=logits)
-        action = dist.sample()
-        return action, dist.log_prob(action)
-
-    def get_value(self, state):
-        """Helper: Get value from Global State"""
-        hidden = self.critic_conv(state)
-        return self.critic(hidden).squeeze(-1)
-
-    def evaluate(self, obs, state, action):
-        """Training: Get values, log_probs, and entropy"""
-        a_hidden = self.actor_conv(obs)
-        logits = self.actor(a_hidden)
-        dist = Categorical(logits=logits)
-        log_probs = dist.log_prob(action)
-        entropy = dist.entropy()
-        
-        c_hidden = self.critic_conv(state)
-        values = self.critic(c_hidden).squeeze(-1)
-        
-        return values, log_probs, entropy
 
 # --- Helper Functions ---
 
