@@ -317,9 +317,6 @@ def train():
         
         for step in range(NUM_STEPS):
                         # Add this temporarily at the start of your training loop, after reset
-            print(f"Playing as: {'Red' if play_as_red else 'Blue'}")
-            print(f"Learner IDs: {learner_ids}")
-            print(f"Agent positions: {[env.game.state.getAgentPosition(i) for i in range(4)]}")
             # Get and canonicalize observations for learner agents
             learner_obs_raw = [obs_dict[env.agents[i]].float() for i in learner_ids]
             learner_obs_canon = [canonicalize_obs(o.unsqueeze(0), play_as_red).squeeze(0) for o in learner_obs_raw]
