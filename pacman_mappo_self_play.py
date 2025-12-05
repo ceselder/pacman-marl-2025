@@ -10,14 +10,14 @@ import matplotlib.pyplot as plt
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-# --- Hyperparameters ---
+# --- Hyperparameters (more conservative) ---
 NUM_STEPS = 2048
-BATCH_SIZE = 512
-LR = 5e-4
+BATCH_SIZE = 256          # Smaller batches = more updates = smoother
+LR = 3e-4                 # Reduced from 5e-4
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
-CLIP_EPS = 0.2
-ENT_COEF = 0.05
+CLIP_EPS = 0.15           # Reduced from 0.2 for stability
+ENT_COEF = 0.03           # Slightly lower entropy
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
@@ -27,55 +27,39 @@ TOTAL_UPDATES = 1000
 OPPONENT_POOL_SIZE = 5
 OPPONENT_UPDATE_FREQ = 20
 SHAPING_SCALE = 0.1
+EVAL_FREQ = 20            # Eval every N updates
+EVAL_EPISODES = 10        # Episodes per eval
 
 
 def canonicalize_obs(obs, is_red_agent):
-    """
-    Canonicalize observation so red team sees the world as if they were blue.
-    
-    obs: tensor of shape (C, H, W) or (B, C, H, W)
-    
-    Channel layout:
-    0: walls, 1: agent_loc, 2: blue_caps, 3: red_caps, 
-    4: allies, 5: enemies, 6: blue_food, 7: red_food
-    """
+    """Canonicalize observation so red team sees the world as if they were blue."""
     if not is_red_agent:
         return obs
     
-    # Determine if batched
     is_batched = obs.dim() == 4
     if not is_batched:
-        obs = obs.unsqueeze(0)  # Add batch dim
+        obs = obs.unsqueeze(0)
     
-    # Clone and flip horizontally
     canon = torch.flip(obs.clone(), dims=[-1])
-    
-    # Swap channels: blue_caps (2) <-> red_caps (3)
-    canon[:, [2, 3], :, :] = canon[:, [3, 2], :, :]
-    
-    # Swap channels: blue_food (6) <-> red_food (7)
-    canon[:, [6, 7], :, :] = canon[:, [7, 6], :, :]
+    canon[:, [2, 3], :, :] = canon[:, [3, 2], :, :]  # Swap capsules
+    canon[:, [6, 7], :, :] = canon[:, [7, 6], :, :]  # Swap food
     
     if not is_batched:
-        canon = canon.squeeze(0)  # Remove batch dim
-    
+        canon = canon.squeeze(0)
     return canon
 
 
 def canonicalize_action(action, is_red_agent):
-    """Swap East <-> West for red team (horizontal flip)."""
+    """Swap East <-> West for red team."""
     if not is_red_agent:
         return action
-    
     if isinstance(action, torch.Tensor):
         mapper = torch.tensor([0, 3, 2, 1, 4], device=action.device)
         return mapper[action]
-    else:
-        return {0: 0, 1: 3, 2: 2, 3: 1, 4: 4}[action]
+    return {0: 0, 1: 3, 2: 2, 3: 1, 4: 4}[action]
 
 
 def get_agent_state(obs_canon):
-    """Extract agent position and carrying amount from observation."""
     agent_ch = obs_canon[1]
     locs = (agent_ch > 0).nonzero(as_tuple=False)
     if len(locs) == 0:
@@ -86,35 +70,28 @@ def get_agent_state(obs_canon):
 
 
 def compute_heuristic_shaping(obs_curr, obs_next):
-    """Distance-based shaping. Returns improvement in distance to target."""
     pos_curr, carry_curr = get_agent_state(obs_curr)
     pos_next, carry_next = get_agent_state(obs_next)
     
     if pos_curr is None or pos_next is None:
         return 0.0
-    
-    # No shaping on state transitions (eating/scoring) - env handles these
     if carry_next > carry_curr or (carry_curr > 0 and carry_next == 0):
         return 0.0
 
     if carry_curr > 0:
-        # Go home (left side, x=0)
         dist_curr = pos_curr[1]
         dist_next = pos_next[1]
     else:
-        # Hunt food (channel 7 = enemy food in canonical view)
         food_ch = obs_curr[7]
         food_locs = (food_ch > 0).nonzero(as_tuple=False).float()
         if len(food_locs) == 0:
             return 0.0
-        
         curr_p = torch.tensor(pos_curr).float()
         next_p = torch.tensor(pos_next).float()
-        
         dist_curr = (food_locs - curr_p).abs().sum(dim=1).min().item()
         dist_next = (food_locs - next_p).abs().sum(dim=1).min().item()
 
-    return dist_curr - dist_next  # Positive if we got closer
+    return dist_curr - dist_next
 
 
 class MAPPOAgent(nn.Module):
@@ -170,6 +147,13 @@ class MAPPOAgent(nn.Module):
         joint_feat = torch.cat(all_feats, dim=1)
         value = self.critic(joint_feat).squeeze(-1)
         return value, log_prob, entropy
+    
+    def get_deterministic_action(self, obs):
+        """Get greedy action for evaluation."""
+        with torch.no_grad():
+            h = self.conv(obs)
+            logits = self.actor(h)
+            return logits.argmax(dim=-1)
 
 
 def compute_gae(rewards, values, dones, last_value):
@@ -183,42 +167,53 @@ def compute_gae(rewards, values, dones, last_value):
         else:
             next_val = values[t + 1]
             next_nonterm = 1.0 - dones[t]
-        
         delta = rewards[t] + GAMMA * next_val * next_nonterm - values[t]
         advantages[t] = lastgaelam = delta + GAMMA * GAE_LAMBDA * next_nonterm * lastgaelam
     return advantages, advantages + values
 
 
-def debug_obs(env, learner_ids, play_as_red):
-    """Print debug info about observations - call once per update."""
-    print(f"\n{'='*60}")
-    print(f"DEBUG: Playing as {'RED' if play_as_red else 'BLUE'}")
-    print(f"Learner IDs: {learner_ids}")
+def evaluate_vs_random(agent, env, num_episodes=10):
+    """Evaluate agent playing as blue vs random red."""
+    agent.eval()
+    returns = []
+    wins = 0
     
-    positions = [env.game.state.getAgentPosition(i) for i in range(4)]
-    print(f"Agent positions (x,y): {positions}")
+    learner_ids = [1, 3]
+    opponent_ids = [0, 2]
     
-    raw_obs = env.get_Observation(learner_ids[0]).float()
-    canon_obs = canonicalize_obs(raw_obs, play_as_red)
+    for _ in range(num_episodes):
+        obs_dict, info = env.reset()
+        episode_return = 0
+        done = False
+        
+        while not done:
+            # Get learner observations (no canonicalization needed - playing blue)
+            learner_obs = torch.stack([obs_dict[env.agents[i]].float() for i in learner_ids])
+            
+            # Deterministic actions for eval
+            with torch.no_grad():
+                actions = agent.get_deterministic_action(learner_obs.to(device)).cpu()
+            
+            # Random opponent actions
+            env_actions = {}
+            for i, aid in enumerate(learner_ids):
+                env_actions[env.agents[aid]] = actions[i].item()
+            for aid in opponent_ids:
+                legal = info['legal_actions'][env.agents[aid]]
+                env_actions[env.agents[aid]] = np.random.choice(legal)
+            
+            obs_dict, rewards, dones, info = env.step(env_actions)
+            episode_return += sum(rewards[env.agents[i]] for i in learner_ids)
+            done = any(dones.values())
+        
+        returns.append(episode_return)
+        # Win if positive score (simplified)
+        final_score = env.game.state.data.score
+        if final_score > 0:  # Blue (our team) winning
+            wins += 1
     
-    channel_names = ['walls', 'agent_loc', 'blue_caps', 'red_caps', 'allies', 'enemies', 'blue_food', 'red_food']
-    
-    print(f"\nRaw obs (agent {learner_ids[0]}):")
-    for i, name in enumerate(channel_names):
-        locs = (raw_obs[i] > 0).nonzero(as_tuple=False).tolist()
-        if 0 < len(locs) < 15:
-            print(f"  {name:12s}: {len(locs):3d} nonzero, locs={locs[:5]}{'...' if len(locs) > 5 else ''}")
-        else:
-            print(f"  {name:12s}: {len(locs):3d} nonzero")
-    
-    print(f"\nCanon obs (play_as_red={play_as_red}):")
-    for i, name in enumerate(channel_names):
-        locs = (canon_obs[i] > 0).nonzero(as_tuple=False).tolist()
-        if 0 < len(locs) < 15:
-            print(f"  {name:12s}: {len(locs):3d} nonzero, locs={locs[:5]}{'...' if len(locs) > 5 else ''}")
-        else:
-            print(f"  {name:12s}: {len(locs):3d} nonzero")
-    print(f"{'='*60}\n")
+    agent.train()
+    return np.mean(returns), np.std(returns), wins / num_episodes
 
 
 def train():
@@ -232,17 +227,38 @@ def train():
         self_play=True
     )
     
+    # Separate eval env
+    eval_env = gymPacMan_parallel_env(
+        layout_file='layouts/bloxCapture.lay',
+        display=False,
+        reward_forLegalAction=False,
+        defenceReward=True,
+        length=300,
+        enemieName='randomTeam',
+        self_play=True
+    )
+    
     obs_shape = env.get_Observation(0).shape
     num_agents = 2
     
     agent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
-    optimizer = torch.optim.Adam(agent.parameters(), lr=LR)
+    optimizer = torch.optim.Adam(agent.parameters(), lr=LR, eps=1e-5)
     
     opponent_pool = deque(maxlen=OPPONENT_POOL_SIZE)
     opponent_pool.append(copy.deepcopy(agent.state_dict()))
     
-    all_returns = []
-    all_rewards = []
+    # Logging
+    log = {
+        'update': [],
+        'reward': [],
+        'ep_return': [],
+        'eval_return': [],
+        'eval_winrate': [],
+        'entropy': [],
+        'clip_frac': [],
+        'pg_loss': [],
+        'v_loss': []
+    }
     
     for update in range(1, TOTAL_UPDATES + 1):
         # Random side selection
@@ -269,31 +285,22 @@ def train():
         value_buf = torch.zeros(NUM_STEPS, num_agents)
         
         obs_dict, _ = env.reset()
-        
-        # Debug print on first update only
-        if update <= 2:
-            debug_obs(env, learner_ids, play_as_red)
-        
         episode_return = 0
         episode_returns = []
         
         for step in range(NUM_STEPS):
-            # Get and canonicalize learner observations
             learner_obs_raw = [obs_dict[env.agents[i]].float() for i in learner_ids]
             learner_obs_canon = [canonicalize_obs(o, play_as_red) for o in learner_obs_raw]
             learner_obs = torch.stack(learner_obs_canon)
             
-            # Joint observation for centralized critic
             joint_obs = torch.cat(learner_obs_canon, dim=0)
             joint_obs_batch = joint_obs.unsqueeze(0).expand(num_agents, -1, -1, -1)
             
             obs_buf[step] = learner_obs
             joint_obs_buf[step] = joint_obs_batch
             
-            # Get learner actions
             with torch.no_grad():
                 all_obs_list = [learner_obs[i:i+1].to(device) for i in range(num_agents)]
-                
                 actions, log_probs, values = [], [], []
                 for i in range(num_agents):
                     act, lp, val, _ = agent.get_action_and_value(
@@ -310,7 +317,7 @@ def train():
             logprob_buf[step] = log_probs.cpu()
             value_buf[step] = values.cpu()
             
-            # Get opponent actions
+            # Opponent actions
             opp_obs_raw = [obs_dict[env.agents[i]].float() for i in opponent_ids]
             opp_obs_canon = [canonicalize_obs(o, not play_as_red) for o in opp_obs_raw]
             opp_obs = torch.stack(opp_obs_canon)
@@ -319,30 +326,24 @@ def train():
                 opp_list = [opp_obs[i:i+1].to(device) for i in range(num_agents)]
                 opp_actions = []
                 for i in range(num_agents):
-                    a, _, _, _ = opponent.get_action_and_value(
-                        opp_obs[i:i+1].to(device), opp_list
-                    )
+                    a, _, _, _ = opponent.get_action_and_value(opp_obs[i:i+1].to(device), opp_list)
                     opp_actions.append(a)
                 opp_actions = torch.cat(opp_actions)
             
-            # Convert to env actions
             env_actions = {}
             for i, aid in enumerate(learner_ids):
                 env_actions[env.agents[aid]] = canonicalize_action(actions[i], play_as_red).item()
             for i, aid in enumerate(opponent_ids):
                 env_actions[env.agents[aid]] = canonicalize_action(opp_actions[i], not play_as_red).item()
             
-            # Step environment
             next_obs_dict, rewards, dones, _ = env.step(env_actions)
             
-            # Compute shaping reward
+            # Shaping
             next_obs_raw = [next_obs_dict[env.agents[i]].float() for i in learner_ids]
             next_obs_canon = [canonicalize_obs(o, play_as_red) for o in next_obs_raw]
-            
             shaping = [compute_heuristic_shaping(learner_obs_canon[i], next_obs_canon[i]) 
                        for i in range(num_agents)]
             
-            # Store rewards
             team_reward = sum(rewards[env.agents[i]] for i in learner_ids)
             episode_return += team_reward
             
@@ -358,7 +359,7 @@ def train():
                 episode_return = 0
                 obs_dict, _ = env.reset()
 
-        # Compute last value for GAE
+        # GAE
         learner_obs_raw = [obs_dict[env.agents[i]].float() for i in learner_ids]
         learner_obs_canon = [canonicalize_obs(o, play_as_red) for o in learner_obs_raw]
         learner_obs = torch.stack(learner_obs_canon)
@@ -367,7 +368,6 @@ def train():
             all_list = [learner_obs[i:i+1].to(device) for i in range(num_agents)]
             last_value = agent.get_value(all_list).cpu().item()
 
-        # Compute advantages
         advantages = torch.zeros_like(reward_buf)
         returns = torch.zeros_like(reward_buf)
         for i in range(num_agents):
@@ -375,7 +375,7 @@ def train():
             advantages[:, i] = adv
             returns[:, i] = ret
             
-        # Flatten for PPO update
+        # PPO Update
         b_obs = obs_buf.reshape(-1, *obs_shape)
         b_joint = joint_obs_buf.reshape(-1, obs_shape[0]*num_agents, obs_shape[1], obs_shape[2])
         b_act = action_buf.reshape(-1)
@@ -422,40 +422,78 @@ def train():
         if update % OPPONENT_UPDATE_FREQ == 0:
             opponent_pool.append(copy.deepcopy(agent.state_dict()))
         
+        # Evaluation
+        if update % EVAL_FREQ == 0:
+            eval_ret, eval_std, eval_wr = evaluate_vs_random(agent, eval_env, EVAL_EPISODES)
+            log['eval_return'].append(eval_ret)
+            log['eval_winrate'].append(eval_wr)
+        else:
+            log['eval_return'].append(log['eval_return'][-1] if log['eval_return'] else 0)
+            log['eval_winrate'].append(log['eval_winrate'][-1] if log['eval_winrate'] else 0)
+        
         # Logging
         mean_reward = reward_buf.sum().item() / num_agents
         mean_ep_return = np.mean(episode_returns) if episode_returns else 0
-        all_returns.append(mean_ep_return)
-        all_rewards.append(mean_reward)
+        
+        log['update'].append(update)
+        log['reward'].append(mean_reward)
+        log['ep_return'].append(mean_ep_return)
+        log['entropy'].append(np.mean(ent_l))
+        log['clip_frac'].append(np.mean(clip_l))
+        log['pg_loss'].append(np.mean(pg_l))
+        log['v_loss'].append(np.mean(v_l))
         
         side = "Red " if play_as_red else "Blue"
+        eval_str = f"| Eval: {log['eval_return'][-1]:6.1f} ({log['eval_winrate'][-1]*100:4.1f}%)" if update % EVAL_FREQ == 0 else ""
         print(f"Upd {update:4d} [{side}] | "
-              f"Reward: {mean_reward:8.2f} | "
-              f"EpRet: {mean_ep_return:7.2f} | "
+              f"Rew: {mean_reward:7.1f} | "
+              f"EpRet: {mean_ep_return:6.1f} | "
               f"Ent: {np.mean(ent_l):.3f} | "
-              f"VL: {np.mean(v_l):.4f} | "
-              f"PG: {np.mean(pg_l):.4f} | "
-              f"Clip: {np.mean(clip_l):.3f}")
+              f"Clip: {np.mean(clip_l):.3f} "
+              f"{eval_str}")
         
         if update % 100 == 0:
             torch.save(agent.state_dict(), f"mappo_{update}.pt")
 
     torch.save(agent.state_dict(), "mappo_final.pt")
     
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-    ax1.plot(all_rewards)
-    ax1.set_xlabel("Update")
-    ax1.set_ylabel("Rollout Reward")
-    ax1.set_title("Reward per Update")
+    # Plotting
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
     
-    ax2.plot(all_returns)
-    ax2.set_xlabel("Update")
-    ax2.set_ylabel("Episode Return")
-    ax2.set_title("Mean Episode Return")
+    axes[0, 0].plot(log['update'], log['reward'])
+    axes[0, 0].set_title('Rollout Reward')
+    axes[0, 0].set_xlabel('Update')
+    
+    axes[0, 1].plot(log['update'], log['ep_return'])
+    axes[0, 1].set_title('Episode Return (Training)')
+    axes[0, 1].set_xlabel('Update')
+    
+    axes[0, 2].plot(log['update'], log['eval_return'], label='Return')
+    axes[0, 2].set_title('Eval vs Random')
+    axes[0, 2].set_xlabel('Update')
+    ax2 = axes[0, 2].twinx()
+    ax2.plot(log['update'], [w*100 for w in log['eval_winrate']], 'r-', alpha=0.5, label='Win%')
+    ax2.set_ylabel('Win Rate %', color='r')
+    
+    axes[1, 0].plot(log['update'], log['entropy'])
+    axes[1, 0].set_title('Entropy')
+    axes[1, 0].axhline(y=0.5, color='r', linestyle='--', alpha=0.5)
+    axes[1, 0].set_xlabel('Update')
+    
+    axes[1, 1].plot(log['update'], log['clip_frac'])
+    axes[1, 1].set_title('Clip Fraction')
+    axes[1, 1].axhline(y=0.2, color='r', linestyle='--', alpha=0.5)
+    axes[1, 1].set_xlabel('Update')
+    
+    axes[1, 2].plot(log['update'], log['v_loss'])
+    axes[1, 2].set_title('Value Loss')
+    axes[1, 2].set_xlabel('Update')
     
     plt.tight_layout()
-    plt.savefig("mappo_curves.png")
+    plt.savefig("mappo_training.png", dpi=150)
     plt.close()
+    
+    print(f"\nTraining complete! Final eval: {log['eval_return'][-1]:.1f} return, {log['eval_winrate'][-1]*100:.1f}% winrate")
 
 
 if __name__ == "__main__":
