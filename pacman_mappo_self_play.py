@@ -13,18 +13,18 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 NUM_STEPS = 2048        # Steps to collect per agent per update
 BATCH_SIZE = 256        # Minibatch size
-LR = 2e-4             # Learning Rate
+LR = 1e-4             # Learning Rate
 GAMMA = 0.98            # Discount factor
 GAE_LAMBDA = 0.95       # GAE parameter
 CLIP_EPS = 0.15         # PPO Clip range
-ENT_COEF = 0.015        # Entropy coefficient
+ENT_COEF = 0.02        # Entropy coefficient
 VF_COEF = 0.5           # Value Function coefficient
 MAX_GRAD_NORM = 0.5     # Gradient clipping
 UPDATE_EPOCHS = 5       # PPO Update epochs
 TOTAL_UPDATES = 120     # Total training iterations
 
 VALUE_HIDDEN_DIM = 512
-CRITIC_HIDDEN_DIM = 1024        # Network hidden size
+CRITIC_HIDDEN_DIM = 512        # Network hidden size
 
 OPPONENT_UPDATE_FREQ = 10  # Add current agent to pool every N updates
 OPPONENT_POOL_SIZE = 5     # Max opponents to keep
