@@ -85,7 +85,7 @@ class AgentQNetwork(nn.Module):
             nn.ReLU(), 
             NoisyLinear(hidden_dim, action_dim)
         )
-        # REMOVED: self.apply(self._init_weights) -> Reverts to PyTorch Default
+        #tried ortho init but no good success
 
     def forward(self, obs):
         x = F.relu(self.conv1(obs))
@@ -475,10 +475,9 @@ def save_models(agent_net, mixer, filename="rainbow_final.pt"):
 layout_name = 'tinyCapture.lay'
 layout_path = os.path.join('layouts', layout_name)
 
-# Ensure reward_forLegalAction=False to prevent "lazy" local optimum
 env = gymPacMan_parallel_env(layout_file=layout_path,
                              display=False,
-                             reward_forLegalAction=False, 
+                             reward_forLegalAction=True, 
                              defenceReward=False,
                              length=299,
                              enemieName='randomTeam',
@@ -507,7 +506,7 @@ rewards_exp, scores_exp = train_rainbow_qmix_shared(
     env, shared_agent, shared_target, mixer, target_mixer, replay_buffer,
     n_episodes=150,
     batch_size=512,
-    lr=0.00025, 
+    lr=0.0003, 
     gamma=0.98,
     shaping_weight=0.1,    
     exploration_beta=0.3, 
