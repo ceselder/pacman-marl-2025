@@ -22,9 +22,8 @@ MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 10     # How many times to re-use data
 TOTAL_UPDATES = 100   # Total training loops
 
-HIDDEN_DIM_SIZE = 512 #512 seems to work ok
+HIDDEN_DIM = 512 #512 seems to work ok
 
-# Self-play config
 OPPONENT_UPDATE_FREQ = 10  # Update opponent pool every N updates
 OPPONENT_POOL_SIZE = 5     # Keep last N versions
 SELF_PLAY_PROB = 0.5       # Prob of playing vs past self (vs latest)
