@@ -74,37 +74,37 @@ def compute_gae(rewards, values, dones, last_value, last_done):
     return advantages, advantages + values
 
 def train_ppo_selfplay(env):
-    # We train blue team (1, 3), opponent is red team (0, 2)
-    train_ids = [1, 3]  # Our agents
-    opp_ids = [0, 2]    # Opponent agents
+    train_ids = [1, 3]
+    opp_ids = [0, 2]
     num_agents = len(train_ids)
     obs_shape = env.get_Observation(train_ids[0]).shape
     
-    # Main agent (trains)
     agent = ActorCritic(obs_shape, 5).to(device)
     optimizer = torch.optim.Adam(agent.parameters(), lr=LR, eps=1e-5)
     
-    # Opponent pool - past versions of our agent
     opponent_pool = deque(maxlen=OPPONENT_POOL_SIZE)
     opponent_pool.append(copy.deepcopy(agent.state_dict()))
     
+    # Logging
+    log = {
+        'update': [], 'reward': [], 'episode_return': [],
+        'pg_loss': [], 'v_loss': [], 'entropy': [], 'clip_frac': []
+    }
+    episode_returns = []
+    current_ep_reward = 0
+    
     def get_opponent():
-        """Sample an opponent from the pool."""
         opp = ActorCritic(obs_shape, 5).to(device)
         if np.random.random() < SELF_PLAY_PROB and len(opponent_pool) > 1:
-            # Play against random past version
             opp.load_state_dict(np.random.choice(list(opponent_pool)[:-1]))
         else:
-            # Play against latest
             opp.load_state_dict(opponent_pool[-1])
         opp.eval()
         return opp
 
     for update in range(1, TOTAL_UPDATES + 1):
-        # Get opponent for this rollout
         opponent = get_opponent()
         
-        # Storage for our team only
         obs_buf = torch.zeros((NUM_STEPS, num_agents, *obs_shape))
         actions_buf = torch.zeros((NUM_STEPS, num_agents), dtype=torch.long)
         logprobs_buf = torch.zeros((NUM_STEPS, num_agents))
@@ -115,24 +115,22 @@ def train_ppo_selfplay(env):
         env.reset()
         next_obs = torch.stack([env.get_Observation(i) for i in train_ids]).float()
         next_done = torch.zeros(num_agents)
+        
+        current_ep_reward = 0
 
         for step in range(NUM_STEPS):
             obs_buf[step] = next_obs
             dones_buf[step] = next_done
             
-            # Our team's actions (with grad tracking for PPO)
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs.to(device))
                 action, logprob, value = action.cpu(), logprob.cpu(), value.cpu()
             
             actions_buf[step], logprobs_buf[step], values_buf[step] = action, logprob, value
 
-            # Opponent's actions
             opp_obs = torch.stack([env.get_Observation(i) for i in opp_ids]).float().to(device)
             opp_actions = opponent.get_action(opp_obs).cpu()
 
-            # Build full action dict
-            # env.step expects actions indexed by agent object, not int
             env_actions = {}
             for i, ag_id in enumerate(train_ids):
                 env_actions[env.agents[ag_id]] = action[i].item()
@@ -141,27 +139,27 @@ def train_ppo_selfplay(env):
 
             next_obs_dict, rewards_dict, dones_dict, _ = env.step(env_actions)
             
-            # Reward for our team
             team_reward = sum(rewards_dict[env.agents[i]] for i in train_ids)
-            rewards_buf[step] = team_reward  # Shared team reward
+            rewards_buf[step] = team_reward
+            current_ep_reward += team_reward
             
             any_done = any(dones_dict[env.agents[i]] for i in train_ids)
             next_done = torch.full((num_agents,), float(any_done))
             
             if any_done:
+                episode_returns.append(current_ep_reward)
+                current_ep_reward = 0
                 env.reset()
                 next_obs = torch.stack([env.get_Observation(i) for i in train_ids]).float()
             else:
                 next_obs = torch.stack([next_obs_dict[env.agents[i]] for i in train_ids]).float()
 
-        # Bootstrap
         with torch.no_grad():
             _, _, _, last_value = agent.get_action_and_value(next_obs.to(device))
             last_value = last_value.cpu()
 
         advantages, returns = compute_gae(rewards_buf, values_buf, dones_buf, last_value, next_done)
 
-        # Flatten
         b_obs = obs_buf.reshape(-1, *obs_shape)
         b_actions = actions_buf.reshape(-1)
         b_logprobs = logprobs_buf.reshape(-1)
@@ -171,7 +169,9 @@ def train_ppo_selfplay(env):
         dataset_size = NUM_STEPS * num_agents
         indices = np.arange(dataset_size)
 
-        # PPO update
+        # Track losses for this update
+        pg_losses, v_losses, entropies, clip_fracs = [], [], [], []
+
         for _ in range(UPDATE_EPOCHS):
             np.random.shuffle(indices)
             for start in range(0, dataset_size, BATCH_SIZE):
@@ -186,27 +186,48 @@ def train_ppo_selfplay(env):
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(mb_obs, mb_actions)
                 ratio = (newlogprob - mb_old_logprobs).exp()
+                
+                # Clip fraction
+                with torch.no_grad():
+                    clip_frac = ((ratio - 1.0).abs() > CLIP_EPS).float().mean().item()
+                    clip_fracs.append(clip_frac)
 
                 pg_loss = -torch.min(
                     ratio * mb_adv,
                     torch.clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * mb_adv
                 ).mean()
                 v_loss = 0.5 * ((newvalue - mb_returns) ** 2).mean()
-                loss = pg_loss - ENT_COEF * entropy.mean() + VF_COEF * v_loss
+                ent = entropy.mean()
+                loss = pg_loss - ENT_COEF * ent + VF_COEF * v_loss
 
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(agent.parameters(), MAX_GRAD_NORM)
                 optimizer.step()
+                
+                pg_losses.append(pg_loss.item())
+                v_losses.append(v_loss.item())
+                entropies.append(ent.item())
 
-        # Update opponent pool periodically
         if update % OPPONENT_UPDATE_FREQ == 0:
             opponent_pool.append(copy.deepcopy(agent.state_dict()))
-            print(f"  -> Added to opponent pool (size: {len(opponent_pool)})")
 
-        print(f"Update {update}/{TOTAL_UPDATES} | Reward: {rewards_buf.sum().item() / num_agents:.2f}")
+        # Log
+        mean_reward = rewards_buf.sum().item() / num_agents
+        mean_ep_return = np.mean(episode_returns[-10:]) if episode_returns else 0
+        
+        log['update'].append(update)
+        log['reward'].append(mean_reward)
+        log['episode_return'].append(mean_ep_return)
+        log['pg_loss'].append(np.mean(pg_losses))
+        log['v_loss'].append(np.mean(v_losses))
+        log['entropy'].append(np.mean(entropies))
+        log['clip_frac'].append(np.mean(clip_fracs))
+        
+        print(f"Update {update}/{TOTAL_UPDATES} | Reward: {mean_reward:.2f} | EpRet: {mean_ep_return:.2f} | Ent: {np.mean(entropies):.3f} | Clip: {np.mean(clip_fracs):.3f}")
 
     torch.save(agent.state_dict(), "ppo_pacman_selfplay.pt")
+    return log
 
 def plot_training(log):
     fig, axes = plt.subplots(2, 3, figsize=(14, 8))
