@@ -22,7 +22,9 @@ VF_COEF = 0.5           # Value Function coefficient
 MAX_GRAD_NORM = 0.5     # Gradient clipping
 UPDATE_EPOCHS = 5       # PPO Update epochs
 TOTAL_UPDATES = 120     # Total training iterations
-HIDDEN_DIM = 512        # Network hidden size
+
+VALUE_HIDDEN_DIM = 512
+CRITIC_HIDDEN_DIM = 1024        # Network hidden size
 
 OPPONENT_UPDATE_FREQ = 10  # Add current agent to pool every N updates
 OPPONENT_POOL_SIZE = 5     # Max opponents to keep
@@ -49,8 +51,8 @@ class MAPPOAgent(nn.Module):
             actor_flat = self.actor_conv(dummy_obs).shape[1]
             
         self.actor = nn.Sequential(
-            nn.Linear(actor_flat, HIDDEN_DIM), nn.ReLU(), 
-            nn.Linear(HIDDEN_DIM, action_dim)
+            nn.Linear(actor_flat, VALUE_HIDDEN_DIM), nn.ReLU(), 
+            nn.Linear(VALUE_HIDDEN_DIM, action_dim)
         )
 
         # --- Centralized Critic (Global State) ---
@@ -69,8 +71,8 @@ class MAPPOAgent(nn.Module):
             critic_flat = self.critic_conv(dummy_state).shape[1]
 
         self.critic = nn.Sequential(
-            nn.Linear(critic_flat, HIDDEN_DIM), nn.ReLU(), 
-            nn.Linear(HIDDEN_DIM, 1)
+            nn.Linear(critic_flat, CRITIC_HIDDEN_DIM), nn.ReLU(), 
+            nn.Linear(CRITIC_HIDDEN_DIM, 1)
         )
 
     def get_action(self, x):
@@ -116,11 +118,11 @@ def compute_gae(rewards, values, dones, last_value, last_done):
         advantages[t] = lastgaelam = delta + GAMMA * GAE_LAMBDA * next_non_terminal * lastgaelam
     return advantages, advantages + values
 
-def process_obs(obs, is_red_team): #yeah okay so they said I dont have to do this but im pretty sure if I wanna do self play I do actually
+def process_obs(obs, is_red_team): 
+    #yeah okay so they said I dont have to do this but im pretty sure if I wanna do self play I do actually
     if not is_red_team:
         return obs # Blue is already default
-    
-    # Create a copy to avoid in-place modification issues
+
     new_obs = obs.clone()
     
     # Swap Capsules: Blue(2) <-> Red(3)
@@ -132,11 +134,8 @@ def process_obs(obs, is_red_team): #yeah okay so they said I dont have to do thi
     new_obs[:, 7, :, :] = obs[:, 6, :, :]
     
     return new_obs
+
 def evaluate_vs_random(agent, eval_env, num_episodes=5):
-    """
-    Evaluates the current agent (playing as Blue) against the Random baseline (playing as Red).
-    Uses a separate environment instance where self_play=False.
-    """
     agent.eval()
     total_rewards = []
     
@@ -204,7 +203,7 @@ def train_mappo(env, eval_env):
     
     # Logs
     log = {
-        'update': [], 'reward': [], 'eval_reward': [], 
+        'update': [], 'reward': [], 'eval_reward': [], 'episode_return': [],
         'pg_loss': [], 'v_loss': [], 'entropy': [], 'clip_frac': []
     }
     
@@ -236,8 +235,8 @@ def train_mappo(env, eval_env):
         # 2. Setup Self-Play Match
         opponent = get_opponent()
         
-        # Randomize Sides: 50% Blue (1,3), 50% Red (0,2)
         # I know it sais you dont have to do this but for self play im pretty sure we do
+        # for self play atleast
         if np.random.rand() > 0.5:
             train_ids = [1, 3] # We are Blue
             opp_ids = [0, 2]   # Opponent is Red
