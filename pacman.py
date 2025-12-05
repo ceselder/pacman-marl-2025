@@ -322,7 +322,7 @@ def train_rainbow_qmix(env, agent_net, target_net, mixer, target_mixer,
         env.reset()
         n_step_buffer.reset()
         done = {agent_id: False for agent_id in agent_indexes}
-        
+
         episode_reward = 0.0
         score = 0.0
         has_trained = False
@@ -507,7 +507,7 @@ if __name__ == "__main__":
         env, agent_net, target_net, mixer, target_mixer, replay_buffer,
         n_episodes=200,
         batch_size=256,
-        lr=0.0003, 
+        lr=0.001, 
         gamma=0.98,  
         exploration_beta=0.3,
         n_step=3,
