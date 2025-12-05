@@ -107,11 +107,13 @@ class MAPPOAgent(nn.Module):
         
         self.actor = nn.Sequential(
             nn.Linear(flat_dim, 512), nn.ReLU(),
+            nn.Linear(512, 512),nn.ReLU(),
             nn.Linear(512, action_dim)
         )
         self.critic = nn.Sequential(
-            nn.Linear(flat_dim * num_agents, 512), nn.ReLU(),
-            nn.Linear(512, 1)
+            nn.Linear(flat_dim * num_agents, 1024), nn.ReLU(),
+            nn.Linear(1024, 1024),nn.ReLU(),
+            nn.Linear(1024, 1)
         )
 
     def get_action_and_value(self, obs, all_obs_list):
@@ -425,6 +427,7 @@ def train():
         # Evaluation
         if update % EVAL_FREQ == 0:
             eval_ret, eval_std, eval_wr = evaluate_vs_random(agent, eval_env, EVAL_EPISODES)
+            print(f"(EVAL RESULTS) ret: {eval_ret} {eval_std} {eval_wr}")
             log['eval_return'].append(eval_ret)
             log['eval_winrate'].append(eval_wr)
         else:
