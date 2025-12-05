@@ -17,7 +17,7 @@ LR = 3e-4                 # Reduced from 5e-4
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.15           # Reduced from 0.2 for stability
-ENT_COEF = 0.01           # Slightly lower entropy
+ENT_COEF = 0.03           # Slightly lower entropy
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
@@ -94,9 +94,43 @@ def compute_heuristic_shaping(obs_curr, obs_next):
     return dist_curr - dist_next
 
 
+def merge_obs_for_critic(obs_list):
+    """
+    Merge multiple agent observations into a single 8-channel observation for critic.
+    
+    Input obs channels:
+    0: walls, 1: self_loc, 2: blue_caps, 3: red_caps, 4: ally_loc, 5: enemies, 6: blue_food, 7: red_food
+    
+    For critic, we merge channel 1 (self) and channel 4 (ally) from all agents into one "team_locations" channel.
+    Result: 8 channels with all team positions in one channel.
+    
+    obs_list: list of (C, H, W) tensors, one per agent
+    Returns: (C, H, W) tensor with merged team locations
+    """
+    # Start with first agent's observation as base
+    merged = obs_list[0].clone()
+    
+    # Merge all agent locations into channel 1 (team positions)
+    # Channel 1 already has agent 0's position
+    # Channel 4 has agent 0's view of allies
+    # We want: channel 1 = all friendly positions, channel 4 = 0 (or keep enemies)
+    
+    # Actually simpler: just add all self_loc channels together
+    team_locs = torch.zeros_like(merged[1])
+    for obs in obs_list:
+        team_locs = torch.maximum(team_locs, obs[1])  # max to handle overlapping (keeps carrying info)
+    
+    merged[1] = team_locs
+    merged[4] = torch.zeros_like(merged[4])  # Clear ally channel since it's now in channel 1
+    
+    return merged
+
+
 class MAPPOAgent(nn.Module):
     def __init__(self, obs_shape, action_dim, num_agents=2):
         super().__init__()
+        self.obs_shape = obs_shape
+        
         self.conv = nn.Sequential(
             nn.Conv2d(obs_shape[0], 32, 3, padding=1), nn.ReLU(),
             nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
@@ -107,13 +141,12 @@ class MAPPOAgent(nn.Module):
         
         self.actor = nn.Sequential(
             nn.Linear(flat_dim, 512), nn.ReLU(),
-            nn.Linear(512, 512),nn.ReLU(),
             nn.Linear(512, action_dim)
         )
+        # Critic now takes same 8 channels (merged obs), not 16
         self.critic = nn.Sequential(
-            nn.Linear(flat_dim * num_agents, 1024), nn.ReLU(),
-            nn.Linear(1024, 1024),nn.ReLU(),
-            nn.Linear(1024, 1)
+            nn.Linear(flat_dim, 512), nn.ReLU(),
+            nn.Linear(512, 1)
         )
 
     def get_action_and_value(self, obs, all_obs_list):
@@ -123,31 +156,38 @@ class MAPPOAgent(nn.Module):
         action = dist.sample()
         log_prob = dist.log_prob(action)
         
-        all_feats = [self.conv(o) for o in all_obs_list]
-        joint_feat = torch.cat(all_feats, dim=1)
-        value = self.critic(joint_feat).squeeze(-1)
+        # Merge observations for critic (handles batched and unbatched)
+        if all_obs_list[0].dim() == 4:  # Batched: (1, C, H, W)
+            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
+        else:
+            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
+        
+        critic_feat = self.conv(merged.to(obs.device))
+        value = self.critic(critic_feat).squeeze(-1)
         return action, log_prob, value, dist.entropy()
 
     def get_value(self, all_obs_list):
-        all_feats = [self.conv(o) for o in all_obs_list]
-        joint_feat = torch.cat(all_feats, dim=1)
-        return self.critic(joint_feat).squeeze(-1)
+        if all_obs_list[0].dim() == 4:
+            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
+        else:
+            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
+        
+        critic_feat = self.conv(merged.to(all_obs_list[0].device))
+        return self.critic(critic_feat).squeeze(-1)
 
-    def evaluate(self, obs, all_obs_flat, action, num_agents, obs_shape):
+    def evaluate(self, obs, merged_obs, action, num_agents, obs_shape):
+        """
+        obs: (batch, C, H, W) - individual agent obs for actor
+        merged_obs: (batch, C, H, W) - merged obs for critic (same shape, 8 channels)
+        """
         h = self.conv(obs)
         logits = self.actor(h)
         dist = Categorical(logits=logits)
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
         
-        C = obs_shape[0]
-        all_feats = []
-        for i in range(num_agents):
-            agent_obs = all_obs_flat[:, i*C:(i+1)*C, :, :]
-            all_feats.append(self.conv(agent_obs))
-        
-        joint_feat = torch.cat(all_feats, dim=1)
-        value = self.critic(joint_feat).squeeze(-1)
+        critic_feat = self.conv(merged_obs)
+        value = self.critic(critic_feat).squeeze(-1)
         return value, log_prob, entropy
     
     def get_deterministic_action(self, obs):
@@ -222,7 +262,7 @@ def train():
     env = gymPacMan_parallel_env(
         layout_file='layouts/bloxCapture.lay',
         display=False,
-        reward_forLegalAction=True,
+        reward_forLegalAction=False,
         defenceReward=True,
         length=300,
         enemieName='randomTeam',
@@ -233,7 +273,7 @@ def train():
     eval_env = gymPacMan_parallel_env(
         layout_file='layouts/bloxCapture.lay',
         display=False,
-        reward_forLegalAction=True,
+        reward_forLegalAction=False,
         defenceReward=True,
         length=300,
         enemieName='randomTeam',
@@ -245,11 +285,7 @@ def train():
     
     agent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
     optimizer = torch.optim.Adam(agent.parameters(), lr=LR, eps=1e-5)
-
-    state_dict = torch.load("mappo_checkpoint.pt", map_location=device) # load from checkpoint
-    agent.load_state_dict(state_dict)
-
-
+    
     opponent_pool = deque(maxlen=OPPONENT_POOL_SIZE)
     opponent_pool.append(copy.deepcopy(agent.state_dict()))
     
@@ -275,6 +311,47 @@ def train():
         else:
             learner_ids = [1, 3]
             opponent_ids = [0, 2]
+        
+        # Debug print observation transformation (first 2 updates only, first step)
+        if update <= 2:
+            obs_dict_dbg, _ = env.reset()
+            raw = obs_dict_dbg[env.agents[learner_ids[0]]].float()
+            canon = canonicalize_obs(raw, play_as_red)
+            W = raw.shape[-1]
+            
+            print(f"\n=== UPDATE {update} | {'RED' if play_as_red else 'BLUE'} | Agent {learner_ids[0]} ===")
+            print(f"Map width: {W}")
+            
+            # Agent position (channel 1)
+            raw_loc = (raw[1] > 0).nonzero(as_tuple=False)
+            canon_loc = (canon[1] > 0).nonzero(as_tuple=False)
+            if len(raw_loc) > 0 and len(canon_loc) > 0:
+                ry, rx = raw_loc[0].tolist()
+                cy, cx = canon_loc[0].tolist()
+                expected_cx = W - 1 - rx if play_as_red else rx
+                print(f"Agent: raw=({ry},{rx}) canon=({cy},{cx}) expected_x={expected_cx} {'OK' if cx == expected_cx else 'WRONG!'}")
+            
+            # Food (channels 6, 7)
+            raw_blue_food = int(raw[6].sum().item())
+            raw_red_food = int(raw[7].sum().item())
+            canon_blue_food = int(canon[6].sum().item())
+            canon_red_food = int(canon[7].sum().item())
+            
+            if play_as_red:
+                # After canon: blue_food should have raw_red count, red_food should have raw_blue count
+                swap_ok = (canon_blue_food == raw_red_food and canon_red_food == raw_blue_food)
+                print(f"Food: raw(b={raw_blue_food},r={raw_red_food}) canon(b={canon_blue_food},r={canon_red_food}) swap={'OK' if swap_ok else 'WRONG!'}")
+            else:
+                print(f"Food: raw(b={raw_blue_food},r={raw_red_food}) canon(b={canon_blue_food},r={canon_red_food}) (no transform)")
+            print("=" * 50)
+        # Random side selection
+        play_as_red = np.random.rand() > 0.5
+        if play_as_red:
+            learner_ids = [0, 2]
+            opponent_ids = [1, 3]
+        else:
+            learner_ids = [1, 3]
+            opponent_ids = [0, 2]
 
         # Load opponent from pool
         opponent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
@@ -283,7 +360,7 @@ def train():
         
         # Buffers
         obs_buf = torch.zeros(NUM_STEPS, num_agents, *obs_shape)
-        joint_obs_buf = torch.zeros(NUM_STEPS, num_agents, obs_shape[0]*num_agents, obs_shape[1], obs_shape[2])
+        merged_obs_buf = torch.zeros(NUM_STEPS, num_agents, *obs_shape)  # 8 channels, not 16
         action_buf = torch.zeros(NUM_STEPS, num_agents, dtype=torch.long)
         logprob_buf = torch.zeros(NUM_STEPS, num_agents)
         reward_buf = torch.zeros(NUM_STEPS, num_agents)
@@ -299,11 +376,12 @@ def train():
             learner_obs_canon = [canonicalize_obs(o, play_as_red) for o in learner_obs_raw]
             learner_obs = torch.stack(learner_obs_canon)
             
-            joint_obs = torch.cat(learner_obs_canon, dim=0)
-            joint_obs_batch = joint_obs.unsqueeze(0).expand(num_agents, -1, -1, -1)
+            # Merged obs for critic (8 channels with all team positions)
+            merged_obs = merge_obs_for_critic(learner_obs_canon)
+            merged_obs_batch = merged_obs.unsqueeze(0).expand(num_agents, -1, -1, -1)
             
             obs_buf[step] = learner_obs
-            joint_obs_buf[step] = joint_obs_batch
+            merged_obs_buf[step] = merged_obs_batch
             
             with torch.no_grad():
                 all_obs_list = [learner_obs[i:i+1].to(device) for i in range(num_agents)]
@@ -383,7 +461,7 @@ def train():
             
         # PPO Update
         b_obs = obs_buf.reshape(-1, *obs_shape)
-        b_joint = joint_obs_buf.reshape(-1, obs_shape[0]*num_agents, obs_shape[1], obs_shape[2])
+        b_merged = merged_obs_buf.reshape(-1, *obs_shape)  # 8 channels, same as obs
         b_act = action_buf.reshape(-1)
         b_logp = logprob_buf.reshape(-1)
         b_adv = advantages.reshape(-1)
@@ -399,7 +477,7 @@ def train():
                 
                 vals, lps, ent = agent.evaluate(
                     b_obs[mb].to(device), 
-                    b_joint[mb].to(device), 
+                    b_merged[mb].to(device), 
                     b_act[mb].to(device),
                     num_agents, obs_shape
                 )
@@ -431,7 +509,6 @@ def train():
         # Evaluation
         if update % EVAL_FREQ == 0:
             eval_ret, eval_std, eval_wr = evaluate_vs_random(agent, eval_env, EVAL_EPISODES)
-            print(f"(EVAL RESULTS) ret: {eval_ret} {eval_std} {eval_wr}")
             log['eval_return'].append(eval_ret)
             log['eval_winrate'].append(eval_wr)
         else:
