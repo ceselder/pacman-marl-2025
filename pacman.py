@@ -92,7 +92,7 @@ class AgentQNetwork(nn.Module):
         self.flatten = nn.Flatten()
         
         self.fc_val = nn.Sequential(
-            NoisyLinear(conv_output_shape, hidden_dim), 
+        NoisyLinear(conv_outoi      put_shape, hidden_dim), 
             nn.ReLU(), 
             NoisyLinear(hidden_dim, 1)
         )
@@ -248,6 +248,7 @@ class NaivePrioritizedBuffer:
 # --- HELPERS ---
 
 def get_min_food_dist(obs, agent_index):
+    return 0 #turned off for now
     try:
         ys, xs = np.nonzero(obs[1])
         if len(ys) == 0: return 0 
@@ -258,14 +259,19 @@ def get_min_food_dist(obs, agent_index):
         if len(f_ys) == 0: return 0 
         dists = np.sum(np.abs(np.stack([f_ys, f_xs], axis=1) - my_pos), axis=1)
         return np.min(dists)
-    except: return 0
+    except: 
+        print("something wrong food dist!")
+        return 0
 
 def get_exploration_bonus(obs, visit_counts, agent_index, beta=0.1):
     pos = (0, 0)
     try:
         ys, xs = np.nonzero(obs[1])
-        if len(ys) > 0: pos = (int(ys[0]), int(xs[0]))
-    except: pass
+        if len(ys) > 0: 
+            pos = (int(ys[0]), int(xs[0]))
+    except: 
+        print("something wrong exploration!")
+        pass
     
     team_id = agent_index % 2
     key = (team_id, pos)
@@ -345,20 +351,17 @@ def select_action(agent_q_network, state, legal_actions):
 
 # --- TRAINING LOOP ---
 
-def train_rainbow_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer, 
+def train_rainbow_qmix_shared(env, agent_net, target_net, mixer, target_mixer, 
                replay_buffer, n_episodes=500, 
                batch_size=512, 
-               gamma=0.975, 
+               gamma=0.98, # Slightly higher gamma for long term food seeking
                lr=0.0001,
-               updates_per_step=1,
-               shaping_weight=0.02,
-               exploration_beta=0.1, 
+               shaping_weight=0.1, 
+               exploration_beta=0.2, 
                n_step=3):
     
-    all_params = list(mixer.parameters())
-    for net in agent_q_networks:
-        all_params += list(net.parameters())
-        
+    # Optimizer for Shared Net + Mixer
+    all_params = list(mixer.parameters()) + list(agent_net.parameters())
     optimizer = optim.Adam(all_params, lr=lr, eps=1.5e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_episodes, eta_min=1e-6)
     
@@ -376,31 +379,36 @@ def train_rainbow_qmix(env, agent_q_networks, target_q_networks, mixer, target_m
 
     n_step_buffer = NStepBuffer(n_step=n_step, gamma=gamma)
 
+    # For shared network support in functions expecting lists
+    agent_q_networks = [agent_net, agent_net]
+    target_q_networks = [target_net, target_net]
+
     for episode in range(n_episodes):
         done = {agent_id: False for agent_id in agent_indexes}
         env.reset()
         n_step_buffer.reset()
+        
+        # Reset count every 50 episodes to force re-exploration
+        if episode % 50 == 0:
+            visit_counts.clear()
         
         episode_reward = 0
         score = 0
         prev_dists = {}
         has_trained = False
         
-        # Reset noise
-        for net in agent_q_networks:
-            net.reset_noise()
-            
+        agent_net.reset_noise()
         per_beta = beta_by_episode(episode)
 
         while not all(done.values()):
             actions = [-1 for _ in env.agents]
             states = []
-            
             current_observations = {}
 
             for i, agent_index in enumerate(agent_indexes):
                 obs_agent = env.get_Observation(agent_index)
                 
+                # Shaping Pre-calculation
                 if shaping_weight > 0 or exploration_beta > 0:
                     current_observations[agent_index] = obs_agent
                     if shaping_weight > 0:
@@ -410,12 +418,15 @@ def train_rainbow_qmix(env, agent_q_networks, target_q_networks, mixer, target_m
                 states.append(state)
                 current_legal = info["legal_actions"][agent_index] if info is not None else legal_actions
                 
-                action = select_action(agent_q_networks[i], state, current_legal)
+                # Shared network selects action for both
+                action = select_action(agent_net, state, current_legal)
                 actions[agent_index] = action
 
             next_states, rewards, terminations, info = env.step(actions)
             score -= info["score_change"]
             done = {key: value for key, value in terminations.items() if key in agent_indexes}
+            
+            # NOTE: We track raw reward here for logging
             episode_reward += rewards[1] + rewards[3]
 
             augmented_rewards = {}
@@ -425,8 +436,9 @@ def train_rainbow_qmix(env, agent_q_networks, target_q_networks, mixer, target_m
                 
                 if shaping_weight > 0:
                     curr_dist = get_min_food_dist(obs_curr, agent_index)
-                    shaping = (prev_dists[agent_index] - curr_dist) * shaping_weight
-                    total_extra += shaping
+                    # Reward for getting closer, penalty for getting further
+                    dist_delta = prev_dists[agent_index] - curr_dist
+                    total_extra += (dist_delta * shaping_weight)
                 
                 if exploration_beta > 0:
                     total_extra += get_exploration_bonus(
@@ -450,12 +462,10 @@ def train_rainbow_qmix(env, agent_q_networks, target_q_networks, mixer, target_m
 
             next_states_converted = torch.stack(next_states_converted)
             states_converted = torch.stack(states)
-            rewards_converted = [rewards_converted]
-            terminations_converted = [terminations_converted]
             
-            # N-STEP BUFFER
-            team_reward = rewards_converted[0][0] 
-            team_done = terminations_converted[0][0]
+            # Team Reward Calculation
+            team_reward = (rewards_converted[0] + rewards_converted[1]) / 2.0
+            team_done = terminations_converted[0] or terminations_converted[1]
             
             transition = n_step_buffer.add(
                 states_converted, 
@@ -470,30 +480,30 @@ def train_rainbow_qmix(env, agent_q_networks, target_q_networks, mixer, target_m
             
             if replay_buffer.size() >= batch_size:
                 has_trained = True
-                for _ in range(updates_per_step):
-                    batch, idxs, weights = replay_buffer.sample(batch_size, beta=per_beta)
-                    
-                    loss, td_errors = compute_td_loss(
-                        agent_q_networks, target_q_networks, mixer, target_mixer, 
-                        batch, weights=weights, gamma=gamma, n_step=n_step
-                    )
-                    
-                    replay_buffer.update_priorities(idxs, td_errors)
-                    
-                    optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(all_params, max_norm=10.0)
-                    optimizer.step()
-                    soft_update_target_network(agent_q_networks, target_q_networks, tau=0.01)
-                    soft_update_mixer(mixer, target_mixer, tau=0.01)
+                batch, idxs, weights = replay_buffer.sample(batch_size, beta=per_beta)
+                
+                loss, td_errors = compute_td_loss(
+                    agent_q_networks, target_q_networks, mixer, target_mixer, 
+                    batch, weights=weights, gamma=gamma, n_step=n_step
+                )
+                
+                replay_buffer.update_priorities(idxs, td_errors)
+                
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(all_params, max_norm=10.0)
+                optimizer.step()
+                soft_update_target_network(agent_q_networks, target_q_networks, tau=0.01)
+                soft_update_mixer(mixer, target_mixer, tau=0.01)
 
         if has_trained: scheduler.step()
         episode_rewards.append(episode_reward)
         episode_scores.append(score)
         
         if (episode + 1) % 5 == 0:
-            avg_reward = np.mean(episode_rewards[-10:])
-            print(f"Ep {episode + 1}/{n_episodes} | Rew: {avg_reward:.2f} | LR: {scheduler.get_last_lr()[0]:.5f}")
+            avg_reward = np.mean(episode_rewards[-5:])
+            avg_score = np.mean(episode_scores[-5:])
+            print(f"Ep {episode + 1}/{n_episodes} | Rew: {avg_reward:.2f} | Score: {avg_score:.2f} | LR: {scheduler.get_last_lr()[0]:.5f}")
     
     return episode_rewards, episode_scores
 
@@ -530,35 +540,25 @@ obs_individual_agent = env.get_Observation(0)
 obs_shape = obs_individual_agent.shape
 
 # 1. Instantiate SEPARATE networks (now hidden_dim=512 default)
-agent_net_1 = AgentQNetwork(obs_shape, action_dim_individual_agent).to(device)
-agent_net_3 = AgentQNetwork(obs_shape, action_dim_individual_agent).to(device)
-
-target_net_1 = AgentQNetwork(obs_shape, action_dim_individual_agent).to(device)
-target_net_3 = AgentQNetwork(obs_shape, action_dim_individual_agent).to(device)
-
-target_net_1.load_state_dict(agent_net_1.state_dict())
-target_net_3.load_state_dict(agent_net_3.state_dict())
-
-agent_q_networks = [agent_net_1, agent_net_3]
-target_q_networks = [target_net_1, target_net_3]
+shared_agent = AgentQNetwork(obs_shape, action_dim_individual_agent).to(device)
+shared_target = AgentQNetwork(obs_shape, action_dim_individual_agent).to(device)
+shared_target.load_state_dict(shared_agent.state_dict())
 
 mixer = SimpleQMixer(n_agents=n_agents, state_shape=obs_shape, embed_dim=32).to(device)
 target_mixer = SimpleQMixer(n_agents=n_agents, state_shape=obs_shape, embed_dim=32).to(device)
 target_mixer.load_state_dict(mixer.state_dict())
 
-# 2. Use Simplified Buffer
 replay_buffer = NaivePrioritizedBuffer(capacity=100_000, alpha=0.6)
 
 print("Starting Upgraded Rainbow Training (Separate Nets, 512-dim, Ortho-Init)...")
 rewards_exp, scores_exp = train_rainbow_qmix(
-    env, agent_q_networks, target_q_networks, mixer, target_mixer, replay_buffer,
-    n_episodes=100,
+    env, shared_agent, shared_target, mixer, target_mixer, replay_buffer,
+    n_episodes=150,
     batch_size=512,
     lr=0.0005,
-    gamma=0.97,
-    updates_per_step=1,
-    shaping_weight=0.00,
-    exploration_beta=0.2, 
+    gamma=0.98,
+    shaping_weight=0.1,
+    exploration_beta=0.3, 
     n_step=3 
 )
 
