@@ -323,10 +323,6 @@ def train_rainbow_qmix(env, agent_net, target_net, mixer, target_mixer,
         n_step_buffer.reset()
         done = {agent_id: False for agent_id in agent_indexes}
         
-        # Reset visit counts occasionally to force re-exploration
-        if episode % 50 == 0:
-            visit_counts.clear()
-
         episode_reward = 0.0
         score = 0.0
         has_trained = False
