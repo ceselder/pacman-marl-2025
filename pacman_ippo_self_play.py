@@ -20,7 +20,7 @@ CLIP_EPS = 0.2
 ENT_COEF = 0.01 #entropy penalty
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
-UPDATE_EPOCHS = 6     # How many times to re-use data
+UPDATE_EPOCHS = 10     # How many times to re-use data
 TOTAL_UPDATES = 300   # Total training loops
 
 HIDDEN_DIM = 512 #512 seems to work ok
