@@ -10,18 +10,18 @@ from gymPacMan import gymPacMan_parallel_env
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 NUM_STEPS = 2048       # Steps to collect per agent before updating
-BATCH_SIZE = 32        # Minibatch size for PPO update
+BATCH_SIZE = 128        # Minibatch size for PPO update
 LR = 2.5e-4
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.2
-ENT_COEF = 0.01 #entropy penalty
+ENT_COEF = 0.02 #entropy penalty
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 10     # How many times to re-use data
 TOTAL_UPDATES = 100   # Total training loops
 
-HIDDEN_DIM_SIZE = 128
+HIDDEN_DIM_SIZE = 512
 
 
 
