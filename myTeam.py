@@ -1,302 +1,423 @@
-# myTeam.py
-# ---------
-# Licensing Information:  You are free to use or extend these projects for
-# educational purposes provided that (1) you do not distribute or publish
-# solutions, (2) you retain this notice, and (3) you provide clear
-# attribution to UC Berkeley, including a link to http://ai.berkeley.edu.
-#
-# Attribution Information: The Pacman AI projects were developed at UC Berkeley.
-# The core projects and autograders were primarily created by John DeNero
-# (denero@cs.berkeley.edu) and Dan Klein (klein@cs.berkeley.edu).
-# Student side autograding was added by Brad Miller, Nick Hay, and
-# Pieter Abbeel (pabbeel@cs.berkeley.edu).
+import os
 import numpy as np
 import torch
-from torch import nn
+import torch.nn as nn
+from torch.distributions import Categorical
+from gymPacMan import gymPacMan_parallel_env
+from collections import deque
+import copy
+import matplotlib.pyplot as plt
 
-from captureAgents import CaptureAgent
-import random
+# --- Hyperparameters ---
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-if torch.cuda.is_available():
-    device = torch.device("cuda:0")
-    print("Running on the GPU")
-else:
-    device = torch.device("cpu")
-    print("Running on the CPU")
+NUM_STEPS = 2048        
+BATCH_SIZE = 256        
+LR = 2.5e-4             
+GAMMA = 0.99            
+GAE_LAMBDA = 0.95       
+CLIP_EPS = 0.2          
+ENT_COEF = 0.025        
+VF_COEF = 0.5           
+MAX_GRAD_NORM = 0.5     
+UPDATE_EPOCHS = 5       
+TOTAL_UPDATES = 300     
 
+# Architecture Dimensions
+VALUE_HIDDEN_DIM = 512
+CRITIC_HIDDEN_DIM = 1024 
 
-"""
-Todo:
-- 
-- Rename this file to TEAM_NAME.py 
-- Load in your model which should start with your TEAM_NAME
-"""
+# Training Settings
+REWARD_SCALE = 5.0        
+WARMUP_UPDATES = 50       
+OPPONENT_UPDATE_FREQ = 10  
+OPPONENT_POOL_SIZE = 5     
+SELF_PLAY_PROB = 0.5       
+EVAL_FREQ = 10             
+EVAL_EPISODES = 5          
+SNAPSHOT_FREQ = 50        
 
-#####################
-# Agent model class #
-#####################
+# --- Agent Architecture ---
+class MAPPOAgent(nn.Module):
+    def __init__(self, obs_shape, action_dim, num_agents=2):
+        super().__init__()
+        
+        # --- Decentralized Actor ---
+        self.actor_conv = nn.Sequential(
+            nn.Conv2d(obs_shape[0], 32, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
+            nn.Flatten()
+        )
+        
+        with torch.no_grad():
+            dummy_obs = torch.zeros(1, *obs_shape)
+            actor_flat = self.actor_conv(dummy_obs).shape[1]
+            
+        self.actor = nn.Sequential(
+            nn.Linear(actor_flat, VALUE_HIDDEN_DIM),   nn.ReLU(),
+            nn.Linear(VALUE_HIDDEN_DIM, VALUE_HIDDEN_DIM), nn.ReLU(), 
+            nn.Linear(VALUE_HIDDEN_DIM, action_dim)
+        )
 
-class AgentQNetwork(nn.Module):
-    def __init__(self):
-        super(AgentQNetwork, self).__init__()
+        # --- Centralized Critic ---
+        critic_input_channels = obs_shape[0] * num_agents
+        self.critic_conv = nn.Sequential(
+            nn.Conv2d(critic_input_channels, 32, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
+            nn.Flatten()
+        )
+        
+        with torch.no_grad():
+            dummy_state = torch.zeros(1, critic_input_channels, obs_shape[1], obs_shape[2])
+            critic_flat = self.critic_conv(dummy_state).shape[1]
 
-    def forward(self, obs):
+        self.critic = nn.Sequential(
+            nn.Linear(critic_flat, CRITIC_HIDDEN_DIM),  nn.ReLU(),
+            nn.Linear(CRITIC_HIDDEN_DIM, CRITIC_HIDDEN_DIM),   nn.ReLU(), 
+            nn.Linear(CRITIC_HIDDEN_DIM, 1)
+        )
 
-        return q_values
+    def get_action(self, x):
+        hidden = self.actor_conv(x)
+        logits = self.actor(hidden)
+        dist = Categorical(logits=logits)
+        action = dist.sample()
+        return action, dist.log_prob(action)
 
-#################
-# Team creation #
-#################
+    def get_value(self, state):
+        hidden = self.critic_conv(state)
+        return self.critic(hidden).squeeze(-1)
 
-def createTeam(firstIndex, secondIndex, isRed,
-               first='Agent1', second='Agent3', dir=''):
+    def evaluate(self, obs, state, action):
+        a_hidden = self.actor_conv(obs)
+        logits = self.actor(a_hidden)
+        dist = Categorical(logits=logits)
+        log_probs = dist.log_prob(action)
+        entropy = dist.entropy()
+        
+        c_hidden = self.critic_conv(state)
+        values = self.critic(c_hidden).squeeze(-1)
+        
+        return values, log_probs, entropy
+
+# --- Helpers ---
+def compute_gae(rewards, values, dones, last_value, last_done):
+    T = len(rewards)
+    advantages = torch.zeros_like(rewards)
+    lastgaelam = 0
+    for t in reversed(range(T)):
+        if t == T - 1:
+            next_non_terminal = 1.0 - last_done
+            next_values = last_value
+        else:
+            next_non_terminal = 1.0 - dones[t + 1]
+            next_values = values[t + 1]
+        delta = rewards[t] + GAMMA * next_values * next_non_terminal - values[t]
+        advantages[t] = lastgaelam = delta + GAMMA * GAE_LAMBDA * next_non_terminal * lastgaelam
+    return advantages, advantages + values
+
+def process_obs(obs, is_red_team): 
     """
-    This function should return a list of two agents that will form the
-    team, initialized using firstIndex and secondIndex as their agent
-    index numbers.  isRed is True if the red team is being created, and
-    will be False if the blue team is being created.
-
-    As a potentially helpful development aid, this function can take
-    additional string-valued keyword arguments ("first" and "second" are
-    such arguments in the case of this function), which will come from
-    the --redOpts and --blueOpts command-line arguments to capture.py.
-    For the nightly contest, however, your team will be created without
-    any extra arguments, so you should make sure that the default
-    behavior is what you want for the nightly contest.
+    Standardizes observations:
+    1. Swaps Channels (Red Food <-> Blue Food)
+    2. HORIZONTAL FLIP (To match myTeam.py logic)
     """
+    if not is_red_team:
+        return obs 
 
-    # The following line is an example only; feel free to change it.
-    return [eval(first)(firstIndex, dir), eval(second)(secondIndex, dir)]
+    new_obs = obs.clone()
+    
+    # 1. Swap Channels
+    new_obs[:, 2, :, :] = obs[:, 3, :, :] # Capsules
+    new_obs[:, 3, :, :] = obs[:, 2, :, :]
+    new_obs[:, 6, :, :] = obs[:, 7, :, :] # Food
+    new_obs[:, 7, :, :] = obs[:, 6, :, :]
+    
+    # 2. HORIZONTAL FLIP (Batch, C, H, W) -> Flip W (dim 3)
+    new_obs = torch.flip(new_obs, [3])
+    
+    return new_obs
 
+def invert_actions(actions):
+    """
+    Maps actions for Horizontal Mirroring.
+    0 (North) -> 0 (North)
+    1 (East)  -> 3 (West)
+    2 (South) -> 2 (South)
+    3 (West)  -> 1 (East)
+    4 (Stop)  -> 4 (Stop)
+    """
+    mapper = torch.tensor([0, 3, 2, 1, 4], device=actions.device)
+    return mapper[actions]
 
-##########
-# Agents #
-##########
-
-class Agent1(CaptureAgent):
-    def __init__(self, index, dir=''):
-        super().__init__(index)
-        # The dir variable is only used for the competition so you can ignore that
-        # Todo: change model name
-        self.Q = AgentQNetwork().to(device)
-        self.Q.load_state_dict(torch.load(dir + "MODEL_NAME.pth"))
-
-    def registerInitialState(self, gameState):
-        """
-        This method handles the initial setup of the
-        agent to populate useful fields (such as what team
-        we're on).
-
-        A distanceCalculator instance caches the maze distances
-        between each pair of positions, so your agents can use:
-        self.distancer.getDistance(p1, p2)
-
-        IMPORTANT: This method may run for at most 15 seconds.
-        """
-
-        '''
-        Make sure you do not delete the following line. If you would like to
-        use Manhattan distances instead of maze distances in order to save
-        on initialization time, please take a look at
-        CaptureAgent.registerInitialState in captureAgents.py.
-        '''
-        self.arena_width = gameState.data.layout.width
-        self.arena_height = gameState.data.layout.height
-        self.center_line = self.compute_center_line(gameState)
-        CaptureAgent.registerInitialState(self, gameState)
-
-
-
-
-    '''
-    Your initialization code goes here, if you need any.
-    '''
-
-    def chooseAction(self, gameState):
-        state = get_Observation(self.index, gameState).to(device)
-        state = torch.unsqueeze(torch.tensor(state, dtype=torch.float32), 0).to(device)
-        # Todo: flatten if required
-        if self.index in [1,3]: # If team blue normal mapping
-            action_mapping = {
-                0: "North",
-                1: "East",
-                2: "South",
-                3: "West",
-                4: "Stop"
-            }
-        else: # If team red the actions have to be mirrored as the observation is mirrored
-            action_mapping = {
-                0: "North",
-                3: "East",
-                2: "South",
-                1: "West",
-                4: "Stop"
-            }
-        # Exploit: take the action with the highest Q-value
-        q_values = self.Q(state).cpu().detach().numpy()[0]
-        index = np.random.choice(np.flatnonzero(q_values == q_values.max()))
-        action = action_mapping[index]
-
-        return action
-
-    def compute_center_line(self, gameState):
-        """
-        Return center line positions.
-        """
-        walls = gameState.getWalls().asList()
-        if self.red:
-            border_x = self.arena_width // 2 - 1
-        else:
-            border_x = self.arena_width // 2
-        border_line = [(border_x, h) for h in range(self.arena_height)]
-        # return [(x, y) for (x, y) in border_line if (x, y) not in walls and (x + 1 - 2*self.red, y) not in walls]
-        return [(x, y) for (x, y) in border_line if (x, y) not in walls]
-
-
-class Agent3(CaptureAgent):
-    def __init__(self, index, dir=''):
-        # The dir variable is only used for the competition so you can ignore that
-        # Todo: change model name
-        super().__init__(index)
-        self.Q = AgentQNetwork().to(device)
-        self.Q.load_state_dict(torch.load(dir + "MODEL_NAME.pth"))
-
-    def registerInitialState(self, gameState):
-        """
-        This method handles the initial setup of the
-        agent to populate useful fields (such as what team
-        we're on).
-
-        A distanceCalculator instance caches the maze distances
-        between each pair of positions, so your agents can use:
-        self.distancer.getDistance(p1, p2)
-
-        IMPORTANT: This method may run for at most 15 seconds.
-        """
-
-        '''
-        Make sure you do not delete the following line. If you would like to
-        use Manhattan distances instead of maze distances in order to save
-        on initialization time, please take a look at
-        CaptureAgent.registerInitialState in captureAgents.py.
-        '''
-        self.arena_width = gameState.data.layout.width
-        self.arena_height = gameState.data.layout.height
-        self.center_line = self.compute_center_line(gameState)
-        CaptureAgent.registerInitialState(self, gameState)
-
-    '''
-    Your initialization code goes here, if you need any.
-    '''
-
-    def chooseAction(self, gameState):
-        state = get_Observation(self.index, gameState).to(device)
-        state = torch.unsqueeze(torch.tensor(state, dtype=torch.float32), 0).to(device)
-        # Todo: flatten if required
-
-        if self.index in [1,3]: # If team blue normal mapping
-            action_mapping = {
-                0: "North",
-                1: "East",
-                2: "South",
-                3: "West",
-                4: "Stop"
-            }
-        else: # If team red the actions have to be mirrored as the observation is mirrored
-            action_mapping = {
-                0: "North",
-                3: "East",
-                2: "South",
-                1: "West",
-                4: "Stop"
-            }
-        # Exploit: take the action with the highest Q-value
-        q_values = self.Q(state).cpu().detach().numpy()[0]
-        index = np.random.choice(np.flatnonzero(q_values == q_values.max()))
-        action = action_mapping[index]
-
-        return action
-
-    def compute_center_line(self, gameState):
-        """
-        Return center line positions.
-        """
-        walls = gameState.getWalls().asList()
-        if self.red:
-            border_x = self.arena_width // 2 - 1
-        else:
-            border_x = self.arena_width // 2
-        border_line = [(border_x, h) for h in range(self.arena_height)]
-        # return [(x, y) for (x, y) in border_line if (x, y) not in walls and (x + 1 - 2*self.red, y) not in walls]
-        return [(x, y) for (x, y) in border_line if (x, y) not in walls]
-
-
-def get_Observation(agentIndex, state):
-    locations = []
-    for i in range(4):
-        if state.getAgentPosition(i):
-            locations.append(state.getAgentPosition(i)[::-1])
-        else:
-            locations.append(None)
-
-    # locations = [state.getAgentPosition(i)[::-1] for i in range(4)]
-    layout_shape = (state.data.layout.height, state.data.layout.width)
-    location = torch.zeros(layout_shape)
-    alliesLocations = torch.zeros(layout_shape)
-    enemiesLocations = torch.zeros(layout_shape)
-    blueCapsules = torch.zeros(layout_shape)
-    redCapsules = torch.zeros(layout_shape)
-
-    observation = torch.unsqueeze(torch.tensor(state.getWalls().data).T, dim=0)
-    if locations[agentIndex]:
-        location[locations[agentIndex]] = 1 + state.getAgentState(agentIndex).numCarrying
-    observation = torch.cat((observation, location.unsqueeze(0)), dim=0)
-
-    for otherAgent in range(4):
-        if otherAgent != agentIndex:
-            if (otherAgent in [0,2] and agentIndex in [0,2]) or (otherAgent in [1,3] and agentIndex in [1,3]):
-                if locations[agentIndex]:
-                    alliesLocations[locations[otherAgent]] = 1
-                for capX, capY in state.getBlueCapsules():
-                    blueCapsules[capY, capX] = 1
+def evaluate_vs_random(agent, eval_env, num_episodes=5):
+    agent.eval()
+    total_rewards = []
+    learner_ids = [1, 3] # Blue
+    
+    for _ in range(num_episodes):
+        obs_dict, _ = eval_env.reset(enemieName='randomTeam')
+        obs = torch.stack([obs_dict[eval_env.agents[i]] for i in learner_ids]).float()
+        processed_obs = process_obs(obs, is_red_team=False)
+        done = False
+        episode_reward = 0
+        
+        while not done:
+            with torch.no_grad():
+                actions, _ = agent.get_action(processed_obs.to(device))
+                actions = actions.cpu()
+            
+            env_actions = {}
+            for i, ag_id in enumerate(learner_ids):
+                env_actions[eval_env.agents[ag_id]] = actions[i].item()
+                
+            next_obs_dict, rewards_dict, dones_dict, _ = eval_env.step(env_actions)
+            step_reward = sum(rewards_dict[eval_env.agents[i]] for i in learner_ids)
+            episode_reward += step_reward
+            
+            if any(dones_dict.values()):
+                done = True
             else:
-                if locations[agentIndex]:
-                    enemiesLocations[locations[otherAgent]] = 1
-                for capX, capY in state.getRedCapsules():
-                    redCapsules[capY, capX] = 1
+                obs = torch.stack([next_obs_dict[eval_env.agents[i]] for i in learner_ids]).float()
+                processed_obs = process_obs(obs, is_red_team=False)
+                
+        total_rewards.append(episode_reward)
+    
+    agent.train()
+    return np.mean(total_rewards)
 
-    if agentIndex in [1,3]:
-        # Observation remains unchanged for the blue team
-        observation = torch.cat((
-            observation,
-            blueCapsules.unsqueeze(0),
-            redCapsules.unsqueeze(0),
-            alliesLocations.unsqueeze(0),
-            enemiesLocations.unsqueeze(0),
-            torch.unsqueeze(torch.tensor(state.getBlueFood().data).T, dim=0),
-            torch.unsqueeze(torch.tensor(state.getRedFood().data).T, dim=0)
-        ), dim=0)
-    else:
-        # Create a completely new observation for the red team
-        flipped_observation = torch.flip(observation, dims=[2])  # Flip observation horizontally
-        flipped_blue_capsules = torch.flip(redCapsules.unsqueeze(0), dims=[2])  # Flip red capsules as blue
-        flipped_red_capsules = torch.flip(blueCapsules.unsqueeze(0), dims=[2])  # Flip blue capsules as red
-        flipped_allies = torch.flip(alliesLocations.unsqueeze(0), dims=[2])  # Flip ally locations
-        flipped_enemies = torch.flip(enemiesLocations.unsqueeze(0), dims=[2])  # Flip enemy locations
-        flipped_blue_food = torch.flip(torch.unsqueeze(torch.tensor(state.getRedFood().data).T, dim=0),
-                                       dims=[2])  # Red food as blue
-        flipped_red_food = torch.flip(torch.unsqueeze(torch.tensor(state.getBlueFood().data).T, dim=0),
-                                      dims=[2])  # Blue food as red
+# --- Main Training Loop ---
+def train_mappo(train_env, eval_env):
+    dummy_obs = train_env.get_Observation(0)
+    obs_shape = dummy_obs.shape
+    num_agents = 2
+    state_shape = (obs_shape[0] * num_agents, obs_shape[1], obs_shape[2])
+    
+    agent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
+    optimizer = torch.optim.Adam(agent.parameters(), lr=LR, eps=1e-5)
+    
+    opponent_pool = deque(maxlen=OPPONENT_POOL_SIZE)
+    opponent_pool.append(copy.deepcopy(agent.state_dict()))
+    
+    log = {
+        'update': [], 'reward': [], 'eval_reward': [], 'episode_return': [], 
+        'pg_loss': [], 'v_loss': [], 'entropy': [], 'clip_frac': []
+    }
+    episode_returns = []
 
-        # Combine flipped components into the final observation
-        observation = torch.cat((
-            flipped_observation,
-            flipped_blue_capsules,
-            flipped_red_capsules,
-            flipped_allies,
-            flipped_enemies,
-            flipped_blue_food,
-            flipped_red_food
-        ), dim=0)
+    def get_opponent():
+        opp = MAPPOAgent(obs_shape, 5, num_agents).to(device)
+        if np.random.random() < SELF_PLAY_PROB and len(opponent_pool) > 1:
+            opp.load_state_dict(np.random.choice(list(opponent_pool)[:-1]))
+        else:
+            opp.load_state_dict(opponent_pool[-1])
+        opp.eval()
+        return opp
 
-    return observation
+    for update in range(1, TOTAL_UPDATES + 1):
+        
+        if update <= WARMUP_UPDATES:
+            current_opp_is_random = True
+            is_red_learner = False 
+            train_ids = [1, 3]
+            opp_ids = [0, 2]
+        else:
+            current_opp_is_random = False
+            opponent = get_opponent()
+            if np.random.rand() > 0.5:
+                train_ids = [1, 3]; opp_ids = [0, 2]; is_red_learner = False
+            else:
+                train_ids = [0, 2]; opp_ids = [1, 3]; is_red_learner = True
+
+        obs_buf = torch.zeros((NUM_STEPS, num_agents, *obs_shape))
+        state_buf = torch.zeros((NUM_STEPS, num_agents, *state_shape))
+        actions_buf = torch.zeros((NUM_STEPS, num_agents), dtype=torch.long)
+        logprobs_buf = torch.zeros((NUM_STEPS, num_agents))
+        rewards_buf = torch.zeros((NUM_STEPS, num_agents))
+        dones_buf = torch.zeros((NUM_STEPS, num_agents))
+        values_buf = torch.zeros((NUM_STEPS, num_agents))
+
+        train_env.reset()
+        raw_obs = torch.stack([train_env.get_Observation(i) for i in train_ids]).float()
+        next_obs = process_obs(raw_obs, is_red_team=is_red_learner)
+        curr_global_state = torch.cat([next_obs[0], next_obs[1]], dim=0)
+        next_state = torch.stack([curr_global_state] * num_agents) 
+        next_done = torch.zeros(num_agents)
+        current_ep_reward = 0
+
+        for step in range(NUM_STEPS):
+            obs_buf[step] = next_obs
+            state_buf[step] = next_state
+            dones_buf[step] = next_done
+            
+            with torch.no_grad():
+                action, logprob = agent.get_action(next_obs.to(device))
+                value = agent.get_value(next_state.to(device))
+                action, logprob, value = action.cpu(), logprob.cpu(), value.cpu()
+            
+            actions_buf[step], logprobs_buf[step], values_buf[step] = action, logprob, value
+
+            # Learner Actions
+            if is_red_learner:
+                real_learner_actions = invert_actions(action)
+            else:
+                real_learner_actions = action
+
+            # Opponent Actions
+            if current_opp_is_random:
+                opp_actions_scalar = torch.randint(0, 5, (num_agents,))
+                real_opp_actions = opp_actions_scalar 
+            else:
+                opp_raw_obs = torch.stack([train_env.get_Observation(i) for i in opp_ids]).float()
+                opp_is_red = not is_red_learner
+                opp_obs = process_obs(opp_raw_obs, is_red_team=opp_is_red).to(device)
+                opp_actions_scalar, _ = opponent.get_action(opp_obs)
+                opp_actions_scalar = opp_actions_scalar.cpu()
+
+                if opp_is_red:
+                    real_opp_actions = invert_actions(opp_actions_scalar)
+                else:
+                    real_opp_actions = opp_actions_scalar
+
+            # Execute
+            env_actions = {}
+            for i, ag_id in enumerate(train_ids):
+                env_actions[train_env.agents[ag_id]] = real_learner_actions[i].item()
+            for i, ag_id in enumerate(opp_ids):
+                env_actions[train_env.agents[ag_id]] = real_opp_actions[i].item()
+
+            next_obs_dict, rewards_dict, dones_dict, _ = train_env.step(env_actions)
+            
+            team_reward = sum(rewards_dict[train_env.agents[i]] for i in train_ids)
+            rewards_buf[step] = team_reward * REWARD_SCALE
+            current_ep_reward += team_reward
+            
+            any_done = any(dones_dict[train_env.agents[i]] for i in train_ids)
+            next_done = torch.full((num_agents,), float(any_done))
+            
+            if any_done:
+                episode_returns.append(current_ep_reward)
+                current_ep_reward = 0
+                train_env.reset()
+                raw_obs = torch.stack([train_env.get_Observation(i) for i in train_ids]).float()
+            else:
+                raw_obs = torch.stack([next_obs_dict[train_env.agents[i]] for i in train_ids]).float()
+            
+            next_obs = process_obs(raw_obs, is_red_team=is_red_learner)
+            curr_global_state = torch.cat([next_obs[0], next_obs[1]], dim=0)
+            next_state = torch.stack([curr_global_state] * num_agents)
+
+        # GAE
+        with torch.no_grad():
+            last_value = agent.get_value(next_state.to(device)).cpu()
+        advantages, returns = compute_gae(rewards_buf, values_buf, dones_buf, last_value, next_done)
+
+        b_obs, b_state = obs_buf.reshape(-1, *obs_shape), state_buf.reshape(-1, *state_shape)
+        b_actions, b_logprobs = actions_buf.reshape(-1), logprobs_buf.reshape(-1)
+        b_advantages, b_returns = advantages.reshape(-1), returns.reshape(-1)
+        
+        indices = np.arange(NUM_STEPS * num_agents)
+        pg_losses, v_losses, entropies, clip_fracs = [], [], [], []
+
+        for _ in range(UPDATE_EPOCHS):
+            np.random.shuffle(indices)
+            for start in range(0, len(indices), BATCH_SIZE):
+                mb = indices[start:start + BATCH_SIZE]
+                mb_adv = (b_advantages[mb] - b_advantages[mb].mean()) / (b_advantages[mb].std() + 1e-8)
+
+                newvalue, newlogprob, entropy = agent.evaluate(b_obs[mb].to(device), b_state[mb].to(device), b_actions[mb].to(device))
+                ratio = (newlogprob - b_logprobs[mb].to(device)).exp()
+                
+                with torch.no_grad():
+                    clip_fracs.append(((ratio - 1.0).abs() > CLIP_EPS).float().mean().item())
+
+                pg_loss = -torch.min(ratio * mb_adv.to(device), torch.clamp(ratio, 1-CLIP_EPS, 1+CLIP_EPS) * mb_adv.to(device)).mean()
+                v_loss = 0.5 * ((newvalue - b_returns[mb].to(device)) ** 2).mean()
+                loss = pg_loss - ENT_COEF * entropy.mean() + VF_COEF * v_loss
+
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(agent.parameters(), MAX_GRAD_NORM)
+                optimizer.step()
+                
+                pg_losses.append(pg_loss.item()); v_losses.append(v_loss.item()); entropies.append(entropy.mean().item())
+
+        if update % OPPONENT_UPDATE_FREQ == 0:
+            opponent_pool.append(copy.deepcopy(agent.state_dict()))
+
+        if update % EVAL_FREQ == 0:
+            eval_score = evaluate_vs_random(agent, eval_env, num_episodes=EVAL_EPISODES)
+            log['eval_reward'].append(eval_score)
+        else:
+            log['eval_reward'].append(log['eval_reward'][-1] if log['eval_reward'] else 0)
+
+        if update % SNAPSHOT_FREQ == 0:
+            fn = f"mappo_pacman_update_{update}.pt"
+            torch.save(agent.state_dict(), fn)
+            print(f"--- Saved {fn} ---")
+
+        mean_reward = rewards_buf.sum().item() / num_agents
+        mean_ep_return = np.mean(episode_returns[-10:]) if episode_returns else 0
+        side = "Warm" if update <= WARMUP_UPDATES else ("Red" if is_red_learner else "Blue")
+        
+        print(f"Upd {update:3d}/{TOTAL_UPDATES} [{side:<4}] | Rwd: {mean_reward:6.1f} | EpRet: {mean_ep_return:6.1f} | Eval: {log['eval_reward'][-1]:6.1f} | Ent: {np.mean(entropies):.3f} | Clip: {np.mean(clip_fracs):.3f}")
+        
+        log['update'].append(update)
+        log['reward'].append(mean_reward)
+        log['episode_return'].append(mean_ep_return)
+        log['pg_loss'].append(np.mean(pg_losses))
+        log['v_loss'].append(np.mean(v_losses))
+        log['entropy'].append(np.mean(entropies))
+        log['clip_frac'].append(np.mean(clip_fracs))
+
+    torch.save(agent.state_dict(), "mappo_pacman_final.pt")
+    return log
+
+def plot_training(log):
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    
+    axes[0,0].plot(log['update'], log['reward'])
+    axes[0,0].set_title('Rollout Reward (Scaled)')
+    axes[0,0].set_xlabel('Update')
+    axes[0,0].grid(True)
+    
+    axes[0,1].plot(log['update'], log['episode_return'], label='Self-Play')
+    axes[0,1].plot(log['update'], log['eval_reward'], label='vs Random', color='orange')
+    axes[0,1].set_title('Episode Return')
+    axes[0,1].legend()
+    axes[0,1].set_xlabel('Update')
+    axes[0,1].grid(True)
+    
+    axes[0,2].plot(log['update'], log['entropy'])
+    axes[0,2].set_title('Entropy')
+    axes[0,2].set_xlabel('Update')
+    axes[0,2].grid(True)
+    
+    axes[1,0].plot(log['update'], log['pg_loss'])
+    axes[1,0].set_title('Policy Loss')
+    axes[1,0].set_xlabel('Update')
+    axes[1,0].grid(True)
+    
+    axes[1,1].plot(log['update'], log['v_loss'])
+    axes[1,1].set_title('Value Loss')
+    axes[1,1].set_xlabel('Update')
+    axes[1,1].grid(True)
+    
+    axes[1,2].plot(log['update'], log['clip_frac'])
+    axes[1,2].set_title('Clip Fraction')
+    axes[1,2].set_xlabel('Update')
+    axes[1,2].axhline(y=0.2, color='r', linestyle='--', alpha=0.5)
+    axes[1,2].grid(True)
+    
+    plt.tight_layout()
+    plt.savefig('mappo_training_curves.png', dpi=150)
+
+if __name__ == "__main__":
+    train_env = gymPacMan_parallel_env(layout_file=os.path.join('layouts', 'tinyCapture.lay'), display=False, reward_forLegalAction=True, defenceReward=True, length=300, enemieName='randomTeam', self_play=True, random_layout=False)
+    eval_env = gymPacMan_parallel_env(layout_file=os.path.join('layouts', 'tinyCapture.lay'), display=False, reward_forLegalAction=True, defenceReward=True, length=300, enemieName='randomTeam', self_play=False, random_layout=False)
+    
+    print("Starting MAPPO with WARMUP Curriculum (Horizontal Mirror)...")
+    log = train_mappo(train_env, eval_env)
+    plot_training(log)
