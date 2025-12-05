@@ -16,12 +16,12 @@ BATCH_SIZE = 256          # Smaller batches = more updates = smoother
 LR = 1.5e-4                 # Reduced
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
-CLIP_EPS = 0.02           # Reduced from 0.2 for stability
-ENT_COEF = 0.15           # Higher entropy for exploration
+CLIP_EPS = 0.13           # Reduced from 0.2 for stability
+ENT_COEF = 0.02           # Higher entropy for exploration
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
-TOTAL_UPDATES = 1500
+TOTAL_UPDATES = 800
 
 # Settings
 OPPONENT_POOL_SIZE = 5
