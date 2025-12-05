@@ -7,11 +7,12 @@ from torch.distributions import Categorical
 from gymPacMan import gymPacMan_parallel_env
 from collections import deque
 import copy
+import matplotlib as plt
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 NUM_STEPS = 2048       # Steps to collect per agent before updating
-BATCH_SIZE = 64        # Minibatch size for PPO update
+BATCH_SIZE = 128        # Minibatch size for PPO update
 LR = 2.5e-4
 GAMMA = 0.98
 GAE_LAMBDA = 0.95
@@ -19,8 +20,8 @@ CLIP_EPS = 0.2
 ENT_COEF = 0.01 #entropy penalty
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
-UPDATE_EPOCHS = 10     # How many times to re-use data
-TOTAL_UPDATES = 500   # Total training loops
+UPDATE_EPOCHS = 6     # How many times to re-use data
+TOTAL_UPDATES = 300   # Total training loops
 
 HIDDEN_DIM = 512 #512 seems to work ok
 
@@ -207,12 +208,45 @@ def train_ppo_selfplay(env):
 
     torch.save(agent.state_dict(), "ppo_pacman_selfplay.pt")
 
+def plot_training(log):
+    fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+    
+    axes[0,0].plot(log['update'], log['reward'])
+    axes[0,0].set_title('Rollout Reward')
+    axes[0,0].set_xlabel('Update')
+    
+    axes[0,1].plot(log['update'], log['episode_return'])
+    axes[0,1].set_title('Episode Return (10-ep avg)')
+    axes[0,1].set_xlabel('Update')
+    
+    axes[0,2].plot(log['update'], log['entropy'])
+    axes[0,2].set_title('Entropy')
+    axes[0,2].axhline(y=0.5, color='r', linestyle='--', alpha=0.5, label='danger zone')
+    axes[0,2].set_xlabel('Update')
+    
+    axes[1,0].plot(log['update'], log['pg_loss'])
+    axes[1,0].set_title('Policy Loss')
+    axes[1,0].set_xlabel('Update')
+    
+    axes[1,1].plot(log['update'], log['v_loss'])
+    axes[1,1].set_title('Value Loss')
+    axes[1,1].set_xlabel('Update')
+    
+    axes[1,2].plot(log['update'], log['clip_frac'])
+    axes[1,2].set_title('Clip Fraction')
+    axes[1,2].axhline(y=0.2, color='r', linestyle='--', alpha=0.5, label='too high')
+    axes[1,2].set_xlabel('Update')
+    
+    plt.tight_layout()
+    plt.savefig('training_curves.png', dpi=150)
+
 if __name__ == "__main__":
     env = gymPacMan_parallel_env(
         layout_file=os.path.join('layouts', 'tinyCapture.lay'),
         display=False, reward_forLegalAction=True, defenceReward=True,
-        length=1000, enemieName='randomTeam',
+        length=2, enemieName='randomTeam',
         self_play=True,  # <-- Enable self-play mode
         random_layout=False
     )
-    train_ppo_selfplay(env)
+    log = train_ppo_selfplay(env)
+    plot_training(log)
