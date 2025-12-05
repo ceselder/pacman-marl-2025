@@ -21,7 +21,7 @@ ENT_COEF = 0.025        # Entropy coefficient
 VF_COEF = 0.5           # Value Function coefficient
 MAX_GRAD_NORM = 0.5     # Gradient clipping
 UPDATE_EPOCHS = 5       # PPO Update epochs
-TOTAL_UPDATES = 1000    # Total training iterations (Increased to demonstrate snapshots)
+TOTAL_UPDATES = 500    # Total training iterations (Increased to demonstrate snapshots)
 
 HIDDEN_DIM = 512
 
