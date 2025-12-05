@@ -24,7 +24,7 @@ MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 10     # How many times to re-use data
 TOTAL_UPDATES = 100   # Total training loops
 
-HIDDEN_DIM_SIZE = 256
+HIDDEN_DIM_SIZE = 1024
 
 class ActorCritic(nn.Module):
     def __init__(self, obs_shape, action_dim):
@@ -159,7 +159,7 @@ def train_ppo(env):
             
             # Check if ANY of our agents died/finished
             any_done = any([dones_dict[i] for i in agent_ids])
-            if len(any_done > 0):
+            if any_done:
                 print("someone died!")
             next_done = torch.tensor([float(any_done)] * num_agents, device=device)
             
@@ -205,9 +205,6 @@ def train_ppo(env):
                 ratio = logratio.exp()
 
                 with torch.no_grad():
-                    # Calculate approx_kl http://joschu.net/blog/kl-approx.html
-                    old_approx_kl = (-logratio).mean()
-                    approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > CLIP_EPS).float().mean().item()]
 
                 mb_advantages = b_advantages[mb_inds]
