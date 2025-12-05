@@ -28,7 +28,7 @@ VALUE_HIDDEN_DIM = 512
 CRITIC_HIDDEN_DIM = 1024 
 
 # Training Settings
-REWARD_SCALE = 5.0        
+REWARD_SCALE = 1.0        
 WARMUP_UPDATES = 50       
 OPPONENT_UPDATE_FREQ = 10  
 OPPONENT_POOL_SIZE = 5     
@@ -415,8 +415,8 @@ def plot_training(log):
     plt.savefig('mappo_training_curves.png', dpi=150)
 
 if __name__ == "__main__":
-    train_env = gymPacMan_parallel_env(layout_file=os.path.join('layouts', 'tinyCapture.lay'), display=False, reward_forLegalAction=True, defenceReward=True, length=300, enemieName='randomTeam', self_play=True, random_layout=False)
-    eval_env = gymPacMan_parallel_env(layout_file=os.path.join('layouts', 'tinyCapture.lay'), display=False, reward_forLegalAction=True, defenceReward=True, length=300, enemieName='randomTeam', self_play=False, random_layout=False)
+    train_env = gymPacMan_parallel_env(layout_file=os.path.join('layouts', 'tinyCapture.lay'), display=False, reward_forLegalAction=False, defenceReward=True, length=300, enemieName='randomTeam', self_play=True, random_layout=False)
+    eval_env = gymPacMan_parallel_env(layout_file=os.path.join('layouts', 'tinyCapture.lay'), display=False, reward_forLegalAction=False, defenceReward=True, length=300, enemieName='randomTeam', self_play=False, random_layout=False)
     
     print("Starting MAPPO with WARMUP Curriculum (Horizontal Mirror)...")
     log = train_mappo(train_env, eval_env)
