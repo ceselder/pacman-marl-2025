@@ -56,7 +56,7 @@ def canonicalize_action(action, is_red_agent):
     if isinstance(action, torch.Tensor):
         mapper = torch.tensor([0, 3, 2, 1, 4], device=action.device)
         return mapper[action]
-    return {0: 0, 1: 3, 2: 4, 3: 1, 4: 2}[action]
+    return {0: 0, 1: 3, 2: 2, 3: 1, 4: 4}[action]
 
 
 def get_agent_state(obs_canon):
@@ -437,7 +437,11 @@ def train():
                 r2 = rewards[env.agents[2]]
                 r3 = rewards[env.agents[3]]
                 learner_sum = sum(rewards[env.agents[i]] for i in learner_ids)
-                print(f"Upd{update} Step{step} | as_{'RED' if play_as_red else 'BLU'} | learner_ids={learner_ids} | r0={r0:+.2f} r1={r1:+.2f} r2={r2:+.2f} r3={r3:+.2f} | sum={learner_sum:+.2f}")
+                # Also show what actions were taken
+                act_names = ['N', 'E', 'S', 'W', 'X']
+                raw_acts = [act_names[a.item()] for a in actions]
+                env_acts = [act_names[env_actions[env.agents[i]]] for i in learner_ids]
+                print(f"Upd{update} Step{step} | as_{'RED' if play_as_red else 'BLU'} | ids={learner_ids} | r0={r0:+.2f} r1={r1:+.2f} r2={r2:+.2f} r3={r3:+.2f} | sum={learner_sum:+.2f} | raw_act={raw_acts} env_act={env_acts}")
             
             # Shaping
             next_obs_raw = [next_obs_dict[env.agents[i]].float() for i in learner_ids]
