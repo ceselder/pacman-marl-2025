@@ -2,10 +2,11 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
 from torch.distributions import Categorical
 from gymPacMan import gymPacMan_parallel_env
+from collections import deque
+import copy
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -23,6 +24,11 @@ TOTAL_UPDATES = 100   # Total training loops
 
 HIDDEN_DIM_SIZE = 512 #512 seems to work ok
 
+# Self-play config
+OPPONENT_UPDATE_FREQ = 10  # Update opponent pool every N updates
+OPPONENT_POOL_SIZE = 5     # Keep last N versions
+SELF_PLAY_PROB = 0.5       # Prob of playing vs past self (vs latest)
+
 class ActorCritic(nn.Module):
     def __init__(self, obs_shape, action_dim):
         super().__init__()
@@ -34,8 +40,8 @@ class ActorCritic(nn.Module):
         )
         with torch.no_grad():
             flat_size = self.conv(torch.zeros(1, *obs_shape)).shape[1]
-        self.actor = nn.Sequential(nn.Linear(flat_size, HIDDEN_DIM_SIZE), nn.ReLU(), nn.Linear(HIDDEN_DIM_SIZE, action_dim))
-        self.critic = nn.Sequential(nn.Linear(flat_size, HIDDEN_DIM_SIZE), nn.ReLU(), nn.Linear(HIDDEN_DIM_SIZE, 1))
+        self.actor = nn.Sequential(nn.Linear(flat_size, HIDDEN_DIM), nn.ReLU(), nn.Linear(HIDDEN_DIM, action_dim))
+        self.critic = nn.Sequential(nn.Linear(flat_size, HIDDEN_DIM), nn.ReLU(), nn.Linear(HIDDEN_DIM, 1))
 
     def get_action_and_value(self, x, action=None):
         hidden = self.conv(x)
@@ -44,6 +50,13 @@ class ActorCritic(nn.Module):
         if action is None:
             action = dist.sample()
         return action, dist.log_prob(action), dist.entropy(), self.critic(hidden).squeeze(-1)
+    
+    def get_action(self, x):
+        """Just get action, no grad tracking - for opponent."""
+        with torch.no_grad():
+            hidden = self.conv(x)
+            logits = self.actor(hidden)
+            return Categorical(logits=logits).sample()
 
 def compute_gae(rewards, values, dones, last_value, last_done):
     T = len(rewards)
@@ -60,16 +73,38 @@ def compute_gae(rewards, values, dones, last_value, last_done):
         advantages[t] = lastgaelam = delta + GAMMA * GAE_LAMBDA * next_non_terminal * lastgaelam
     return advantages, advantages + values
 
-def train_ppo(env):
-    agent_ids = [1, 3]
-    num_agents = len(agent_ids)
-    obs_shape = env.get_Observation(agent_ids[0]).shape
+def train_ppo_selfplay(env):
+    # We train blue team (1, 3), opponent is red team (0, 2)
+    train_ids = [1, 3]  # Our agents
+    opp_ids = [0, 2]    # Opponent agents
+    num_agents = len(train_ids)
+    obs_shape = env.get_Observation(train_ids[0]).shape
     
+    # Main agent (trains)
     agent = ActorCritic(obs_shape, 5).to(device)
     optimizer = torch.optim.Adam(agent.parameters(), lr=LR, eps=1e-5)
+    
+    # Opponent pool - past versions of our agent
+    opponent_pool = deque(maxlen=OPPONENT_POOL_SIZE)
+    opponent_pool.append(copy.deepcopy(agent.state_dict()))
+    
+    def get_opponent():
+        """Sample an opponent from the pool."""
+        opp = ActorCritic(obs_shape, 5).to(device)
+        if np.random.random() < SELF_PLAY_PROB and len(opponent_pool) > 1:
+            # Play against random past version
+            opp.load_state_dict(np.random.choice(list(opponent_pool)[:-1]))
+        else:
+            # Play against latest
+            opp.load_state_dict(opponent_pool[-1])
+        opp.eval()
+        return opp
 
     for update in range(1, TOTAL_UPDATES + 1):
-        # Storage - keep on CPU if CPU-bound, move batches to GPU
+        # Get opponent for this rollout
+        opponent = get_opponent()
+        
+        # Storage for our team only
         obs_buf = torch.zeros((NUM_STEPS, num_agents, *obs_shape))
         actions_buf = torch.zeros((NUM_STEPS, num_agents), dtype=torch.long)
         logprobs_buf = torch.zeros((NUM_STEPS, num_agents))
@@ -78,44 +113,52 @@ def train_ppo(env):
         values_buf = torch.zeros((NUM_STEPS, num_agents))
 
         env.reset()
-        next_obs = torch.tensor(np.stack([env.get_Observation(i) for i in agent_ids]), dtype=torch.float32)
+        next_obs = torch.stack([env.get_Observation(i) for i in train_ids]).float()
         next_done = torch.zeros(num_agents)
 
-        # Rollout
         for step in range(NUM_STEPS):
             obs_buf[step] = next_obs
             dones_buf[step] = next_done
             
+            # Our team's actions (with grad tracking for PPO)
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs.to(device))
                 action, logprob, value = action.cpu(), logprob.cpu(), value.cpu()
             
             actions_buf[step], logprobs_buf[step], values_buf[step] = action, logprob, value
 
-            env_actions = [-1] * len(env.agents)
-            for i, ag_id in enumerate(agent_ids):
-                env_actions[ag_id] = action[i].item()
+            # Opponent's actions
+            opp_obs = torch.stack([env.get_Observation(i) for i in opp_ids]).float().to(device)
+            opp_actions = opponent.get_action(opp_obs).cpu()
+
+            # Build full action dict
+            # env.step expects actions indexed by agent object, not int
+            env_actions = {}
+            for i, ag_id in enumerate(train_ids):
+                env_actions[env.agents[ag_id]] = action[i].item()
+            for i, ag_id in enumerate(opp_ids):
+                env_actions[env.agents[ag_id]] = opp_actions[i].item()
 
             next_obs_dict, rewards_dict, dones_dict, _ = env.step(env_actions)
             
-            team_reward = np.clip(sum(rewards_dict[i] for i in agent_ids), -1, 1)
-            rewards_buf[step] = team_reward
+            # Reward for our team
+            team_reward = sum(rewards_dict[env.agents[i]] for i in train_ids)
+            rewards_buf[step] = team_reward  # Shared team reward
             
-            any_done = any(dones_dict[i] for i in agent_ids)
+            any_done = any(dones_dict[env.agents[i]] for i in train_ids)
             next_done = torch.full((num_agents,), float(any_done))
             
             if any_done:
                 env.reset()
-                next_obs = torch.tensor(np.stack([env.get_Observation(i) for i in agent_ids]), dtype=torch.float32)
+                next_obs = torch.stack([env.get_Observation(i) for i in train_ids]).float()
             else:
-                next_obs = torch.tensor(np.stack([next_obs_dict[i] for i in agent_ids]), dtype=torch.float32)
+                next_obs = torch.stack([next_obs_dict[env.agents[i]] for i in train_ids]).float()
 
         # Bootstrap
         with torch.no_grad():
             _, _, _, last_value = agent.get_action_and_value(next_obs.to(device))
             last_value = last_value.cpu()
 
-        # GAE
         advantages, returns = compute_gae(rewards_buf, values_buf, dones_buf, last_value, next_done)
 
         # Flatten
@@ -136,18 +179,17 @@ def train_ppo(env):
                 
                 mb_obs = b_obs[mb].to(device)
                 mb_actions = b_actions[mb].to(device)
-                mb_old_logprobs = b_logprobs[mb].to(device)
-                mb_advantages = b_advantages[mb].to(device)
+                mb_adv = (b_advantages[mb] - b_advantages[mb].mean()) / (b_advantages[mb].std() + 1e-8)
+                mb_adv = mb_adv.to(device)
                 mb_returns = b_returns[mb].to(device)
-                
-                mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+                mb_old_logprobs = b_logprobs[mb].to(device)
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(mb_obs, mb_actions)
                 ratio = (newlogprob - mb_old_logprobs).exp()
 
                 pg_loss = -torch.min(
-                    ratio * mb_advantages,
-                    torch.clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * mb_advantages
+                    ratio * mb_adv,
+                    torch.clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * mb_adv
                 ).mean()
                 v_loss = 0.5 * ((newvalue - mb_returns) ** 2).mean()
                 loss = pg_loss - ENT_COEF * entropy.mean() + VF_COEF * v_loss
@@ -157,14 +199,21 @@ def train_ppo(env):
                 nn.utils.clip_grad_norm_(agent.parameters(), MAX_GRAD_NORM)
                 optimizer.step()
 
+        # Update opponent pool periodically
+        if update % OPPONENT_UPDATE_FREQ == 0:
+            opponent_pool.append(copy.deepcopy(agent.state_dict()))
+            print(f"  -> Added to opponent pool (size: {len(opponent_pool)})")
+
         print(f"Update {update}/{TOTAL_UPDATES} | Reward: {rewards_buf.sum().item() / num_agents:.2f}")
 
-    torch.save(agent.state_dict(), "ppo_pacman.pt")
+    torch.save(agent.state_dict(), "ppo_pacman_selfplay.pt")
 
 if __name__ == "__main__":
     env = gymPacMan_parallel_env(
         layout_file=os.path.join('layouts', 'tinyCapture.lay'),
-        display=False, reward_forLegalAction=True, defenceReward=False,
-        length=1000, enemieName='randomTeam', self_play=False, random_layout=False
+        display=False, reward_forLegalAction=True, defenceReward=True,
+        length=1000, enemieName='randomTeam',
+        self_play=True,  # <-- Enable self-play mode
+        random_layout=False
     )
-    train_ppo(env)
+    train_ppo_selfplay(env)
