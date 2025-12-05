@@ -13,7 +13,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 NUM_STEPS = 2048        # Steps to collect per agent per update
 BATCH_SIZE = 256        # Minibatch size
-LR = 1e-4             # Learning Rate
+LR = 2e-4             # Learning Rate
 GAMMA = 0.98            # Discount factor
 GAE_LAMBDA = 0.95       # GAE parameter
 CLIP_EPS = 0.15         # PPO Clip range
@@ -133,7 +133,7 @@ def process_obs(obs, is_red_team):
     new_obs[:, 6, :, :] = obs[:, 7, :, :]
     new_obs[:, 7, :, :] = obs[:, 6, :, :]
     
-    return new_obs
+    return obs #without flipping
 
 def evaluate_vs_random(agent, eval_env, num_episodes=5):
     agent.eval()
