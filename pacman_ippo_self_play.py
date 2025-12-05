@@ -224,7 +224,7 @@ def train_ppo_selfplay(env):
         log['entropy'].append(np.mean(entropies))
         log['clip_frac'].append(np.mean(clip_fracs))
         
-        print(f"Update {update}/{TOTAL_UPDATES} | Reward: {mean_reward:.2f} | mu episodic retur : {mean_ep_return:.2f} | entropy: {np.mean(entropies):.3f} | Clip: {np.mean(clip_fracs):.3f}")
+        print(f"Update {update}/{TOTAL_UPDATES} | Reward: {mean_reward:.2f} | Mean episodic return : {mean_ep_return:.2f} | Entropy: {np.mean(entropies):.3f} | Clip: {np.mean(clip_fracs):.3f}")
 
     torch.save(agent.state_dict(), "ppo_pacman_selfplay.pt")
     return log
