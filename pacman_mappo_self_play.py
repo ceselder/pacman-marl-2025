@@ -13,11 +13,11 @@ print(f"Using device: {device}")
 # --- Hyperparameters (more conservative) ---
 NUM_STEPS = 2048
 BATCH_SIZE = 256          # Smaller batches = more updates = smoother
-LR = 3e-4                 # Reduced from 5e-4
+LR = 2e-4                 # Reduced
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.15           # Reduced from 0.2 for stability
-ENT_COEF = 0.03           # Slightly lower entropy
+ENT_COEF = 0.15           # Higher entropy for exploration
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
@@ -26,7 +26,7 @@ TOTAL_UPDATES = 1000
 # Settings
 OPPONENT_POOL_SIZE = 5
 OPPONENT_UPDATE_FREQ = 20
-SHAPING_SCALE = 0.1
+SHAPING_SCALE = 0.15
 EVAL_FREQ = 20            # Eval every N updates
 EVAL_EPISODES = 10        # Episodes per eval
 
@@ -267,7 +267,7 @@ def train():
     env = gymPacMan_parallel_env(
         layout_file='layouts/bloxCapture.lay',
         display=False,
-        reward_forLegalAction=True,
+        reward_forLegalAction=False,
         defenceReward=True,
         length=300,
         enemieName='randomTeam',
@@ -278,7 +278,7 @@ def train():
     eval_env = gymPacMan_parallel_env(
         layout_file='layouts/bloxCapture.lay',
         display=False,
-        reward_forLegalAction=True,
+        reward_forLegalAction=False,
         defenceReward=True,
         length=300,
         enemieName='randomTeam',
@@ -347,14 +347,6 @@ def train():
                     raise ValueError(f"Update {update} Step {step}: Food position flip wrong! raw_red[0]=({ry},{rx}) expected in canon_blue at ({ry},{W-1-rx})")
     
     for update in range(1, TOTAL_UPDATES + 1):
-        # Random side selection
-        play_as_red = np.random.rand() > 0.5
-        if play_as_red:
-            learner_ids = [0, 2]
-            opponent_ids = [1, 3]
-        else:
-            learner_ids = [1, 3]
-            opponent_ids = [0, 2]
         # Random side selection
         play_as_red = np.random.rand() > 0.5
         if play_as_red:
@@ -438,11 +430,14 @@ def train():
             
             next_obs_dict, rewards, dones, _ = env.step(env_actions)
             
-            # DEBUG: Check reward signs for first few steps of first 2 updates
+            # DEBUG: Print when any reward is non-zero
             if (rewards[env.agents[0]] > 0.01 or rewards[env.agents[1]] > 0.01) and step > 900 and step < 905:
-                r0 = rewards[env.agents[0]]  # Red agent 0
-                r1 = rewards[env.agents[1]]  # Blue agent 1
-                print(f"Update {update} Step {step} | play_as_red={play_as_red} | r_red0={r0:.2f} r_blue1={r1:.2f} | team_sum={sum(rewards[env.agents[i]] for i in learner_ids):.2f}")
+                r0 = rewards[env.agents[0]]
+                r1 = rewards[env.agents[1]]
+                r2 = rewards[env.agents[2]]
+                r3 = rewards[env.agents[3]]
+                learner_sum = sum(rewards[env.agents[i]] for i in learner_ids)
+                print(f"Upd{update} Step{step} | as_{'RED' if play_as_red else 'BLU'} | learner_ids={learner_ids} | r0={r0:+.2f} r1={r1:+.2f} r2={r2:+.2f} r3={r3:+.2f} | sum={learner_sum:+.2f}")
             
             # Shaping
             next_obs_raw = [next_obs_dict[env.agents[i]].float() for i in learner_ids]
