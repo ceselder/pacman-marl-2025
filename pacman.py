@@ -62,11 +62,10 @@ class NoisyLinear(nn.Module):
         else:
             return F.linear(input, self.weight_mu, self.bias_mu)
 
-# --- AGENT NETWORK (Standard Depth, Default Init) ---
+# --- AGENT NETWORK ---
 class AgentQNetwork(nn.Module):
     def __init__(self, obs_shape, action_dim, hidden_dim=512):
         super(AgentQNetwork, self).__init__()
-        # Standard 3-Layer CNN
         self.conv1 = nn.Conv2d(obs_shape[0], 16, kernel_size=3, stride=1, padding=1)
         self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)
         self.conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
@@ -85,7 +84,6 @@ class AgentQNetwork(nn.Module):
             nn.ReLU(), 
             NoisyLinear(hidden_dim, action_dim)
         )
-        #tried ortho init but no good success
 
     def forward(self, obs):
         x = F.relu(self.conv1(obs))
@@ -116,7 +114,6 @@ class SimpleQMixer(nn.Module):
         self.hyper_b1 = nn.Linear(self.state_dim, embed_dim)
         self.hyper_w2 = nn.Sequential(nn.Linear(self.state_dim, embed_dim), nn.ReLU(), nn.Linear(embed_dim, embed_dim))
         self.hyper_b2 = nn.Sequential(nn.Linear(self.state_dim, embed_dim), nn.ReLU(), nn.Linear(embed_dim, 1))
-        # REMOVED: self.apply(self._init_weights)
 
     def forward(self, agent_qs, states):
         bs = agent_qs.shape[0]
@@ -194,32 +191,28 @@ class NaivePrioritizedBuffer:
     
     def update_priorities(self, indices, errors):
         for idx, err in zip(indices, errors):
-            self.priorities[idx] = (err + self.epsilon)
+            # FIXED: Explicit cast to float to avoid NumPy deprecation warning
+            self.priorities[idx] = (float(err) + self.epsilon)
     
     def size(self):
         return len(self.buffer)
 
-# --- HELPERS ---
-def get_min_food_dist(obs, agent_index):
-    ys, xs = np.nonzero(obs[1]).tolist()[0]
-    pos = (int(ys), int(xs))
-    target_ch = 7 if agent_index in [1, 3] else 6 
-    print(np.nonzero(obs[target_ch]))
-    f_ys, f_xs = np.nonzero(obs[target_ch])
-    dists = np.sum(np.abs(np.stack([f_ys, f_xs], axis=1) - pos), axis=1)
-    print(np.min(dists))
-    return np.min(dists)
-
 def get_exploration_bonus(obs, visit_counts, agent_index, beta=0.1):
     ys, xs = np.nonzero(obs[1]).tolist()[0]
-    pos = (int(ys), int(xs)) #todo we may not even have to use ints
+    pos = (int(ys), int(xs))
+
+    target_ch = 7 if agent_index in [1, 3] else 6 
+    food = np.nonzero(obs[target_ch]).tolist()
 
     team_id = agent_index % 2
-    key = (team_id, pos)
+    food_hashable = tuple(tuple(coord) for coord in food)
+    
+    key = (team_id, pos, food_hashable)
     visit_counts[key] = visit_counts.get(key, 0) + 1
     return beta / np.sqrt(visit_counts[key])
 
-def compute_td_loss(agent_q_networks, target_q_networks, mixer, target_mixer, batch, weights=None, gamma=0.99, n_step=1):
+def compute_td_loss(agent_net, target_net, mixer, target_mixer, batch, weights=None, gamma=0.99, n_step=1):
+    # CLEANED UP: Removed list inputs, uses singular shared net
     states, actions, rewards, next_states, dones = batch
     states = torch.tensor(states, dtype=torch.float32).to(device)
     actions = torch.tensor(actions, dtype=torch.long).to(device)
@@ -230,17 +223,23 @@ def compute_td_loss(agent_q_networks, target_q_networks, mixer, target_mixer, ba
         weights = torch.tensor(weights, dtype=torch.float32).to(device)
     
     agent_q_values = []
-    for i, q_net in enumerate(agent_q_networks):
-        q_vals = q_net(states[:, i])
+    # Iterate over the number of agents (dim 1 of states)
+    n_agents = states.shape[1]
+    
+    for i in range(n_agents):
+        # Use the SAME shared agent_net for all agents
+        q_vals = agent_net(states[:, i])
         q_taken = q_vals.gather(1, actions[:, i].unsqueeze(1))
         agent_q_values.append(q_taken)
+    
     agent_q_values = torch.cat(agent_q_values, dim=1)
     q_tot = mixer(agent_q_values, states).squeeze(-1)
     
     with torch.no_grad():
         next_agent_q_values = []
-        for i, (q_net, target_net) in enumerate(zip(agent_q_networks, target_q_networks)):
-            next_q_vals = q_net(next_states[:, i])
+        for i in range(n_agents):
+            # Use the SAME shared agent_net and target_net
+            next_q_vals = agent_net(next_states[:, i])
             max_actions = next_q_vals.argmax(dim=1, keepdim=True)
             target_q_vals = target_net(next_states[:, i])
             next_q_taken = target_q_vals.gather(1, max_actions)
@@ -261,10 +260,9 @@ def compute_td_loss(agent_q_networks, target_q_networks, mixer, target_mixer, ba
         loss = loss_elementwise.mean()
     return loss, td_errors
 
-def soft_update_target_network(source_nets, target_nets, tau=0.01):
-    for target, source in zip(target_nets, source_nets):
-        for target_param, source_param in zip(target.parameters(), source.parameters()):
-            target_param.data.copy_(tau * source_param.data + (1 - tau) * target_param.data)
+def soft_update_target_network(source_net, target_net, tau=0.01):
+    for target_param, source_param in zip(target_net.parameters(), source_net.parameters()):
+        target_param.data.copy_(tau * source_param.data + (1 - tau) * target_param.data)
 
 def soft_update_mixer(mixer, target_mixer, tau=0.01):
     for target_param, source_param in zip(target_mixer.parameters(), mixer.parameters()):
@@ -289,7 +287,6 @@ def train_rainbow_qmix_shared(env, agent_net, target_net, mixer, target_mixer,
                batch_size=64, 
                gamma=0.98,
                lr=0.0001,
-               shaping_weight=0.1, 
                exploration_beta=0.2, 
                n_step=3):
     
@@ -312,9 +309,7 @@ def train_rainbow_qmix_shared(env, agent_net, target_net, mixer, target_mixer,
 
     n_step_buffer = NStepBuffer(n_step=n_step, gamma=gamma)
     
-    # Create lists just for the function call
-    agent_q_networks = [agent_net, agent_net]
-    target_q_networks = [target_net, target_net]
+    # CLEANED UP: Removed redundant network lists
 
     for episode in range(n_episodes):
         done = {agent_id: False for agent_id in agent_indexes}
@@ -327,7 +322,6 @@ def train_rainbow_qmix_shared(env, agent_net, target_net, mixer, target_mixer,
         
         episode_reward = 0
         score = 0
-        prev_dists = {}
         has_trained = False
         
         agent_net.reset_noise()
@@ -342,10 +336,8 @@ def train_rainbow_qmix_shared(env, agent_net, target_net, mixer, target_mixer,
                 obs_agent = env.get_Observation(agent_index)
                 
                 # Shaping Pre-calculation
-                if shaping_weight > 0 or exploration_beta > 0:
+                if exploration_beta > 0:
                     current_observations[agent_index] = obs_agent
-                    if shaping_weight > 0:
-                        prev_dists[agent_index] = get_min_food_dist(obs_agent, agent_index)
 
                 state = torch.as_tensor(obs_agent, dtype=torch.float32).to(device)
                 states.append(state)
@@ -364,12 +356,6 @@ def train_rainbow_qmix_shared(env, agent_net, target_net, mixer, target_mixer,
             augmented_rewards = {}
             for agent_index in agent_indexes:
                 total_extra = 0.0
-                obs_curr = list(next_states.values())[agent_index]
-                
-                if shaping_weight > 0:
-                    curr_dist = get_min_food_dist(obs_curr, agent_index)
-                    dist_delta = prev_dists[agent_index] - curr_dist
-                    total_extra += (dist_delta * shaping_weight)
                 
                 if exploration_beta > 0:
                     total_extra += get_exploration_bonus(
@@ -405,7 +391,7 @@ def train_rainbow_qmix_shared(env, agent_net, target_net, mixer, target_mixer,
                 next_states_converted, 
                 [team_done, team_done]
             )
-            
+        
             if transition:
                 replay_buffer.add(transition)
             
@@ -413,8 +399,9 @@ def train_rainbow_qmix_shared(env, agent_net, target_net, mixer, target_mixer,
                 has_trained = True
                 batch, idxs, weights = replay_buffer.sample(batch_size, beta=per_beta)
                 
+                # CLEANED UP: Passing singular nets
                 loss, td_errors = compute_td_loss(
-                    agent_q_networks, target_q_networks, mixer, target_mixer, 
+                    agent_net, target_net, mixer, target_mixer, 
                     batch, weights=weights, gamma=gamma, n_step=n_step
                 )
                 
@@ -424,8 +411,10 @@ def train_rainbow_qmix_shared(env, agent_net, target_net, mixer, target_mixer,
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(all_params, max_norm=10.0)
                 optimizer.step()
-                soft_update_target_network(agent_q_networks, target_q_networks, tau=0.01)
+                soft_update_target_network(agent_net, target_net, tau=0.01)
                 soft_update_mixer(mixer, target_mixer, tau=0.01)
+            else:
+                print("something just happened")
 
         if has_trained: scheduler.step()
         episode_rewards.append(episode_reward)
@@ -494,14 +483,13 @@ target_mixer.load_state_dict(mixer.state_dict())
 
 replay_buffer = NaivePrioritizedBuffer(capacity=100_000, alpha=0.6)
 
-print("Starting Final Rainbow Training (Shared Net, No Ortho, No Free Reward)...")
+print("Starting Final Rainbow Training (Shared Net, No Ortho)...")
 rewards_exp, scores_exp = train_rainbow_qmix_shared(
     env, shared_agent, shared_target, mixer, target_mixer, replay_buffer,
     n_episodes=150,
     batch_size=512,
     lr=0.0003, 
-    gamma=0.98,
-    shaping_weight=0.1,    
+    gamma=0.98,  
     exploration_beta=0.5, 
     n_step=3 
 )
