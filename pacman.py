@@ -7,7 +7,6 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from gymPacMan import gymPacMan_parallel_env
 from collections import deque
-import random
 import math
 
 # --- SETUP ---
@@ -17,6 +16,7 @@ if torch.cuda.is_available():
 elif torch.backends.mps.is_available():
     device = torch.device("mps")
 print(f"Device: {device}")
+
 
 # --- RAINBOW NOISY LAYER ---
 class NoisyLinear(nn.Module):
@@ -62,6 +62,7 @@ class NoisyLinear(nn.Module):
         else:
             return F.linear(input, self.weight_mu, self.bias_mu)
 
+
 # --- AGENT NETWORK ---
 class AgentQNetwork(nn.Module):
     def __init__(self, obs_shape, action_dim, hidden_dim=512):
@@ -100,6 +101,7 @@ class AgentQNetwork(nn.Module):
             if isinstance(module, NoisyLinear):
                 module.reset_noise()
 
+
 # --- QMIX MIXER ---
 class SimpleQMixer(nn.Module):
     def __init__(self, n_agents, state_shape, embed_dim=32):
@@ -110,15 +112,29 @@ class SimpleQMixer(nn.Module):
         else:
             self.state_dim = state_shape
             
-        self.hyper_w1 = nn.Sequential(nn.Linear(self.state_dim, embed_dim), nn.ReLU(), nn.Linear(embed_dim, n_agents * embed_dim))
+        self.hyper_w1 = nn.Sequential(
+            nn.Linear(self.state_dim, embed_dim), 
+            nn.ReLU(), 
+            nn.Linear(embed_dim, n_agents * embed_dim)
+        )
         self.hyper_b1 = nn.Linear(self.state_dim, embed_dim)
-        self.hyper_w2 = nn.Sequential(nn.Linear(self.state_dim, embed_dim), nn.ReLU(), nn.Linear(embed_dim, embed_dim))
-        self.hyper_b2 = nn.Sequential(nn.Linear(self.state_dim, embed_dim), nn.ReLU(), nn.Linear(embed_dim, 1))
+        self.hyper_w2 = nn.Sequential(
+            nn.Linear(self.state_dim, embed_dim), 
+            nn.ReLU(), 
+            nn.Linear(embed_dim, embed_dim)
+        )
+        self.hyper_b2 = nn.Sequential(
+            nn.Linear(self.state_dim, embed_dim), 
+            nn.ReLU(), 
+            nn.Linear(embed_dim, 1)
+        )
 
     def forward(self, agent_qs, states):
         bs = agent_qs.shape[0]
-        if len(states.shape) > 2: state_flat = states[:, 0].reshape(bs, -1)
-        else: state_flat = states
+        if len(states.shape) > 2:
+            state_flat = states[:, 0].reshape(bs, -1)
+        else:
+            state_flat = states
         agent_qs = agent_qs.view(bs, 1, self.n_agents)
         w1 = torch.abs(self.hyper_w1(state_flat)).view(bs, self.n_agents, -1)
         b1 = self.hyper_b1(state_flat).view(bs, 1, -1)
@@ -128,7 +144,8 @@ class SimpleQMixer(nn.Module):
         q_tot = torch.bmm(hidden, w2) + b2
         return q_tot.view(bs, -1, 1)
 
-# --- N-STEP BUFFER ---
+
+# --- N-STEP BUFFER (Simplified) ---
 class NStepBuffer:
     def __init__(self, n_step, gamma):
         self.n_step = n_step
@@ -136,22 +153,37 @@ class NStepBuffer:
         self.buffer = deque(maxlen=n_step)
     
     def add(self, state, action, reward, next_state, done):
+        """
+        Args:
+            state: [n_agents, C, H, W] tensor
+            action: [n_agents] list of ints
+            reward: scalar team reward
+            next_state: [n_agents, C, H, W] tensor
+            done: bool
+        Returns transition or None if buffer not full
+        """
         self.buffer.append((state, action, reward, next_state, done))
-        if len(self.buffer) < self.n_step: return None
+        if len(self.buffer) < self.n_step:
+            return None
+        
         curr_state, curr_action, _, _, _ = self.buffer[0]
-        n_state, _, _, _, n_done = self.buffer[-1]
-        R = 0
+        n_state = self.buffer[-1][3]
+        n_done = self.buffer[-1][4]
+        
+        # Compute n-step return
+        R = 0.0
         for i in range(self.n_step):
-            r = self.buffer[i][2][0] 
-            R += (self.gamma ** i) * r
-            if self.buffer[i][4][0]: 
+            R += (self.gamma ** i) * self.buffer[i][2]
+            if self.buffer[i][4]:  # Episode ended early
                 n_state = self.buffer[i][3]
-                n_done = self.buffer[i][4]
+                n_done = True
                 break
-        return (curr_state, curr_action, [R]*2, n_state, n_done)
+        
+        return (curr_state, curr_action, R, n_state, n_done)
 
     def reset(self):
         self.buffer.clear()
+
 
 # --- PER BUFFER ---
 class NaivePrioritizedBuffer:
@@ -174,123 +206,119 @@ class NaivePrioritizedBuffer:
     
     def sample(self, batch_size, beta=0.4):
         N = len(self.buffer)
-        if N == 0: return None
+        if N == 0:
+            return None
         probs = self.priorities[:N] ** self.alpha
         probs /= probs.sum()
-        indices = np.random.choice(N, batch_size, p=probs)
+        indices = np.random.choice(N, batch_size, p=probs, replace=False)
         weights = (N * probs[indices]) ** (-beta)
         weights /= weights.max()
         experiences = [self.buffer[i] for i in indices]
         
         states = np.array([e[0].cpu().numpy() for e in experiences], dtype=np.float32)
         actions = np.array([e[1] for e in experiences], dtype=np.int64)
-        rewards = np.array([e[2] for e in experiences])
+        rewards = np.array([e[2] for e in experiences], dtype=np.float32)
         next_states = np.array([e[3].cpu().numpy() for e in experiences], dtype=np.float32)
-        dones = np.array([e[4] for e in experiences])
+        dones = np.array([e[4] for e in experiences], dtype=np.float32)
+        
         return (states, actions, rewards, next_states, dones), indices, weights
     
     def update_priorities(self, indices, errors):
         for idx, err in zip(indices, errors):
-            # FIXED: Explicit cast to float to avoid NumPy deprecation warning
-            self.priorities[idx] = (float(err) + self.epsilon)
+            self.priorities[idx] = float(err) + self.epsilon
     
     def size(self):
         return len(self.buffer)
 
+
+# --- HELPERS ---
 def get_exploration_bonus(obs, visit_counts, agent_index, beta=0.1):
-    ys, xs = np.nonzero(obs[1]).tolist()[0]
-    pos = (int(ys), int(xs))
-
-    target_ch = 7 if agent_index in [1, 3] else 6 
-    food = np.nonzero(obs[target_ch]).tolist()
-
-    team_id = agent_index % 2
-    food_hashable = tuple(tuple(coord) for coord in food)
+    """Count-based exploration bonus. Assumes agent position exists in channel 1."""
+    nonzero = np.nonzero(obs[1])
+    pos = (int(nonzero[0][0]), int(nonzero[1][0]))
     
-    key = (team_id, pos, food_hashable)
+    team_id = agent_index % 2
+    key = (team_id, pos)
     visit_counts[key] = visit_counts.get(key, 0) + 1
     return beta / np.sqrt(visit_counts[key])
 
-def compute_td_loss(agent_net, target_net, mixer, target_mixer, batch, weights=None, gamma=0.99, n_step=1):
-    # CLEANED UP: Removed list inputs, uses singular shared net
+
+def compute_td_loss(agent_net, target_net, mixer, target_mixer, batch, 
+                    weights=None, gamma=0.99, n_step=1):
+    """
+    Batched forward pass to avoid gradient doubling.
+    """
     states, actions, rewards, next_states, dones = batch
-    states = torch.tensor(states, dtype=torch.float32).to(device)
-    actions = torch.tensor(actions, dtype=torch.long).to(device)
-    rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
-    next_states = torch.tensor(next_states, dtype=torch.float32).to(device)
-    dones = torch.tensor(dones, dtype=torch.float32).to(device)
-    if weights is not None:
-        weights = torch.tensor(weights, dtype=torch.float32).to(device)
     
-    agent_q_values = []
-    # Iterate over the number of agents (dim 1 of states)
+    batch_size = states.shape[0]
     n_agents = states.shape[1]
     
-    for i in range(n_agents):
-        # Use the SAME shared agent_net for all agents
-        q_vals = agent_net(states[:, i])
-        q_taken = q_vals.gather(1, actions[:, i].unsqueeze(1))
-        agent_q_values.append(q_taken)
-    
-    agent_q_values = torch.cat(agent_q_values, dim=1)
-    q_tot = mixer(agent_q_values, states).squeeze(-1)
-    
-    with torch.no_grad():
-        next_agent_q_values = []
-        for i in range(n_agents):
-            # Use the SAME shared agent_net and target_net
-            next_q_vals = agent_net(next_states[:, i])
-            max_actions = next_q_vals.argmax(dim=1, keepdim=True)
-            target_q_vals = target_net(next_states[:, i])
-            next_q_taken = target_q_vals.gather(1, max_actions)
-            next_agent_q_values.append(next_q_taken)
-            
-        next_agent_q_values = torch.cat(next_agent_q_values, dim=1)
-        next_q_tot = target_mixer(next_agent_q_values, next_states).squeeze(-1)
-        team_reward = rewards[:, 0].unsqueeze(1) 
-        done_mask = dones[:, 0].unsqueeze(1) 
-        target_q_tot = team_reward + (gamma ** n_step) * next_q_tot * (1 - done_mask)
-    
-    loss_elementwise = F.huber_loss(q_tot, target_q_tot, reduction='none')
-    td_errors = torch.abs(target_q_tot - q_tot).detach().cpu().numpy()
+    states = torch.tensor(states, dtype=torch.float32, device=device)
+    actions = torch.tensor(actions, dtype=torch.long, device=device)
+    rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
+    next_states = torch.tensor(next_states, dtype=torch.float32, device=device)
+    dones = torch.tensor(dones, dtype=torch.float32, device=device)
     
     if weights is not None:
-        loss = (loss_elementwise * weights).mean()
+        weights = torch.tensor(weights, dtype=torch.float32, device=device)
+    
+    # Batched forward pass: [batch * n_agents, C, H, W]
+    states_flat = states.view(-1, *states.shape[2:])
+    q_vals_all = agent_net(states_flat)  # [batch * n_agents, n_actions]
+    q_vals_all = q_vals_all.view(batch_size, n_agents, -1)  # [batch, n_agents, n_actions]
+    
+    # Gather Q-values for taken actions
+    actions_expanded = actions.unsqueeze(-1)  # [batch, n_agents, 1]
+    agent_q_values = q_vals_all.gather(2, actions_expanded).squeeze(-1)  # [batch, n_agents]
+    
+    q_tot = mixer(agent_q_values, states).squeeze(-1)  # [batch, 1]
+    
+    with torch.no_grad():
+        # Batched forward for next states
+        next_states_flat = next_states.view(-1, *next_states.shape[2:])
+        
+        # Double DQN: use online net to select actions, target net to evaluate
+        next_q_online = agent_net(next_states_flat).view(batch_size, n_agents, -1)
+        max_actions = next_q_online.argmax(dim=2, keepdim=True)
+        
+        next_q_target = target_net(next_states_flat).view(batch_size, n_agents, -1)
+        next_agent_q_values = next_q_target.gather(2, max_actions).squeeze(-1)
+        
+        next_q_tot = target_mixer(next_agent_q_values, next_states).squeeze(-1)
+        
+        target_q_tot = rewards.unsqueeze(1) + (gamma ** n_step) * next_q_tot * (1 - dones.unsqueeze(1))
+    
+    loss_elementwise = F.huber_loss(q_tot, target_q_tot, reduction='none')
+    td_errors = torch.abs(target_q_tot - q_tot).detach().cpu().numpy().flatten()
+    
+    if weights is not None:
+        loss = (loss_elementwise.squeeze() * weights).mean()
     else:
         loss = loss_elementwise.mean()
+    
     return loss, td_errors
 
-def soft_update_target_network(source_net, target_net, tau=0.01):
+
+def soft_update(source_net, target_net, tau=0.01):
     for target_param, source_param in zip(target_net.parameters(), source_net.parameters()):
         target_param.data.copy_(tau * source_param.data + (1 - tau) * target_param.data)
 
-def soft_update_mixer(mixer, target_mixer, tau=0.01):
-    for target_param, source_param in zip(target_mixer.parameters(), mixer.parameters()):
-        target_param.data.copy_(tau * source_param.data + (1 - tau) * target_param.data)
 
-def select_action(agent_q_network, state, legal_actions):
-    state = torch.unsqueeze(state.clone().detach(), 0).to(device)
+def select_action(agent_net, state, legal_actions):
+    state = state.unsqueeze(0).to(device)
     with torch.no_grad():
-        q_values = agent_q_network(state).cpu().numpy()
-    q_values = q_values[0]
-    best_action = legal_actions[0]
-    best_val = -float('inf')
-    for action in legal_actions:
-        if q_values[action] > best_val:
-            best_val = q_values[action]
-            best_action = action
+        q_values = agent_net(state).cpu().numpy()[0]
+    
+    best_action = max(legal_actions, key=lambda a: q_values[a])
     return best_action
 
+
 # --- TRAINING LOOP ---
-def train_rainbow_qmix_shared(env, agent_net, target_net, mixer, target_mixer, 
-               replay_buffer, n_episodes=500, 
-               batch_size=64, 
-               gamma=0.98,
-               lr=0.0001,
-               exploration_beta=0.2, 
-               n_step=3):
+def train_rainbow_qmix(env, agent_net, target_net, mixer, target_mixer, 
+                       replay_buffer, n_episodes=500, batch_size=64, 
+                       gamma=0.98, lr=0.0001, exploration_beta=0.2, n_step=3,
+                       tau=0.005):
     
-    # Optimizer for Shared Net + Mixer
     all_params = list(mixer.parameters()) + list(agent_net.parameters())
     optimizer = optim.Adam(all_params, lr=lr, eps=1.5e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_episodes, eta_min=1e-6)
@@ -304,105 +332,96 @@ def train_rainbow_qmix_shared(env, agent_net, target_net, mixer, target_mixer,
     visit_counts = {}
     
     beta_start = 0.4
-    beta_frames = n_episodes 
-    beta_by_episode = lambda ep: min(1.0, beta_start + ep * (1.0 - beta_start) / beta_frames)
-
-    n_step_buffer = NStepBuffer(n_step=n_step, gamma=gamma)
+    beta_by_episode = lambda ep: min(1.0, beta_start + ep * (1.0 - beta_start) / n_episodes)
     
-    # CLEANED UP: Removed redundant network lists
+    n_step_buffer = NStepBuffer(n_step=n_step, gamma=gamma)
 
     for episode in range(n_episodes):
-        done = {agent_id: False for agent_id in agent_indexes}
         env.reset()
         n_step_buffer.reset()
+        done = {agent_id: False for agent_id in agent_indexes}
         
-        # Reset count every 50 episodes
-        # if episode % 50 == 0:
-        #     visit_counts.clear()
-        
-        episode_reward = 0
-        score = 0
+        episode_reward = 0.0
+        score = 0.0
         has_trained = False
         
+        # Reset noise for both networks at episode start
         agent_net.reset_noise()
+        target_net.reset_noise()
+        
         per_beta = beta_by_episode(episode)
 
         while not all(done.values()):
-            actions = [-1 for _ in env.agents]
             states = []
+            actions_taken = []
             current_observations = {}
 
-            for i, agent_index in enumerate(agent_indexes):
+            for agent_index in agent_indexes:
                 obs_agent = env.get_Observation(agent_index)
+                current_observations[agent_index] = obs_agent
                 
-                # Shaping Pre-calculation
-                if exploration_beta > 0:
-                    current_observations[agent_index] = obs_agent
-
-                state = torch.as_tensor(obs_agent, dtype=torch.float32).to(device)
+                state = torch.as_tensor(obs_agent, dtype=torch.float32, device=device)
                 states.append(state)
-                current_legal = info["legal_actions"][agent_index] if info is not None else legal_actions
                 
-                # Shared network selects action for both
+                current_legal = info["legal_actions"][agent_index] if info else legal_actions
                 action = select_action(agent_net, state, current_legal)
-                actions[agent_index] = action
+                actions_taken.append(action)
 
-            next_states, rewards, terminations, info = env.step(actions)
+            # Build full action list for env
+            env_actions = [-1] * len(env.agents)
+            for i, agent_index in enumerate(agent_indexes):
+                env_actions[agent_index] = actions_taken[i]
+
+            next_states_dict, rewards, terminations, info = env.step(env_actions)
             score -= info["score_change"]
-            done = {key: value for key, value in terminations.items() if key in agent_indexes}
+            done = {k: v for k, v in terminations.items() if k in agent_indexes}
             
             episode_reward += rewards[1] + rewards[3]
 
-            augmented_rewards = {}
-            for agent_index in agent_indexes:
-                total_extra = 0.0
+            # Compute augmented team reward
+            team_reward = 0.0
+            for i, agent_index in enumerate(agent_indexes):
+                agent_reward = rewards[agent_index]
                 
                 if exploration_beta > 0:
-                    total_extra += get_exploration_bonus(
+                    agent_reward += get_exploration_bonus(
                         current_observations[agent_index], 
                         visit_counts, 
                         agent_index, 
                         beta=exploration_beta
                     )
-                    
-                augmented_rewards[agent_index] = rewards[agent_index] + total_extra
+                
+                team_reward += agent_reward
+            team_reward /= len(agent_indexes)
 
-            next_states_converted = []
-            rewards_converted = []
-            terminations_converted = []
-            actions_converted = []
-            for index in agent_indexes:
-                next_states_converted.append(list(next_states.values())[index])
-                rewards_converted.append(augmented_rewards[index]) 
-                terminations_converted.append(terminations[index])
-                actions_converted.append(actions[index])
-
-            next_states_converted = torch.stack(next_states_converted)
-            states_converted = torch.stack(states)
+            # Convert next states
+            next_states_list = [
+                torch.as_tensor(list(next_states_dict.values())[idx], dtype=torch.float32, device=device)
+                for idx in agent_indexes
+            ]
             
-            # Team Reward Calculation
-            team_reward = (rewards_converted[0] + rewards_converted[1]) / 2.0
-            team_done = terminations_converted[0] or terminations_converted[1]
+            states_stacked = torch.stack(states)
+            next_states_stacked = torch.stack(next_states_list)
+            team_done = any(terminations[idx] for idx in agent_indexes)
             
             transition = n_step_buffer.add(
-                states_converted, 
-                actions_converted, 
-                [team_reward, team_reward], 
-                next_states_converted, 
-                [team_done, team_done]
+                states_stacked, 
+                actions_taken, 
+                team_reward, 
+                next_states_stacked, 
+                team_done
             )
-        
+            
             if transition:
                 replay_buffer.add(transition)
             
             if replay_buffer.size() >= batch_size:
                 has_trained = True
-                batch, idxs, weights = replay_buffer.sample(batch_size, beta=per_beta)
+                batch, idxs, is_weights = replay_buffer.sample(batch_size, beta=per_beta)
                 
-                # CLEANED UP: Passing singular nets
                 loss, td_errors = compute_td_loss(
                     agent_net, target_net, mixer, target_mixer, 
-                    batch, weights=weights, gamma=gamma, n_step=n_step
+                    batch, weights=is_weights, gamma=gamma, n_step=n_step
                 )
                 
                 replay_buffer.update_priorities(idxs, td_errors)
@@ -411,88 +430,111 @@ def train_rainbow_qmix_shared(env, agent_net, target_net, mixer, target_mixer,
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(all_params, max_norm=10.0)
                 optimizer.step()
-                soft_update_target_network(agent_net, target_net, tau=0.01)
-                soft_update_mixer(mixer, target_mixer, tau=0.01)
-            else:
-                print("something just happened")
+                
+                soft_update(agent_net, target_net, tau=tau)
+                soft_update(mixer, target_mixer, tau=tau)
 
-        if has_trained: scheduler.step()
+        if has_trained:
+            scheduler.step()
+        
         episode_rewards.append(episode_reward)
         episode_scores.append(score)
         
         if (episode + 1) % 5 == 0:
             avg_reward = np.mean(episode_rewards[-5:])
             avg_score = np.mean(episode_scores[-5:])
-            print(f"Ep {episode + 1}/{n_episodes} | Rew: {avg_reward:.2f} | Score: {avg_score:.2f} | LR: {scheduler.get_last_lr()[0]:.5f}")
+            print(f"Ep {episode + 1}/{n_episodes} | Rew: {avg_reward:.2f} | Score: {avg_score:.2f} | LR: {scheduler.get_last_lr()[0]:.6f}")
     
     return episode_rewards, episode_scores
 
-def plot_training_curves(rewards, scores, filename="rainbow_final.png", window=20):
+
+def plot_training_curves(rewards, scores, filename="rainbow_qmix.png", window=20):
     import matplotlib
     matplotlib.use('Agg')
+    
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
     def moving_avg(data, w):
-        if len(data) < w: return data
+        if len(data) < w:
+            return data
         return np.convolve(data, np.ones(w)/w, mode='valid')
+    
     axes[0].plot(rewards, alpha=0.3, color='blue')
     if len(rewards) >= window:
-        axes[0].plot(range(window-1, len(rewards)), moving_avg(rewards, window), color='blue', linewidth=2, label=f'{window}-ep avg')
-    axes[0].set_title('Training Rewards (Shared Net)')
+        axes[0].plot(range(window-1, len(rewards)), moving_avg(rewards, window), 
+                     color='blue', linewidth=2, label=f'{window}-ep avg')
+    axes[0].set_title('Training Rewards')
+    axes[0].set_xlabel('Episode')
     axes[0].legend()
+    
     axes[1].plot(scores, alpha=0.3, color='green')
     if len(scores) >= window:
-        axes[1].plot(range(window-1, len(scores)), moving_avg(scores, window), color='green', linewidth=2, label=f'{window}-ep avg')
+        axes[1].plot(range(window-1, len(scores)), moving_avg(scores, window), 
+                     color='green', linewidth=2, label=f'{window}-ep avg')
     axes[1].set_title('Game Scores')
+    axes[1].set_xlabel('Episode')
     axes[1].legend()
+    
     plt.tight_layout()
     plt.savefig(filename)
     plt.close(fig)
+    print(f"Plot saved to {filename}")
 
-def save_models(agent_net, mixer, filename="rainbow_final.pt"):
-    checkpoint = {'agent_net': agent_net.state_dict(), 'mixer': mixer.state_dict()}
+
+def save_models(agent_net, mixer, filename="rainbow_qmix.pt"):
+    checkpoint = {
+        'agent_net': agent_net.state_dict(), 
+        'mixer': mixer.state_dict()
+    }
     torch.save(checkpoint, filename)
     print(f"Model saved to {filename}")
 
+
 # --- MAIN EXECUTION ---
-layout_name = 'tinyCapture.lay'
-layout_path = os.path.join('layouts', layout_name)
+if __name__ == "__main__":
+    layout_name = 'tinyCapture.lay'
+    layout_path = os.path.join('layouts', layout_name)
 
-env = gymPacMan_parallel_env(layout_file=layout_path,
-                             display=False,
-                             reward_forLegalAction=True, 
-                             defenceReward=False,
-                             length=299,
-                             enemieName='randomTeam',
-                             self_play=False,
-                             random_layout=False)
-env.reset()
+    env = gymPacMan_parallel_env(
+        layout_file=layout_path,
+        display=False,
+        reward_forLegalAction=True, 
+        defenceReward=False,
+        length=299,
+        enemieName='randomTeam',
+        self_play=False,
+        random_layout=False
+    )
+    env.reset()
 
-n_agents = int(len(env.agents) / 2)
-action_dim_individual_agent = 5
-obs_individual_agent = env.get_Observation(0)
-obs_shape = obs_individual_agent.shape
+    n_agents = len(env.agents) // 2
+    action_dim = 5
+    obs_shape = env.get_Observation(0).shape
 
-# 1. SHARED Network
-shared_agent = AgentQNetwork(obs_shape, action_dim_individual_agent).to(device)
-shared_target = AgentQNetwork(obs_shape, action_dim_individual_agent).to(device)
-shared_target.load_state_dict(shared_agent.state_dict())
+    # Shared networks
+    agent_net = AgentQNetwork(obs_shape, action_dim).to(device)
+    target_net = AgentQNetwork(obs_shape, action_dim).to(device)
+    target_net.load_state_dict(agent_net.state_dict())
 
-mixer = SimpleQMixer(n_agents=n_agents, state_shape=obs_shape, embed_dim=32).to(device)
-target_mixer = SimpleQMixer(n_agents=n_agents, state_shape=obs_shape, embed_dim=32).to(device)
-target_mixer.load_state_dict(mixer.state_dict())
+    mixer = SimpleQMixer(n_agents=n_agents, state_shape=obs_shape, embed_dim=32).to(device)
+    target_mixer = SimpleQMixer(n_agents=n_agents, state_shape=obs_shape, embed_dim=32).to(device)
+    target_mixer.load_state_dict(mixer.state_dict())
 
-replay_buffer = NaivePrioritizedBuffer(capacity=100_000, alpha=0.6)
+    replay_buffer = NaivePrioritizedBuffer(capacity=100_000, alpha=0.6)
 
-print("Starting Final Rainbow Training (Shared Net, No Ortho)...")
-rewards_exp, scores_exp = train_rainbow_qmix_shared(
-    env, shared_agent, shared_target, mixer, target_mixer, replay_buffer,
-    n_episodes=150,
-    batch_size=512,
-    lr=0.0003, 
-    gamma=0.98,  
-    exploration_beta=0.5, 
-    n_step=3 
-)
+    print(f"Obs shape: {obs_shape}, Action dim: {action_dim}, Agents: {n_agents}")
+    print("Starting Rainbow QMIX Training...")
+    
+    rewards, scores = train_rainbow_qmix(
+        env, agent_net, target_net, mixer, target_mixer, replay_buffer,
+        n_episodes=150,
+        batch_size=512,
+        lr=0.001, 
+        gamma=0.98,  
+        exploration_beta=0.5,
+        n_step=3,
+        tau=0.005
+    )
 
-save_models(shared_agent, mixer, filename="rainbow_final.pt")
-plot_training_curves(rewards_exp, scores_exp, filename="Rainbow_Final_Run.png")
+    save_models(agent_net, mixer)
+    plot_training_curves(rewards, scores)
