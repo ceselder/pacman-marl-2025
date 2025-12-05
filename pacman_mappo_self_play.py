@@ -13,11 +13,11 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 NUM_STEPS = 2048        
 BATCH_SIZE = 256        
-LR = 2.5e-4             # Good starting rate
+LR = 2.5e-4             
 GAMMA = 0.99            
 GAE_LAMBDA = 0.95       
 CLIP_EPS = 0.2          
-ENT_COEF = 0.025        # Force exploration
+ENT_COEF = 0.025        
 VF_COEF = 0.5           
 MAX_GRAD_NORM = 0.5     
 UPDATE_EPOCHS = 5       
@@ -25,17 +25,17 @@ TOTAL_UPDATES = 300
 
 # Architecture Dimensions
 VALUE_HIDDEN_DIM = 512
-CRITIC_HIDDEN_DIM = 1024  # Bigger Critic handles the complexity well
+CRITIC_HIDDEN_DIM = 1024 
 
 # Training Settings
-REWARD_SCALE = 5.0        # <--- KEEPS SIGNAL LOUD
-WARMUP_UPDATES = 50       # Train vs Random first
+REWARD_SCALE = 5.0        
+WARMUP_UPDATES = 50       
 OPPONENT_UPDATE_FREQ = 10  
 OPPONENT_POOL_SIZE = 5     
 SELF_PLAY_PROB = 0.5       
 EVAL_FREQ = 10             
 EVAL_EPISODES = 5          
-SNAPSHOT_FREQ = 50        # Save model every 50 updates
+SNAPSHOT_FREQ = 50        
 
 # --- Agent Architecture ---
 class MAPPOAgent(nn.Module):
@@ -54,7 +54,6 @@ class MAPPOAgent(nn.Module):
             dummy_obs = torch.zeros(1, *obs_shape)
             actor_flat = self.actor_conv(dummy_obs).shape[1]
             
-        # Corrected 2-Layer Sequential
         self.actor = nn.Sequential(
             nn.Linear(actor_flat, VALUE_HIDDEN_DIM),   nn.ReLU(),
             nn.Linear(VALUE_HIDDEN_DIM, VALUE_HIDDEN_DIM), nn.ReLU(), 
@@ -74,7 +73,6 @@ class MAPPOAgent(nn.Module):
             dummy_state = torch.zeros(1, critic_input_channels, obs_shape[1], obs_shape[2])
             critic_flat = self.critic_conv(dummy_state).shape[1]
 
-        # Corrected 2-Layer Sequential (Bigger)
         self.critic = nn.Sequential(
             nn.Linear(critic_flat, CRITIC_HIDDEN_DIM),  nn.ReLU(),
             nn.Linear(CRITIC_HIDDEN_DIM, CRITIC_HIDDEN_DIM),   nn.ReLU(), 
@@ -104,8 +102,7 @@ class MAPPOAgent(nn.Module):
         
         return values, log_probs, entropy
 
-# --- Helper Functions ---
-
+# --- Helpers ---
 def compute_gae(rewards, values, dones, last_value, last_done):
     T = len(rewards)
     advantages = torch.zeros_like(rewards)
@@ -125,7 +122,7 @@ def process_obs(obs, is_red_team):
     """
     Standardizes observations:
     1. Swaps Channels (Red Food <-> Blue Food)
-    2. Flips Board 180 (Red Position <-> Blue Position)
+    2. HORIZONTAL FLIP (To match myTeam.py logic)
     """
     if not is_red_team:
         return obs 
@@ -138,19 +135,21 @@ def process_obs(obs, is_red_team):
     new_obs[:, 6, :, :] = obs[:, 7, :, :] # Food
     new_obs[:, 7, :, :] = obs[:, 6, :, :]
     
-    # 2. SPATIAL FLIP
-    new_obs = torch.flip(new_obs, [2, 3])
+    # 2. HORIZONTAL FLIP (Batch, C, H, W) -> Flip W (dim 3)
+    new_obs = torch.flip(new_obs, [3])
     
     return new_obs
 
 def invert_actions(actions):
     """
-    Maps actions to their 180-degree opposite.
-    0 (North) <-> 2 (South)
-    1 (East)  <-> 3 (West)
-    4 (Stop)  <-> 4 (Stop)
+    Maps actions for Horizontal Mirroring.
+    0 (North) -> 0 (North)
+    1 (East)  -> 3 (West)
+    2 (South) -> 2 (South)
+    3 (West)  -> 1 (East)
+    4 (Stop)  -> 4 (Stop)
     """
-    mapper = torch.tensor([2, 3, 0, 1, 4], device=actions.device)
+    mapper = torch.tensor([0, 3, 2, 1, 4], device=actions.device)
     return mapper[actions]
 
 def evaluate_vs_random(agent, eval_env, num_episodes=5):
@@ -190,7 +189,6 @@ def evaluate_vs_random(agent, eval_env, num_episodes=5):
     return np.mean(total_rewards)
 
 # --- Main Training Loop ---
-
 def train_mappo(train_env, eval_env):
     dummy_obs = train_env.get_Observation(0)
     obs_shape = dummy_obs.shape
@@ -220,14 +218,12 @@ def train_mappo(train_env, eval_env):
 
     for update in range(1, TOTAL_UPDATES + 1):
         
-        # --- PHASE 1: WARMUP vs RANDOM ---
         if update <= WARMUP_UPDATES:
             current_opp_is_random = True
-            is_red_learner = False # Always train Blue first (easiest)
+            is_red_learner = False 
             train_ids = [1, 3]
             opp_ids = [0, 2]
         else:
-            # --- PHASE 2: SELF-PLAY ---
             current_opp_is_random = False
             opponent = get_opponent()
             if np.random.rand() > 0.5:
@@ -235,7 +231,6 @@ def train_mappo(train_env, eval_env):
             else:
                 train_ids = [0, 2]; opp_ids = [1, 3]; is_red_learner = True
 
-        # Buffers
         obs_buf = torch.zeros((NUM_STEPS, num_agents, *obs_shape))
         state_buf = torch.zeros((NUM_STEPS, num_agents, *state_shape))
         actions_buf = torch.zeros((NUM_STEPS, num_agents), dtype=torch.long)
@@ -252,7 +247,6 @@ def train_mappo(train_env, eval_env):
         next_done = torch.zeros(num_agents)
         current_ep_reward = 0
 
-        # Rollout
         for step in range(NUM_STEPS):
             obs_buf[step] = next_obs
             state_buf[step] = next_state
@@ -265,16 +259,16 @@ def train_mappo(train_env, eval_env):
             
             actions_buf[step], logprobs_buf[step], values_buf[step] = action, logprob, value
 
-            # --- HANDLE LEARNER ACTIONS ---
+            # Learner Actions
             if is_red_learner:
                 real_learner_actions = invert_actions(action)
             else:
                 real_learner_actions = action
 
-            # --- HANDLE OPPONENT ACTIONS ---
+            # Opponent Actions
             if current_opp_is_random:
                 opp_actions_scalar = torch.randint(0, 5, (num_agents,))
-                real_opp_actions = opp_actions_scalar # Random doesn't need inversion
+                real_opp_actions = opp_actions_scalar 
             else:
                 opp_raw_obs = torch.stack([train_env.get_Observation(i) for i in opp_ids]).float()
                 opp_is_red = not is_red_learner
@@ -353,20 +347,17 @@ def train_mappo(train_env, eval_env):
         if update % OPPONENT_UPDATE_FREQ == 0:
             opponent_pool.append(copy.deepcopy(agent.state_dict()))
 
-        # Evaluation
         if update % EVAL_FREQ == 0:
             eval_score = evaluate_vs_random(agent, eval_env, num_episodes=EVAL_EPISODES)
             log['eval_reward'].append(eval_score)
         else:
             log['eval_reward'].append(log['eval_reward'][-1] if log['eval_reward'] else 0)
 
-        # Snapshot
         if update % SNAPSHOT_FREQ == 0:
             fn = f"mappo_pacman_update_{update}.pt"
             torch.save(agent.state_dict(), fn)
             print(f"--- Saved {fn} ---")
 
-        # Log
         mean_reward = rewards_buf.sum().item() / num_agents
         mean_ep_return = np.mean(episode_returns[-10:]) if episode_returns else 0
         side = "Warm" if update <= WARMUP_UPDATES else ("Red" if is_red_learner else "Blue")
@@ -387,39 +378,33 @@ def train_mappo(train_env, eval_env):
 def plot_training(log):
     fig, axes = plt.subplots(2, 3, figsize=(15, 8))
     
-    # 1. Rollout Reward
     axes[0,0].plot(log['update'], log['reward'])
     axes[0,0].set_title('Rollout Reward (Scaled)')
     axes[0,0].set_xlabel('Update')
     axes[0,0].grid(True)
     
-    # 2. Episode Return vs Eval
-    axes[0,1].plot(log['update'], log['episode_return'], label='Self-Play (Training)')
-    axes[0,1].plot(log['update'], log['eval_reward'], label='vs Random (Eval)', color='orange')
-    axes[0,1].set_title('Episode Return (Unscaled)')
+    axes[0,1].plot(log['update'], log['episode_return'], label='Self-Play')
+    axes[0,1].plot(log['update'], log['eval_reward'], label='vs Random', color='orange')
+    axes[0,1].set_title('Episode Return')
     axes[0,1].legend()
     axes[0,1].set_xlabel('Update')
     axes[0,1].grid(True)
     
-    # 3. Entropy
     axes[0,2].plot(log['update'], log['entropy'])
     axes[0,2].set_title('Entropy')
     axes[0,2].set_xlabel('Update')
     axes[0,2].grid(True)
     
-    # 4. Policy Loss
     axes[1,0].plot(log['update'], log['pg_loss'])
     axes[1,0].set_title('Policy Loss')
     axes[1,0].set_xlabel('Update')
     axes[1,0].grid(True)
     
-    # 5. Value Loss
     axes[1,1].plot(log['update'], log['v_loss'])
     axes[1,1].set_title('Value Loss')
     axes[1,1].set_xlabel('Update')
     axes[1,1].grid(True)
     
-    # 6. Clip Fraction
     axes[1,2].plot(log['update'], log['clip_frac'])
     axes[1,2].set_title('Clip Fraction')
     axes[1,2].set_xlabel('Update')
@@ -433,6 +418,6 @@ if __name__ == "__main__":
     train_env = gymPacMan_parallel_env(layout_file=os.path.join('layouts', 'tinyCapture.lay'), display=False, reward_forLegalAction=True, defenceReward=True, length=300, enemieName='randomTeam', self_play=True, random_layout=False)
     eval_env = gymPacMan_parallel_env(layout_file=os.path.join('layouts', 'tinyCapture.lay'), display=False, reward_forLegalAction=True, defenceReward=True, length=300, enemieName='randomTeam', self_play=False, random_layout=False)
     
-    print("Starting MAPPO with WARMUP Curriculum (Flipped + Scaled)...")
+    print("Starting MAPPO with WARMUP Curriculum (Horizontal Mirror)...")
     log = train_mappo(train_env, eval_env)
     plot_training(log)
