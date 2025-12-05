@@ -25,6 +25,7 @@ TOTAL_UPDATES = 500    # Total training iterations (Increased to demonstrate sna
 
 HIDDEN_DIM = 512
 
+
 OPPONENT_UPDATE_FREQ = 10  # Add current agent to pool every N updates
 OPPONENT_POOL_SIZE = 5     # Max opponents to keep
 SELF_PLAY_PROB = 0.5       # Probability of playing against older versions
@@ -69,7 +70,10 @@ class MAPPOAgent(nn.Module):
             critic_flat = self.critic_conv(dummy_state).shape[1]
 
         self.critic = nn.Sequential(
-            nn.Linear(critic_flat, HIDDEN_DIM), nn.ReLU(), 
+            nn.Linear(critic_flat, HIDDEN_DIM), 
+            nn.ReLU(),
+            nn.Linear(HIDDEN_DIM, HIDDEN_DIM),
+            nn.ReLU(),
             nn.Linear(HIDDEN_DIM, 1)
         )
 
