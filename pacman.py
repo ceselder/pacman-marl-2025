@@ -223,6 +223,7 @@ def get_exploration_bonus(obs, visit_counts, agent_index, beta=0.1):
             pos = (int(ys[0]), int(xs[0]))
     except: 
         print("issue exploration distance")
+        print(np.nonzero(obs[1]))
         pass
     team_id = agent_index % 2
     key = (team_id, pos)
