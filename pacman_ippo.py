@@ -7,13 +7,10 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 from gymPacMan import gymPacMan_parallel_env
 
-# --- CONFIG ---
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-print(f"Device: {device}")
-
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 NUM_STEPS = 2048       # Steps to collect per agent before updating
-BATCH_SIZE = 64        # Minibatch size for PPO update
+BATCH_SIZE = 32        # Minibatch size for PPO update
 LR = 2.5e-4
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
@@ -24,228 +21,152 @@ MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 10     # How many times to re-use data
 TOTAL_UPDATES = 100   # Total training loops
 
-HIDDEN_DIM_SIZE = 1024
+HIDDEN_DIM_SIZE = 128
+
+
 
 class ActorCritic(nn.Module):
     def __init__(self, obs_shape, action_dim):
-        super(ActorCritic, self).__init__()
-        
-        # Shared Feature Extractor (CNN)
-        self.conv1 = nn.Conv2d(obs_shape[0], 32, 3, stride=1, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, 3, stride=1, padding=1)
-        self.conv3 = nn.Conv2d(64, 64, 3, stride=1, padding=1)
-        
-        # Calculate flat size
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(obs_shape[0], 32, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
+            nn.Flatten()
+        )
         with torch.no_grad():
-            dummy = torch.zeros(1, *obs_shape)
-            x = F.relu(self.conv1(dummy))
-            x = F.relu(self.conv2(x))
-            x = F.relu(self.conv3(x))
-            self.flat_size = x.view(1, -1).shape[1]
-
-        self.flatten = nn.Flatten()
-        
-        # Actor Head (Policy)
-        self.actor = nn.Sequential(
-            nn.Linear(self.flat_size, HIDDEN_DIM_SIZE),
-            nn.ReLU(),
-            nn.Linear(HIDDEN_DIM_SIZE, action_dim)
-        )
-        
-        # Critic Head (Value)
-        self.critic = nn.Sequential(
-            nn.Linear(self.flat_size, HIDDEN_DIM_SIZE),
-            nn.ReLU(),
-            nn.Linear(HIDDEN_DIM_SIZE, 1)
-        )
-
-    def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = self.flatten(x)
-        return x
+            flat_size = self.conv(torch.zeros(1, *obs_shape)).shape[1]
+        self.actor = nn.Sequential(nn.Linear(flat_size, HIDDEN_DIM_SIZE), nn.ReLU(), nn.Linear(HIDDEN_DIM_SIZE, action_dim))
+        self.critic = nn.Sequential(nn.Linear(flat_size, HIDDEN_DIM_SIZE), nn.ReLU(), nn.Linear(HIDDEN_DIM_SIZE, 1))
 
     def get_action_and_value(self, x, action=None):
-        hidden = self.forward(x)
-        
-        # Actor
+        hidden = self.conv(x)
         logits = self.actor(hidden)
-        probs = Categorical(logits=logits)
-        
+        dist = Categorical(logits=logits)
         if action is None:
-            action = probs.sample()
-            
-        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
+            action = dist.sample()
+        return action, dist.log_prob(action), dist.entropy(), self.critic(hidden).squeeze(-1)
 
-def compute_gae(rewards, values, dones, next_value):
-    """ Calculate Generalized Advantage Estimation """
+def compute_gae(rewards, values, dones, last_value, last_done):
+    T = len(rewards)
     advantages = torch.zeros_like(rewards)
     lastgaelam = 0
-    for t in reversed(range(len(rewards))):
-        if t == len(rewards) - 1:
-            nextnonterminal = 1.0 - next_value # Simplified done logic
-            nextvalues = next_value
+    for t in reversed(range(T)):
+        if t == T - 1:
+            next_non_terminal = 1.0 - last_done
+            next_values = last_value
         else:
-            nextnonterminal = 1.0 - dones[t+1]
-            nextvalues = values[t+1]
-            
-        delta = rewards[t] + GAMMA * nextvalues * nextnonterminal - values[t]
-        advantages[t] = lastgaelam = delta + GAMMA * GAE_LAMBDA * nextnonterminal * lastgaelam
-    
-    returns = advantages + values
-    return advantages, returns
+            next_non_terminal = 1.0 - dones[t + 1]
+            next_values = values[t + 1]
+        delta = rewards[t] + GAMMA * next_values * next_non_terminal - values[t]
+        advantages[t] = lastgaelam = delta + GAMMA * GAE_LAMBDA * next_non_terminal * lastgaelam
+    return advantages, advantages + values
 
 def train_ppo(env):
-    agent_ids = [1, 3] # The indices of your team
-    obs_shape = env.get_Observation(agent_ids[0]).shape
-    action_dim = 5
-    
-    agent = ActorCritic(obs_shape, action_dim).to(device)
-    optimizer = optim.Adam(agent.parameters(), lr=LR, eps=1e-5)
-
+    agent_ids = [1, 3]
     num_agents = len(agent_ids)
+    obs_shape = env.get_Observation(agent_ids[0]).shape
     
-    global_step = 0
-    
+    agent = ActorCritic(obs_shape, 5).to(device)
+    optimizer = torch.optim.Adam(agent.parameters(), lr=LR, eps=1e-5)
+
     for update in range(1, TOTAL_UPDATES + 1):
-        # 1. Initialize Storage Buffers
-        obs_buf = torch.zeros((NUM_STEPS, num_agents) + obs_shape).to(device)
-        actions_buf = torch.zeros((NUM_STEPS, num_agents)).to(device)
-        logprobs_buf = torch.zeros((NUM_STEPS, num_agents)).to(device)
-        rewards_buf = torch.zeros((NUM_STEPS, num_agents)).to(device)
-        dones_buf = torch.zeros((NUM_STEPS, num_agents)).to(device)
-        values_buf = torch.zeros((NUM_STEPS, num_agents)).to(device)
+        # Storage - keep on CPU if CPU-bound, move batches to GPU
+        obs_buf = torch.zeros((NUM_STEPS, num_agents, *obs_shape))
+        actions_buf = torch.zeros((NUM_STEPS, num_agents), dtype=torch.long)
+        logprobs_buf = torch.zeros((NUM_STEPS, num_agents))
+        rewards_buf = torch.zeros((NUM_STEPS, num_agents))
+        dones_buf = torch.zeros((NUM_STEPS, num_agents))
+        values_buf = torch.zeros((NUM_STEPS, num_agents))
 
         env.reset()
-        # Initial observation
-        obs_list = [torch.tensor(env.get_Observation(i), dtype=torch.float32, device=device) for i in agent_ids]
-        next_obs = torch.stack(obs_list) # Shape: (2, C, H, W)
-        next_done = torch.zeros(num_agents).to(device)
+        next_obs = torch.tensor(np.stack([env.get_Observation(i) for i in agent_ids]), dtype=torch.float32)
+        next_done = torch.zeros(num_agents)
 
-        # 2. Collect Rollouts
+        # Rollout
         for step in range(NUM_STEPS):
-            global_step += 1
             obs_buf[step] = next_obs
             dones_buf[step] = next_done
             
             with torch.no_grad():
-                # Pass both agents through network simultaneously
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
-                values_buf[step] = value.flatten()
+                action, logprob, _, value = agent.get_action_and_value(next_obs.to(device))
+                action, logprob, value = action.cpu(), logprob.cpu(), value.cpu()
             
-            actions_buf[step] = action
-            logprobs_buf[step] = logprob
+            actions_buf[step], logprobs_buf[step], values_buf[step] = action, logprob, value
 
-            # Execute in Env
-            cpu_actions = action.cpu().numpy()
             env_actions = [-1] * len(env.agents)
             for i, ag_id in enumerate(agent_ids):
-                env_actions[ag_id] = cpu_actions[i]
+                env_actions[ag_id] = action[i].item()
 
             next_obs_dict, rewards_dict, dones_dict, _ = env.step(env_actions)
-
-            # Process Feedback
-            # Cooperative Reward: Sum rewards of team and give to both
-            team_reward = sum([rewards_dict[i] for i in agent_ids])
-            # Normalize reward slightly to help convergence
-            team_reward = np.clip(team_reward, -1, 1) 
-
-            rewards_buf[step] = torch.tensor([team_reward] * num_agents, device=device)
             
-            # Prepare next step
-            obs_list = [torch.tensor(next_obs_dict[i], dtype=torch.float32, device=device) for i in agent_ids]
-            next_obs = torch.stack(obs_list)
+            team_reward = np.clip(sum(rewards_dict[i] for i in agent_ids), -1, 1)
+            rewards_buf[step] = team_reward
             
-            # Check if ANY of our agents died/finished
-            any_done = any([dones_dict[i] for i in agent_ids])
-            if any_done:
-                print("someone died!")
-            next_done = torch.tensor([float(any_done)] * num_agents, device=device)
+            any_done = any(dones_dict[i] for i in agent_ids)
+            next_done = torch.full((num_agents,), float(any_done))
             
             if any_done:
                 env.reset()
-                obs_list = [torch.tensor(env.get_Observation(i), dtype=torch.float32, device=device) for i in agent_ids]
-                next_obs = torch.stack(obs_list)
+                next_obs = torch.tensor(np.stack([env.get_Observation(i) for i in agent_ids]), dtype=torch.float32)
+            else:
+                next_obs = torch.tensor(np.stack([next_obs_dict[i] for i in agent_ids]), dtype=torch.float32)
 
-        # 3. Bootstrap value for last step
+        # Bootstrap
         with torch.no_grad():
-            _, _, _, next_value = agent.get_action_and_value(next_obs)
-            next_value = next_value.flatten()
+            _, _, _, last_value = agent.get_action_and_value(next_obs.to(device))
+            last_value = last_value.cpu()
 
-        # 4. Compute GAE (Advantages)
-        advantages, returns = compute_gae(rewards_buf, values_buf, dones_buf, next_value)
-        
-        # 5. Flatten the collected data
-        # We merge time and agent dimensions: (NUM_STEPS, AGENTS, ...) -> (NUM_STEPS * AGENTS, ...)
-        b_obs = obs_buf.view(-1, *obs_shape)
-        b_logprobs = logprobs_buf.view(-1)
-        b_actions = actions_buf.view(-1)
-        b_advantages = advantages.view(-1)
-        b_returns = returns.view(-1)
-        b_values = values_buf.view(-1)
+        # GAE
+        advantages, returns = compute_gae(rewards_buf, values_buf, dones_buf, last_value, next_done)
 
-        # 6. PPO Update
-        b_inds = np.arange(BATCH_SIZE)
-        clipfracs = []
+        # Flatten
+        b_obs = obs_buf.reshape(-1, *obs_shape)
+        b_actions = actions_buf.reshape(-1)
+        b_logprobs = logprobs_buf.reshape(-1)
+        b_advantages = advantages.reshape(-1)
+        b_returns = returns.reshape(-1)
         
-        # Flattened dataset size
         dataset_size = NUM_STEPS * num_agents
         indices = np.arange(dataset_size)
 
-        for epoch in range(UPDATE_EPOCHS):
+        # PPO update
+        for _ in range(UPDATE_EPOCHS):
             np.random.shuffle(indices)
-            
             for start in range(0, dataset_size, BATCH_SIZE):
-                end = start + BATCH_SIZE
-                mb_inds = indices[start:end]
+                mb = indices[start:start + BATCH_SIZE]
                 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
-                logratio = newlogprob - b_logprobs[mb_inds]
-                ratio = logratio.exp()
-
-                with torch.no_grad():
-                    clipfracs += [((ratio - 1.0).abs() > CLIP_EPS).float().mean().item()]
-
-                mb_advantages = b_advantages[mb_inds]
-                # Normalize advantages (Critical for PPO stability)
+                mb_obs = b_obs[mb].to(device)
+                mb_actions = b_actions[mb].to(device)
+                mb_old_logprobs = b_logprobs[mb].to(device)
+                mb_advantages = b_advantages[mb].to(device)
+                mb_returns = b_returns[mb].to(device)
+                
                 mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
-                # Policy Loss
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS)
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(mb_obs, mb_actions)
+                ratio = (newlogprob - mb_old_logprobs).exp()
 
-                # Value Loss (clipped)
-                newvalue = newvalue.view(-1)
-                v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                v_clipped = b_values[mb_inds] + torch.clamp(
-                    newvalue - b_values[mb_inds],
-                    -CLIP_EPS,
-                    CLIP_EPS,
-                )
-                v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
-                v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                v_loss = 0.5 * v_loss_max.mean()
-
-                loss = pg_loss - ENT_COEF * entropy.mean() + v_loss * VF_COEF
+                pg_loss = -torch.min(
+                    ratio * mb_advantages,
+                    torch.clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * mb_advantages
+                ).mean()
+                v_loss = 0.5 * ((newvalue - mb_returns) ** 2).mean()
+                loss = pg_loss - ENT_COEF * entropy.mean() + VF_COEF * v_loss
 
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(agent.parameters(), MAX_GRAD_NORM)
                 optimizer.step()
 
-        print(f"Update {update}/{TOTAL_UPDATES} | Loss: {loss.item():.3f} | Mean Reward: {rewards_buf.sum().item() / num_agents:.2f}")
+        print(f"Update {update}/{TOTAL_UPDATES} | Reward: {rewards_buf.sum().item() / num_agents:.2f}")
 
     torch.save(agent.state_dict(), "ppo_pacman.pt")
 
 if __name__ == "__main__":
-    layout_name = 'tinyCapture.lay'
-    layout_path = os.path.join('layouts', layout_name)
     env = gymPacMan_parallel_env(
-        layout_file=layout_path, display=False, reward_forLegalAction=True,
-        defenceReward=False, length=1000, enemieName='randomTeam',
-        self_play=False, random_layout=False
+        layout_file=os.path.join('layouts', 'tinyCapture.lay'),
+        display=False, reward_forLegalAction=True, defenceReward=False,
+        length=1000, enemieName='randomTeam', self_play=False, random_layout=False
     )
-    
     train_ppo(env)
