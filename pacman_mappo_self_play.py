@@ -27,18 +27,22 @@ TOTAL_UPDATES = 1000
 OPPONENT_POOL_SIZE = 5
 OPPONENT_UPDATE_FREQ = 20
 SHAPING_SCALE = 0
-WARMUP_UPDATES = 0
+WARMUP_UPDATES = 50
 
 
-def canonicalize_obs(obs, is_red_agent):
+def canonicalize_obs(obs, is_red_agent, debug=False):
     if not is_red_agent:
         return obs
     
     canon = obs.clone()
     canon = torch.flip(canon, dims=[-1])  # Horizontal flip
     
+    if debug:
+        print(f"  [canonicalize] Input shape: {obs.shape}, dim={obs.dim()}")
+        print(f"  [canonicalize] Before swap - ch6 sum: {canon[6].sum().item():.0f}, ch7 sum: {canon[7].sum().item():.0f}")
+    
     # Swap capsules: blue (2) <-> red (3)
-    # Handle both (C, H, W) and (1, C, H, W) shapes
+    # Swap food: blue (6) <-> red (7)
     if canon.dim() == 3:
         temp = canon[2, :, :].clone()
         canon[2, :, :] = canon[3, :, :]
@@ -55,6 +59,9 @@ def canonicalize_obs(obs, is_red_agent):
         temp = canon[:, 6, :, :].clone()
         canon[:, 6, :, :] = canon[:, 7, :, :]
         canon[:, 7, :, :] = temp
+    
+    if debug:
+        print(f"  [canonicalize] After swap - ch6 sum: {canon[6].sum().item():.0f}, ch7 sum: {canon[7].sum().item():.0f}")
     
     return canon
 
@@ -208,8 +215,9 @@ def debug_obs(env, learner_ids, opponent_ids, play_as_red, step=0):
     # Get raw obs for first learner
     raw_obs = env.get_Observation(learner_ids[0]).float()
     
-    # Canonicalize
-    canon_obs = canonicalize_obs(raw_obs.unsqueeze(0), play_as_red).squeeze(0)
+    # Canonicalize with debug
+    print(f"\nCalling canonicalize_obs with play_as_red={play_as_red}:")
+    canon_obs = canonicalize_obs(raw_obs.unsqueeze(0), play_as_red, debug=True).squeeze(0)
     
     # Channel summary
     channel_names = ['walls', 'agent_loc', 'blue_caps', 'red_caps', 'allies', 'enemies', 'blue_food', 'red_food']
