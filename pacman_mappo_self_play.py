@@ -17,15 +17,15 @@ LR = 3e-4
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.2
-ENT_COEF = 0.015
+ENT_COEF = 0.01
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
-TOTAL_UPDATES = 120
+TOTAL_UPDATES = 1000
 
 # Self-play settings
 OPPONENT_POOL_SIZE = 5
-OPPONENT_UPDATE_FREQ = 10
+OPPONENT_UPDATE_FREQ = 20
 
 
 def canonicalize_obs(obs, is_red_agent):
@@ -335,7 +335,7 @@ def train():
         
         with torch.no_grad():
             all_obs_list = [learner_obs[i:i+1].to(device) for i in range(num_agents)]
-            last_value = agent.get_value(all_obs_list).cpu()
+            last_value = agent.get_value(all_obs_list).cpu().item()  # scalar, shared value
         
         # GAE
         advantages = torch.zeros_like(reward_buf)
@@ -346,7 +346,7 @@ def train():
                 reward_buf[:, i],
                 value_buf[:, i],
                 done_buf[:, i],
-                last_value[i]
+                last_value  # same for both agents (shared critic, team reward)
             )
             advantages[:, i] = adv
             returns[:, i] = ret
