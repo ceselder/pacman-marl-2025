@@ -181,14 +181,14 @@ class MAPPOAgent(nn.Module):
             flat_dim = self.conv(torch.zeros(1, *obs_shape)).shape[1]
         
         self.actor = nn.Sequential(
-            nn.Linear(flat_dim, 256), nn.ReLU(),
-            nn.Linear(256, action_dim)
+            nn.Linear(flat_dim, 512), nn.ReLU(),
+            nn.Linear(512, action_dim)
         )
         
         # Centralized critic sees all agents' observations
         self.critic = nn.Sequential(
-            nn.Linear(flat_dim * num_agents, 256), nn.ReLU(),
-            nn.Linear(256, 1)
+            nn.Linear(flat_dim * num_agents, 1024), nn.ReLU(),
+            nn.Linear(1024, 1)
         )
         
         self.flat_dim = flat_dim
@@ -316,6 +316,10 @@ def train():
         episode_returns = []
         
         for step in range(NUM_STEPS):
+                        # Add this temporarily at the start of your training loop, after reset
+            print(f"Playing as: {'Red' if play_as_red else 'Blue'}")
+            print(f"Learner IDs: {learner_ids}")
+            print(f"Agent positions: {[env.game.state.getAgentPosition(i) for i in range(4)]}")
             # Get and canonicalize observations for learner agents
             learner_obs_raw = [obs_dict[env.agents[i]].float() for i in learner_ids]
             learner_obs_canon = [canonicalize_obs(o.unsqueeze(0), play_as_red).squeeze(0) for o in learner_obs_raw]
