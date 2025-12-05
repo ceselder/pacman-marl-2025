@@ -244,7 +244,7 @@ if __name__ == "__main__":
     env = gymPacMan_parallel_env(
         layout_file=os.path.join('layouts', 'tinyCapture.lay'),
         display=False, reward_forLegalAction=True, defenceReward=True,
-        length=2, enemieName='randomTeam',
+        length=500, enemieName='randomTeam',
         self_play=True,  # <-- Enable self-play mode
         random_layout=False
     )
