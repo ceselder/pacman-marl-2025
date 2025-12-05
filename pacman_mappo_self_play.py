@@ -12,7 +12,7 @@ print(f"Using device: {device}")
 
 # --- Hyperparameters ---
 NUM_STEPS = 2048
-BATCH_SIZE = 32
+BATCH_SIZE = 512
 LR = 5e-4
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
@@ -183,11 +183,53 @@ def compute_gae(rewards, values, dones, last_value):
     return advantages, advantages + values
 
 
+def debug_obs(env, learner_ids, opponent_ids, play_as_red, step=0):
+    """Print compressed debug info about observations."""
+    if step != 0:  # Only print on first step of rollout
+        return
+    
+    print(f"\n{'='*60}")
+    print(f"DEBUG: Playing as {'RED' if play_as_red else 'BLUE'}")
+    print(f"Learner IDs: {learner_ids}, Opponent IDs: {opponent_ids}")
+    
+    # Agent positions
+    positions = [env.game.state.getAgentPosition(i) for i in range(4)]
+    print(f"Agent positions (x,y): {positions}")
+    
+    # Get raw obs for first learner
+    raw_obs = env.get_Observation(learner_ids[0]).float()
+    
+    # Canonicalize
+    canon_obs = canonicalize_obs(raw_obs.unsqueeze(0), play_as_red).squeeze(0)
+    
+    # Channel summary
+    channel_names = ['walls', 'agent_loc', 'blue_caps', 'red_caps', 'allies', 'enemies', 'blue_food', 'red_food']
+    
+    print(f"\nRaw obs (agent {learner_ids[0]}):")
+    for i, name in enumerate(channel_names):
+        nonzero = (raw_obs[i] > 0).sum().item()
+        if nonzero > 0 and nonzero < 20:  # Print positions if sparse
+            locs = (raw_obs[i] > 0).nonzero(as_tuple=False).tolist()
+            print(f"  {name:12s}: {nonzero:3d} nonzero, locs={locs[:5]}{'...' if len(locs) > 5 else ''}")
+        else:
+            print(f"  {name:12s}: {nonzero:3d} nonzero")
+    
+    print(f"\nCanon obs (agent {learner_ids[0]}, play_as_red={play_as_red}):")
+    for i, name in enumerate(channel_names):
+        nonzero = (canon_obs[i] > 0).sum().item()
+        if nonzero > 0 and nonzero < 20:
+            locs = (canon_obs[i] > 0).nonzero(as_tuple=False).tolist()
+            print(f"  {name:12s}: {nonzero:3d} nonzero, locs={locs[:5]}{'...' if len(locs) > 5 else ''}")
+        else:
+            print(f"  {name:12s}: {nonzero:3d} nonzero")
+    print(f"{'='*60}\n")
+
+
 def train():
     env = gymPacMan_parallel_env(
         layout_file='layouts/tinyCapture.lay',
         display=False,
-        reward_forLegalAction=True,
+        reward_forLegalAction=False,
         defenceReward=True,
         length=300,
         enemieName='randomTeam',
@@ -239,9 +281,10 @@ def train():
         value_buf = torch.zeros(NUM_STEPS, num_agents)
         
         obs_dict, _ = env.reset()
-
-        print(f"Agent positions: {[env.game.state.getAgentPosition(i) for i in range(4)]}")
-        print(f"Learner IDs: {learner_ids}, Opponent IDs: {opponent_ids}")
+        
+        # Debug print on first step only
+        debug_obs(env, learner_ids, opponent_ids, play_as_red, step=0)
+        
         episode_return = 0
         episode_returns = []
         
