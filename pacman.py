@@ -18,43 +18,26 @@ elif torch.backends.mps.is_available():
     device = torch.device("mps")
 print(f"Device: {device}")
 
-if torch.cuda.is_available():
-    torch.backends.cudnn.benchmark = True
-
-layout_name = 'tinyCapture.lay'
-layout_path = os.path.join('layouts', layout_name)
-env = gymPacMan_parallel_env(layout_file=layout_path,
-                             display=False,
-                             reward_forLegalAction=True,
-                             defenceReward=False,
-                             length=299,
-                             enemieName='randomTeam',
-                             self_play=False,
-                             random_layout=False)
-env.reset()
-
-# --- 1. RAINBOW COMPONENTS (Noisy Nets) ---
-
+# --- RAINBOW NOISY LAYER ---
 class NoisyLinear(nn.Module):
     def __init__(self, in_features, out_features, std_init=0.5):
         super(NoisyLinear, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.std_init = std_init
-
+        
         self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
         self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
         self.register_buffer('weight_epsilon', torch.empty(out_features, in_features))
-
+        
         self.bias_mu = nn.Parameter(torch.empty(out_features))
         self.bias_sigma = nn.Parameter(torch.empty(out_features))
         self.register_buffer('bias_epsilon', torch.empty(out_features))
-
+        
         self.reset_parameters()
         self.reset_noise()
 
     def reset_parameters(self):
-        # We stick to the paper's init for Noisy Layers to ensure exploration works
         mu_range = 1 / math.sqrt(self.in_features)
         self.weight_mu.data.uniform_(-mu_range, mu_range)
         self.weight_sigma.data.fill_(self.std_init / math.sqrt(self.in_features))
@@ -79,11 +62,11 @@ class NoisyLinear(nn.Module):
         else:
             return F.linear(input, self.weight_mu, self.bias_mu)
 
-# --- DUELING DQN ARCHITECTURE (Upgraded) ---
-
+# --- AGENT NETWORK (Standard Depth, Default Init) ---
 class AgentQNetwork(nn.Module):
     def __init__(self, obs_shape, action_dim, hidden_dim=512):
         super(AgentQNetwork, self).__init__()
+        # Standard 3-Layer CNN
         self.conv1 = nn.Conv2d(obs_shape[0], 16, kernel_size=3, stride=1, padding=1)
         self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)
         self.conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
@@ -91,8 +74,9 @@ class AgentQNetwork(nn.Module):
         conv_output_shape = obs_shape[1] * obs_shape[2] * 64 
         self.flatten = nn.Flatten()
         
+        # Dueling Heads
         self.fc_val = nn.Sequential(
-        NoisyLinear(conv_outoi      put_shape, hidden_dim), 
+            NoisyLinear(conv_output_shape, hidden_dim), 
             nn.ReLU(), 
             NoisyLinear(hidden_dim, 1)
         )
@@ -101,17 +85,7 @@ class AgentQNetwork(nn.Module):
             nn.ReLU(), 
             NoisyLinear(hidden_dim, action_dim)
         )
-        
-        # Apply Orthogonal Initialization to Conv Layers, apparently good idea
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Conv2d):
-            # Orthogonal init with gain for ReLU
-            nn.init.orthogonal_(m.weight, gain=nn.init.calculate_gain('relu'))
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        # Note: We do NOT strictly init NoisyLinear here as it has its own logic
+        # REMOVED: self.apply(self._init_weights) -> Reverts to PyTorch Default
 
     def forward(self, obs):
         x = F.relu(self.conv1(obs))
@@ -129,7 +103,6 @@ class AgentQNetwork(nn.Module):
                 module.reset_noise()
 
 # --- QMIX MIXER ---
-
 class SimpleQMixer(nn.Module):
     def __init__(self, n_agents, state_shape, embed_dim=32):
         super(SimpleQMixer, self).__init__()
@@ -143,15 +116,7 @@ class SimpleQMixer(nn.Module):
         self.hyper_b1 = nn.Linear(self.state_dim, embed_dim)
         self.hyper_w2 = nn.Sequential(nn.Linear(self.state_dim, embed_dim), nn.ReLU(), nn.Linear(embed_dim, embed_dim))
         self.hyper_b2 = nn.Sequential(nn.Linear(self.state_dim, embed_dim), nn.ReLU(), nn.Linear(embed_dim, 1))
-
-        # Apply Orthogonal Init to Mixer as well (Standard Linear layers)
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.orthogonal_(m.weight, gain=nn.init.calculate_gain('relu'))
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
+        # REMOVED: self.apply(self._init_weights)
 
     def forward(self, agent_qs, states):
         bs = agent_qs.shape[0]
@@ -166,8 +131,7 @@ class SimpleQMixer(nn.Module):
         q_tot = torch.bmm(hidden, w2) + b2
         return q_tot.view(bs, -1, 1)
 
-# --- 2. MULTI-STEP LEARNING BUFFER ---
-
+# --- N-STEP BUFFER ---
 class NStepBuffer:
     def __init__(self, n_step, gamma):
         self.n_step = n_step
@@ -177,15 +141,13 @@ class NStepBuffer:
     def add(self, state, action, reward, next_state, done):
         self.buffer.append((state, action, reward, next_state, done))
         if len(self.buffer) < self.n_step: return None
-        
         curr_state, curr_action, _, _, _ = self.buffer[0]
         n_state, _, _, _, n_done = self.buffer[-1]
-        
         R = 0
         for i in range(self.n_step):
             r = self.buffer[i][2][0] 
             R += (self.gamma ** i) * r
-            if self.buffer[i][4][0]: # If done
+            if self.buffer[i][4][0]: 
                 n_state = self.buffer[i][3]
                 n_done = self.buffer[i][4]
                 break
@@ -194,8 +156,7 @@ class NStepBuffer:
     def reset(self):
         self.buffer.clear()
 
-# --- 3. CLEANER PRIORITIZED REPLAY (No SumTree) ---
-
+# --- PER BUFFER ---
 class NaivePrioritizedBuffer:
     def __init__(self, capacity, alpha=0.6):
         self.capacity = capacity
@@ -207,27 +168,21 @@ class NaivePrioritizedBuffer:
     
     def add(self, experience):
         max_p = self.priorities[:len(self.buffer)].max() if self.buffer else 1.0
-        
         if len(self.buffer) < self.capacity:
             self.buffer.append(experience)
         else:
             self.buffer[self.pos] = experience
-        
         self.priorities[self.pos] = max_p
         self.pos = (self.pos + 1) % self.capacity
     
     def sample(self, batch_size, beta=0.4):
         N = len(self.buffer)
         if N == 0: return None
-        
         probs = self.priorities[:N] ** self.alpha
         probs /= probs.sum()
-        
         indices = np.random.choice(N, batch_size, p=probs)
-        
         weights = (N * probs[indices]) ** (-beta)
         weights /= weights.max()
-        
         experiences = [self.buffer[i] for i in indices]
         
         states = np.array([e[0].cpu().numpy() for e in experiences], dtype=np.float32)
@@ -235,7 +190,6 @@ class NaivePrioritizedBuffer:
         rewards = np.array([e[2] for e in experiences])
         next_states = np.array([e[3].cpu().numpy() for e in experiences], dtype=np.float32)
         dones = np.array([e[4] for e in experiences])
-        
         return (states, actions, rewards, next_states, dones), indices, weights
     
     def update_priorities(self, indices, errors):
@@ -246,21 +200,18 @@ class NaivePrioritizedBuffer:
         return len(self.buffer)
 
 # --- HELPERS ---
-
 def get_min_food_dist(obs, agent_index):
-    return 0 #turned off for now
     try:
-        ys, xs = np.nonzero(obs[1])
+        ys, xs = np.nonzero(obs[1]) 
         if len(ys) == 0: return 0 
         my_pos = np.array([ys[0], xs[0]])
-        target_ch = 7 if agent_index in [1, 3] else 6
+        target_ch = 7 if agent_index in [1, 3] else 6 
         if target_ch >= obs.shape[0]: return 0
         f_ys, f_xs = np.nonzero(obs[target_ch])
         if len(f_ys) == 0: return 0 
         dists = np.sum(np.abs(np.stack([f_ys, f_xs], axis=1) - my_pos), axis=1)
         return np.min(dists)
     except: 
-        print("something wrong food dist!")
         return 0
 
 def get_exploration_bonus(obs, visit_counts, agent_index, beta=0.1):
@@ -269,19 +220,14 @@ def get_exploration_bonus(obs, visit_counts, agent_index, beta=0.1):
         ys, xs = np.nonzero(obs[1])
         if len(ys) > 0: 
             pos = (int(ys[0]), int(xs[0]))
-    except: 
-        print("something wrong exploration!")
-        pass
-    
+    except: pass
     team_id = agent_index % 2
     key = (team_id, pos)
-    
     visit_counts[key] = visit_counts.get(key, 0) + 1
     return beta / np.sqrt(visit_counts[key])
 
 def compute_td_loss(agent_q_networks, target_q_networks, mixer, target_mixer, batch, weights=None, gamma=0.99, n_step=1):
     states, actions, rewards, next_states, dones = batch
-    
     states = torch.tensor(states, dtype=torch.float32).to(device)
     actions = torch.tensor(actions, dtype=torch.long).to(device)
     rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
@@ -298,7 +244,6 @@ def compute_td_loss(agent_q_networks, target_q_networks, mixer, target_mixer, ba
     agent_q_values = torch.cat(agent_q_values, dim=1)
     q_tot = mixer(agent_q_values, states).squeeze(-1)
     
-    # Double DQN Logic
     with torch.no_grad():
         next_agent_q_values = []
         for i, (q_net, target_net) in enumerate(zip(agent_q_networks, target_q_networks)):
@@ -310,10 +255,8 @@ def compute_td_loss(agent_q_networks, target_q_networks, mixer, target_mixer, ba
             
         next_agent_q_values = torch.cat(next_agent_q_values, dim=1)
         next_q_tot = target_mixer(next_agent_q_values, next_states).squeeze(-1)
-        
         team_reward = rewards[:, 0].unsqueeze(1) 
         done_mask = dones[:, 0].unsqueeze(1) 
-        
         target_q_tot = team_reward + (gamma ** n_step) * next_q_tot * (1 - done_mask)
     
     loss_elementwise = F.huber_loss(q_tot, target_q_tot, reduction='none')
@@ -323,7 +266,6 @@ def compute_td_loss(agent_q_networks, target_q_networks, mixer, target_mixer, ba
         loss = (loss_elementwise * weights).mean()
     else:
         loss = loss_elementwise.mean()
-        
     return loss, td_errors
 
 def soft_update_target_network(source_nets, target_nets, tau=0.01):
@@ -340,7 +282,6 @@ def select_action(agent_q_network, state, legal_actions):
     with torch.no_grad():
         q_values = agent_q_network(state).cpu().numpy()
     q_values = q_values[0]
-    
     best_action = legal_actions[0]
     best_val = -float('inf')
     for action in legal_actions:
@@ -350,11 +291,10 @@ def select_action(agent_q_network, state, legal_actions):
     return best_action
 
 # --- TRAINING LOOP ---
-
 def train_rainbow_qmix_shared(env, agent_net, target_net, mixer, target_mixer, 
                replay_buffer, n_episodes=500, 
                batch_size=512, 
-               gamma=0.98, # Slightly higher gamma for long term food seeking
+               gamma=0.98,
                lr=0.0001,
                shaping_weight=0.1, 
                exploration_beta=0.2, 
@@ -378,8 +318,8 @@ def train_rainbow_qmix_shared(env, agent_net, target_net, mixer, target_mixer,
     beta_by_episode = lambda ep: min(1.0, beta_start + ep * (1.0 - beta_start) / beta_frames)
 
     n_step_buffer = NStepBuffer(n_step=n_step, gamma=gamma)
-
-    # For shared network support in functions expecting lists
+    
+    # Create lists just for the function call
     agent_q_networks = [agent_net, agent_net]
     target_q_networks = [target_net, target_net]
 
@@ -388,7 +328,7 @@ def train_rainbow_qmix_shared(env, agent_net, target_net, mixer, target_mixer,
         env.reset()
         n_step_buffer.reset()
         
-        # Reset count every 50 episodes to force re-exploration
+        # Reset count every 50 episodes
         if episode % 50 == 0:
             visit_counts.clear()
         
@@ -426,7 +366,6 @@ def train_rainbow_qmix_shared(env, agent_net, target_net, mixer, target_mixer,
             score -= info["score_change"]
             done = {key: value for key, value in terminations.items() if key in agent_indexes}
             
-            # NOTE: We track raw reward here for logging
             episode_reward += rewards[1] + rewards[3]
 
             augmented_rewards = {}
@@ -436,7 +375,6 @@ def train_rainbow_qmix_shared(env, agent_net, target_net, mixer, target_mixer,
                 
                 if shaping_weight > 0:
                     curr_dist = get_min_food_dist(obs_curr, agent_index)
-                    # Reward for getting closer, penalty for getting further
                     dist_delta = prev_dists[agent_index] - curr_dist
                     total_extra += (dist_delta * shaping_weight)
                 
@@ -507,7 +445,7 @@ def train_rainbow_qmix_shared(env, agent_net, target_net, mixer, target_mixer,
     
     return episode_rewards, episode_scores
 
-def plot_training_curves(rewards, scores, filename="rainbow_upgraded.png", window=20):
+def plot_training_curves(rewards, scores, filename="rainbow_final.png", window=20):
     import matplotlib
     matplotlib.use('Agg')
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
@@ -517,7 +455,7 @@ def plot_training_curves(rewards, scores, filename="rainbow_upgraded.png", windo
     axes[0].plot(rewards, alpha=0.3, color='blue')
     if len(rewards) >= window:
         axes[0].plot(range(window-1, len(rewards)), moving_avg(rewards, window), color='blue', linewidth=2, label=f'{window}-ep avg')
-    axes[0].set_title('Training Rewards (Upgraded Rainbow)')
+    axes[0].set_title('Training Rewards (Shared Net)')
     axes[0].legend()
     axes[1].plot(scores, alpha=0.3, color='green')
     if len(scores) >= window:
@@ -528,18 +466,32 @@ def plot_training_curves(rewards, scores, filename="rainbow_upgraded.png", windo
     plt.savefig(filename)
     plt.close(fig)
 
-def save_models(agent_nets, mixer, filename="rainbow_upgraded.pt"):
-    checkpoint = {'agent_nets': [net.state_dict() for net in agent_nets], 'mixer': mixer.state_dict()}
+def save_models(agent_net, mixer, filename="rainbow_final.pt"):
+    checkpoint = {'agent_net': agent_net.state_dict(), 'mixer': mixer.state_dict()}
     torch.save(checkpoint, filename)
     print(f"Model saved to {filename}")
 
 # --- MAIN EXECUTION ---
+layout_name = 'tinyCapture.lay'
+layout_path = os.path.join('layouts', layout_name)
+
+# Ensure reward_forLegalAction=False to prevent "lazy" local optimum
+env = gymPacMan_parallel_env(layout_file=layout_path,
+                             display=False,
+                             reward_forLegalAction=False, 
+                             defenceReward=False,
+                             length=299,
+                             enemieName='randomTeam',
+                             self_play=False,
+                             random_layout=False)
+env.reset()
+
 n_agents = int(len(env.agents) / 2)
 action_dim_individual_agent = 5
 obs_individual_agent = env.get_Observation(0)
 obs_shape = obs_individual_agent.shape
 
-# 1. Instantiate SEPARATE networks (now hidden_dim=512 default)
+# 1. SHARED Network
 shared_agent = AgentQNetwork(obs_shape, action_dim_individual_agent).to(device)
 shared_target = AgentQNetwork(obs_shape, action_dim_individual_agent).to(device)
 shared_target.load_state_dict(shared_agent.state_dict())
@@ -550,17 +502,17 @@ target_mixer.load_state_dict(mixer.state_dict())
 
 replay_buffer = NaivePrioritizedBuffer(capacity=100_000, alpha=0.6)
 
-print("Starting Upgraded Rainbow Training (Separate Nets, 512-dim, Ortho-Init)...")
-rewards_exp, scores_exp = train_rainbow_qmix(
+print("Starting Final Rainbow Training (Shared Net, No Ortho, No Free Reward)...")
+rewards_exp, scores_exp = train_rainbow_qmix_shared(
     env, shared_agent, shared_target, mixer, target_mixer, replay_buffer,
     n_episodes=150,
     batch_size=512,
-    lr=0.0005,
+    lr=0.00025, 
     gamma=0.98,
-    shaping_weight=0.1,
+    shaping_weight=0.1,    
     exploration_beta=0.3, 
     n_step=3 
 )
 
-save_models(agent_q_networks, mixer, filename="rainbow_upgraded.pt")
-plot_training_curves(rewards_exp, scores_exp, filename="Rainbow_Upgraded_Run.png")
+save_models(shared_agent, mixer, filename="rainbow_final.pt")
+plot_training_curves(rewards_exp, scores_exp, filename="Rainbow_Final_Run.png")
