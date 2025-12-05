@@ -78,10 +78,15 @@ class MAPPOAgent(nn.Module):
         )
 
     def get_action(self, x):
-        h = self.actor_conv(x)
-        logits = self.actor(h)
+        hidden = self.actor_conv(x)
+        logits = self.actor(hidden)
         dist = Categorical(logits=logits)
-        return dist.sample(), dist.log_prob(dist.sample())
+        
+        # FIX: Sample ONCE
+        action = dist.sample()
+        
+        # Return action and the log_prob of THAT action
+        return action, dist.log_prob(action)
 
     def get_value(self, state):
         h = self.critic_conv(state)
