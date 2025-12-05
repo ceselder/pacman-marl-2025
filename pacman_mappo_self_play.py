@@ -56,7 +56,7 @@ def canonicalize_action(action, is_red_agent):
     if isinstance(action, torch.Tensor):
         mapper = torch.tensor([0, 3, 2, 1, 4], device=action.device)
         return mapper[action]
-    return {0: 0, 1: 3, 2: 2, 3: 1, 4: 4}[action]
+    return {0: 0, 1: 3, 2: 4, 3: 1, 4: 2}[action]
 
 
 def get_agent_state(obs_canon):
