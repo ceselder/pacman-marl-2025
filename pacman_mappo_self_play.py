@@ -26,7 +26,7 @@ TOTAL_UPDATES = 1000
 # Settings
 OPPONENT_POOL_SIZE = 5
 OPPONENT_UPDATE_FREQ = 20
-SHAPING_SCALE = 0.1
+SHAPING_SCALE = 0.15
 EVAL_FREQ = 20            # Eval every N updates
 EVAL_EPISODES = 10        # Episodes per eval
 
