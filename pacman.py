@@ -224,9 +224,7 @@ class NaivePrioritizedBuffer:
 # --- HELPERS ---
 def get_exploration_bonus(obs, visit_counts, agent_index, beta=0.1):
     # Added safety check: if agent is dead/eaten, it might not appear in channel 1
-    nonzero = np.nonzero(obs[1])
-    if len(nonzero[0]) == 0:
-        return 0.0
+    nonzero = np.nonzero(obs[1]).tolist()[0]
         
     pos = (int(nonzero[0][0]), int(nonzero[1][0]))
     
@@ -327,6 +325,10 @@ def train_rainbow_qmix(env, agent_net, target_net, mixer, target_mixer,
         env.reset()
         n_step_buffer.reset()
         done = {agent_id: False for agent_id in agent_indexes}
+        
+        # Reset visit counts occasionally to force re-exploration
+        if episode % 50 == 0:
+            visit_counts.clear()
 
         episode_reward = 0.0
         score = 0.0
@@ -485,7 +487,7 @@ if __name__ == "__main__":
     env = gymPacMan_parallel_env(
         layout_file=layout_path,
         display=False,
-        reward_forLegalAction=True,
+        reward_forLegalAction=True,  # Set False for harder difficulty
         defenceReward=False,
         length=299,
         enemieName='randomTeam',
