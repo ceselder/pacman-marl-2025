@@ -439,7 +439,7 @@ def train():
             next_obs_dict, rewards, dones, _ = env.step(env_actions)
             
             # DEBUG: Check reward signs for first few steps of first 2 updates
-            if rewards[env.agents[0]] > 0.01 or rewards[env.agents[1]] > 0.01:
+            if (rewards[env.agents[0]] > 0.01 or rewards[env.agents[1]] > 0.01) and step > 900 and step < 905:
                 r0 = rewards[env.agents[0]]  # Red agent 0
                 r1 = rewards[env.agents[1]]  # Blue agent 1
                 print(f"Update {update} Step {step} | play_as_red={play_as_red} | r_red0={r0:.2f} r_blue1={r1:.2f} | team_sum={sum(rewards[env.agents[i]] for i in learner_ids):.2f}")
