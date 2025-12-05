@@ -457,12 +457,12 @@ replay_buffer = PrioritizedReplayBuffer(buffer_size=100_000, alpha=0.6)
 
 rewards_exp, scores_exp = train_qmix(
     env, agent_q_networks, target_q_networks, mixer, target_mixer, replay_buffer,
-    n_episodes=1200,
-    batch_size=1024,
+    n_episodes=500,
+    batch_size=512,
     lr=0.0005,
     gamma=0.995,
     updates_per_step=1,
-    exploration_beta=0.08,
+    exploration_beta=0.1,
     shaping_weight=0.01,
 )
 
