@@ -11,18 +11,20 @@ from gymPacMan import gymPacMan_parallel_env
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
 
-# Hyperparameters
+
 NUM_STEPS = 2048       # Steps to collect per agent before updating
 BATCH_SIZE = 64        # Minibatch size for PPO update
 LR = 2.5e-4
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.2
-ENT_COEF = 0.01        # Exploration via entropy
+ENT_COEF = 0.01 #entropy penalty
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 10     # How many times to re-use data
-TOTAL_UPDATES = 1000   # Total training loops
+TOTAL_UPDATES = 100   # Total training loops
+
+HIDDEN_DIM_SIZE = 256
 
 class ActorCritic(nn.Module):
     def __init__(self, obs_shape, action_dim):
@@ -45,16 +47,16 @@ class ActorCritic(nn.Module):
         
         # Actor Head (Policy)
         self.actor = nn.Sequential(
-            nn.Linear(self.flat_size, 512),
+            nn.Linear(self.flat_size, HIDDEN_DIM_SIZE),
             nn.ReLU(),
-            nn.Linear(512, action_dim)
+            nn.Linear(HIDDEN_DIM_SIZE, action_dim)
         )
         
         # Critic Head (Value)
         self.critic = nn.Sequential(
-            nn.Linear(self.flat_size, 512),
+            nn.Linear(self.flat_size, HIDDEN_DIM_SIZE),
             nn.ReLU(),
-            nn.Linear(512, 1)
+            nn.Linear(HIDDEN_DIM_SIZE, 1)
         )
 
     def forward(self, x):
@@ -94,18 +96,14 @@ def compute_gae(rewards, values, dones, next_value):
     returns = advantages + values
     return advantages, returns
 
-# --- TRAINING LOOP ---
 def train_ppo(env):
     agent_ids = [1, 3] # The indices of your team
     obs_shape = env.get_Observation(agent_ids[0]).shape
     action_dim = 5
     
-    # Single network shared by both agents
     agent = ActorCritic(obs_shape, action_dim).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=LR, eps=1e-5)
 
-    # Storage setup
-    # Dimensions: [Time, Num_Agents]
     num_agents = len(agent_ids)
     
     global_step = 0
@@ -240,7 +238,6 @@ def train_ppo(env):
 
         print(f"Update {update}/{TOTAL_UPDATES} | Loss: {loss.item():.3f} | Mean Reward: {rewards_buf.sum().item() / num_agents:.2f}")
 
-    # Save
     torch.save(agent.state_dict(), "ppo_pacman.pt")
 
 if __name__ == "__main__":
