@@ -11,7 +11,7 @@ import matplotlib as plt
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-NUM_STEPS = 2048       # Steps to collect per agent before updating
+NUM_STEPS = 1024       # Steps to collect per agent before updating
 BATCH_SIZE = 128        # Minibatch size for PPO update
 LR = 2.5e-4
 GAMMA = 0.98
