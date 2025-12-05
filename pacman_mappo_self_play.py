@@ -13,11 +13,11 @@ print(f"Using device: {device}")
 # --- Hyperparameters (more conservative) ---
 NUM_STEPS = 2048
 BATCH_SIZE = 256          # Smaller batches = more updates = smoother
-LR = 2e-4                 # Reduced from 5e-4
+LR = 3e-4                 # Reduced from 5e-4
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.15           # Reduced from 0.2 for stability
-ENT_COEF = 0.01           # Slightly lower entropy
+ENT_COEF = 0.03           # Slightly lower entropy
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
@@ -26,7 +26,7 @@ TOTAL_UPDATES = 1000
 # Settings
 OPPONENT_POOL_SIZE = 5
 OPPONENT_UPDATE_FREQ = 20
-SHAPING_SCALE = 0.15
+SHAPING_SCALE = 0.1
 EVAL_FREQ = 20            # Eval every N updates
 EVAL_EPISODES = 10        # Episodes per eval
 
@@ -437,6 +437,12 @@ def train():
                 env_actions[env.agents[aid]] = canonicalize_action(opp_actions[i], not play_as_red).item()
             
             next_obs_dict, rewards, dones, _ = env.step(env_actions)
+            
+            # DEBUG: Check reward signs for first few steps of first 2 updates
+            if update <= 2 and step < 5:
+                r0 = rewards[env.agents[0]]  # Red agent 0
+                r1 = rewards[env.agents[1]]  # Blue agent 1
+                print(f"Update {update} Step {step} | play_as_red={play_as_red} | r_red0={r0:.2f} r_blue1={r1:.2f} | team_sum={sum(rewards[env.agents[i]] for i in learner_ids):.2f}")
             
             # Shaping
             next_obs_raw = [next_obs_dict[env.agents[i]].float() for i in learner_ids]
