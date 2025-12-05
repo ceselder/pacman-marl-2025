@@ -158,7 +158,8 @@ class gymPacMan_parallel_env:
                 red_reward = self.get_reward(agentIndex, action, red_reward)
                 self.game.state = self.game.state.generateSuccessor(agentIndex,action)
                 score_change += self.game.state.data.scoreChange
-                red_score_change = self.game.state.data.scoreChange
+                #red_score_change = self.game.state.data.scoreChange
+                red_score_change += self.game.state.data.scoreChange
 
 
 
