@@ -74,7 +74,6 @@ class AgentQNetwork(nn.Module):
         conv_output_shape = obs_shape[1] * obs_shape[2] * 64 
         self.flatten = nn.Flatten()
         
-        # Dueling Heads
         self.fc_val = nn.Sequential(
             NoisyLinear(conv_output_shape, hidden_dim), 
             nn.ReLU(), 
@@ -145,7 +144,7 @@ class SimpleQMixer(nn.Module):
         return q_tot.view(bs, -1, 1)
 
 
-# --- N-STEP BUFFER (Simplified) ---
+# --- N-STEP BUFFER ---
 class NStepBuffer:
     def __init__(self, n_step, gamma):
         self.n_step = n_step
@@ -153,15 +152,6 @@ class NStepBuffer:
         self.buffer = deque(maxlen=n_step)
     
     def add(self, state, action, reward, next_state, done):
-        """
-        Args:
-            state: [n_agents, C, H, W] tensor
-            action: [n_agents] list of ints
-            reward: scalar team reward
-            next_state: [n_agents, C, H, W] tensor
-            done: bool
-        Returns transition or None if buffer not full
-        """
         self.buffer.append((state, action, reward, next_state, done))
         if len(self.buffer) < self.n_step:
             return None
@@ -170,11 +160,10 @@ class NStepBuffer:
         n_state = self.buffer[-1][3]
         n_done = self.buffer[-1][4]
         
-        # Compute n-step return
         R = 0.0
         for i in range(self.n_step):
             R += (self.gamma ** i) * self.buffer[i][2]
-            if self.buffer[i][4]:  # Episode ended early
+            if self.buffer[i][4]:
                 n_state = self.buffer[i][3]
                 n_done = True
                 break
@@ -225,6 +214,7 @@ class NaivePrioritizedBuffer:
     
     def update_priorities(self, indices, errors):
         for idx, err in zip(indices, errors):
+            # Casting to float avoids DeprecationWarning
             self.priorities[idx] = float(err) + self.epsilon
     
     def size(self):
@@ -233,8 +223,11 @@ class NaivePrioritizedBuffer:
 
 # --- HELPERS ---
 def get_exploration_bonus(obs, visit_counts, agent_index, beta=0.1):
-    """Count-based exploration bonus. Assumes agent position exists in channel 1."""
+    # Added safety check: if agent is dead/eaten, it might not appear in channel 1
     nonzero = np.nonzero(obs[1])
+    if len(nonzero[0]) == 0:
+        return 0.0
+        
     pos = (int(nonzero[0][0]), int(nonzero[1][0]))
     
     team_id = agent_index % 2
@@ -245,9 +238,6 @@ def get_exploration_bonus(obs, visit_counts, agent_index, beta=0.1):
 
 def compute_td_loss(agent_net, target_net, mixer, target_mixer, batch, 
                     weights=None, gamma=0.99, n_step=1):
-    """
-    Batched forward pass to avoid gradient doubling.
-    """
     states, actions, rewards, next_states, dones = batch
     
     batch_size = states.shape[0]
@@ -262,22 +252,19 @@ def compute_td_loss(agent_net, target_net, mixer, target_mixer, batch,
     if weights is not None:
         weights = torch.tensor(weights, dtype=torch.float32, device=device)
     
-    # Batched forward pass: [batch * n_agents, C, H, W]
+    # Flatten states to process all agents in one forward pass
     states_flat = states.view(-1, *states.shape[2:])
-    q_vals_all = agent_net(states_flat)  # [batch * n_agents, n_actions]
-    q_vals_all = q_vals_all.view(batch_size, n_agents, -1)  # [batch, n_agents, n_actions]
+    q_vals_all = agent_net(states_flat)
+    q_vals_all = q_vals_all.view(batch_size, n_agents, -1)
     
-    # Gather Q-values for taken actions
-    actions_expanded = actions.unsqueeze(-1)  # [batch, n_agents, 1]
-    agent_q_values = q_vals_all.gather(2, actions_expanded).squeeze(-1)  # [batch, n_agents]
+    actions_expanded = actions.unsqueeze(-1)
+    agent_q_values = q_vals_all.gather(2, actions_expanded).squeeze(-1)
     
-    q_tot = mixer(agent_q_values, states).squeeze(-1)  # [batch, 1]
+    q_tot = mixer(agent_q_values, states).squeeze(-1)
     
     with torch.no_grad():
-        # Batched forward for next states
         next_states_flat = next_states.view(-1, *next_states.shape[2:])
         
-        # Double DQN: use online net to select actions, target net to evaluate
         next_q_online = agent_net(next_states_flat).view(batch_size, n_agents, -1)
         max_actions = next_q_online.argmax(dim=2, keepdim=True)
         
@@ -340,15 +327,13 @@ def train_rainbow_qmix(env, agent_net, target_net, mixer, target_mixer,
         env.reset()
         n_step_buffer.reset()
         done = {agent_id: False for agent_id in agent_indexes}
-        
+
         episode_reward = 0.0
         score = 0.0
         has_trained = False
         
-        # Reset noise for both networks at episode start
+        # Reset noise at start of episode for consistent exploration strategy (inference)
         agent_net.reset_noise()
-        target_net.reset_noise()
-        
         per_beta = beta_by_episode(episode)
 
         while not all(done.values()):
@@ -367,7 +352,6 @@ def train_rainbow_qmix(env, agent_net, target_net, mixer, target_mixer,
                 action = select_action(agent_net, state, current_legal)
                 actions_taken.append(action)
 
-            # Build full action list for env
             env_actions = [-1] * len(env.agents)
             for i, agent_index in enumerate(agent_indexes):
                 env_actions[agent_index] = actions_taken[i]
@@ -378,11 +362,9 @@ def train_rainbow_qmix(env, agent_net, target_net, mixer, target_mixer,
             
             episode_reward += rewards[1] + rewards[3]
 
-            # Compute augmented team reward
             team_reward = 0.0
             for i, agent_index in enumerate(agent_indexes):
                 agent_reward = rewards[agent_index]
-                
                 if exploration_beta > 0:
                     agent_reward += get_exploration_bonus(
                         current_observations[agent_index], 
@@ -390,11 +372,9 @@ def train_rainbow_qmix(env, agent_net, target_net, mixer, target_mixer,
                         agent_index, 
                         beta=exploration_beta
                     )
-                
                 team_reward += agent_reward
             team_reward /= len(agent_indexes)
 
-            # Convert next states
             next_states_list = [
                 torch.as_tensor(list(next_states_dict.values())[idx], dtype=torch.float32, device=device)
                 for idx in agent_indexes
@@ -417,6 +397,13 @@ def train_rainbow_qmix(env, agent_net, target_net, mixer, target_mixer,
             
             if replay_buffer.size() >= batch_size:
                 has_trained = True
+                
+                # IMPORTANT: Reset noise before training step
+                # This ensures the network trains on a variety of noise conditions
+                # rather than overfitting to the specific noise used for the current episode
+                agent_net.reset_noise()
+                target_net.reset_noise()
+
                 batch, idxs, is_weights = replay_buffer.sample(batch_size, beta=per_beta)
                 
                 loss, td_errors = compute_td_loss(
@@ -498,7 +485,7 @@ if __name__ == "__main__":
     env = gymPacMan_parallel_env(
         layout_file=layout_path,
         display=False,
-        reward_forLegalAction=True, 
+        reward_forLegalAction=True,
         defenceReward=False,
         length=299,
         enemieName='randomTeam',
@@ -511,7 +498,6 @@ if __name__ == "__main__":
     action_dim = 5
     obs_shape = env.get_Observation(0).shape
 
-    # Shared networks
     agent_net = AgentQNetwork(obs_shape, action_dim).to(device)
     target_net = AgentQNetwork(obs_shape, action_dim).to(device)
     target_net.load_state_dict(agent_net.state_dict())
@@ -527,11 +513,11 @@ if __name__ == "__main__":
     
     rewards, scores = train_rainbow_qmix(
         env, agent_net, target_net, mixer, target_mixer, replay_buffer,
-        n_episodes=150,
+        n_episodes=200,
         batch_size=512,
-        lr=0.001, 
+        lr=0.0003, 
         gamma=0.98,  
-        exploration_beta=0.5,
+        exploration_beta=0.3,
         n_step=3,
         tau=0.005
     )
