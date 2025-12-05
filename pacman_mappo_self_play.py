@@ -13,15 +13,15 @@ print(f"Using device: {device}")
 # --- Hyperparameters (more conservative) ---
 NUM_STEPS = 2048
 BATCH_SIZE = 256          # Smaller batches = more updates = smoother
-LR = 2e-4                 # Reduced
+LR = 1.5e-4                 # Reduced
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
-CLIP_EPS = 0.15           # Reduced from 0.2 for stability
+CLIP_EPS = 0.17           # Reduced from 0.2 for stability
 ENT_COEF = 0.15           # Higher entropy for exploration
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
-TOTAL_UPDATES = 1000
+TOTAL_UPDATES = 1500
 
 # Settings
 OPPONENT_POOL_SIZE = 5
@@ -95,24 +95,10 @@ def compute_heuristic_shaping(obs_curr, obs_next):
 
 
 def merge_obs_for_critic(obs_list):
-    """
-    Merge multiple agent observations into a single 8-channel observation for critic.
-    
-    Input obs channels:
-    0: walls, 1: self_loc, 2: blue_caps, 3: red_caps, 4: ally_loc, 5: enemies, 6: blue_food, 7: red_food
-    
-    For critic, we merge channel 1 (self) and channel 4 (ally) from all agents into one "team_locations" channel.
-    Result: 8 channels with all team positions in one channel.
-    
-    obs_list: list of (C, H, W) tensors, one per agent
-    Returns: (C, H, W) tensor with merged team locations
-    """
     # Start with first agent's observation as base
     merged = obs_list[0].clone()
     
     # Merge all agent locations into channel 1 (team positions)
-    # Channel 1 already has agent 0's position
-    # Channel 4 has agent 0's view of allies
     # We want: channel 1 = all friendly positions, channel 4 = 0 (or keep enemies)
     
     # Actually simpler: just add all self_loc channels together
@@ -267,7 +253,7 @@ def train():
     env = gymPacMan_parallel_env(
         layout_file='layouts/bloxCapture.lay',
         display=False,
-        reward_forLegalAction=False,
+        reward_forLegalAction=True,
         defenceReward=True,
         length=300,
         enemieName='randomTeam',
@@ -278,7 +264,7 @@ def train():
     eval_env = gymPacMan_parallel_env(
         layout_file='layouts/bloxCapture.lay',
         display=False,
-        reward_forLegalAction=False,
+        reward_forLegalAction=True,
         defenceReward=True,
         length=300,
         enemieName='randomTeam',
@@ -307,44 +293,6 @@ def train():
         'v_loss': []
     }
     
-    def verify_canonicalization(raw, canon, play_as_red, step, update):
-        """Check canonicalization is correct, raise error if not."""
-        if not play_as_red:
-            if not torch.equal(raw, canon):
-                raise ValueError(f"Update {update} Step {step}: Blue should have raw==canon but doesn't!")
-            return
-        
-        W = raw.shape[-1]
-        
-        # Check agent position flip
-        raw_loc = (raw[1] > 0).nonzero(as_tuple=False)
-        canon_loc = (canon[1] > 0).nonzero(as_tuple=False)
-        if len(raw_loc) > 0 and len(canon_loc) > 0:
-            rx = raw_loc[0][1].item()
-            cx = canon_loc[0][1].item()
-            expected = W - 1 - rx
-            if cx != expected:
-                raise ValueError(f"Update {update} Step {step}: Agent flip wrong! raw_x={rx}, canon_x={cx}, expected={expected}")
-        
-        # Check food swap
-        raw_blue = int(raw[6].sum().item())
-        raw_red = int(raw[7].sum().item())
-        canon_blue = int(canon[6].sum().item())
-        canon_red = int(canon[7].sum().item())
-        
-        if canon_blue != raw_red or canon_red != raw_blue:
-            raise ValueError(f"Update {update} Step {step}: Food swap wrong! raw(b={raw_blue},r={raw_red}) canon(b={canon_blue},r={canon_red})")
-        
-        # Check a specific position is flipped correctly (first food pellet)
-        if raw_red > 0:
-            raw_red_locs = (raw[7] > 0).nonzero(as_tuple=False)
-            canon_blue_locs = (canon[6] > 0).nonzero(as_tuple=False)
-            if len(raw_red_locs) > 0:
-                ry, rx = raw_red_locs[0].tolist()
-                expected_loc = [ry, W - 1 - rx]
-                found = any(loc.tolist() == expected_loc for loc in canon_blue_locs)
-                if not found:
-                    raise ValueError(f"Update {update} Step {step}: Food position flip wrong! raw_red[0]=({ry},{rx}) expected in canon_blue at ({ry},{W-1-rx})")
     
     for update in range(1, TOTAL_UPDATES + 1):
         # Random side selection
@@ -378,11 +326,6 @@ def train():
             learner_obs_raw = [obs_dict[env.agents[i]].float() for i in learner_ids]
             learner_obs_canon = [canonicalize_obs(o, play_as_red) for o in learner_obs_raw]
             learner_obs = torch.stack(learner_obs_canon)
-            
-            # Verify canonicalization for first 5 updates
-            if update <= 5:
-                for i in range(num_agents):
-                    verify_canonicalization(learner_obs_raw[i], learner_obs_canon[i], play_as_red, step, update)
             
             # Merged obs for critic (8 channels with all team positions)
             merged_obs = merge_obs_for_critic(learner_obs_canon)
@@ -431,17 +374,17 @@ def train():
             next_obs_dict, rewards, dones, _ = env.step(env_actions)
             
             # DEBUG: Print when any reward is non-zero
-            if (rewards[env.agents[0]] > 0.01 or rewards[env.agents[1]] > 0.01) and step > 900 and step < 905:
-                r0 = rewards[env.agents[0]]
-                r1 = rewards[env.agents[1]]
-                r2 = rewards[env.agents[2]]
-                r3 = rewards[env.agents[3]]
-                learner_sum = sum(rewards[env.agents[i]] for i in learner_ids)
-                # Also show what actions were taken
-                act_names = ['N', 'E', 'S', 'W', 'X']
-                raw_acts = [act_names[a.item()] for a in actions]
-                env_acts = [act_names[env_actions[env.agents[i]]] for i in learner_ids]
-                print(f"Upd{update} Step{step} | as_{'RED' if play_as_red else 'BLU'} | ids={learner_ids} | r0={r0:+.2f} r1={r1:+.2f} r2={r2:+.2f} r3={r3:+.2f} | sum={learner_sum:+.2f} | raw_act={raw_acts} env_act={env_acts}")
+            # if (rewards[env.agents[0]] > 0.01 or rewards[env.agents[1]] > 0.01) and step > 900 and step < 905:
+            #     r0 = rewards[env.agents[0]]
+            #     r1 = rewards[env.agents[1]]
+            #     r2 = rewards[env.agents[2]]
+            #     r3 = rewards[env.agents[3]]
+            #     learner_sum = sum(rewards[env.agents[i]] for i in learner_ids)
+            #     # Also show what actions were taken
+            #     act_names = ['N', 'E', 'S', 'W', 'X']
+            #     raw_acts = [act_names[a.item()] for a in actions]
+            #     env_acts = [act_names[env_actions[env.agents[i]]] for i in learner_ids]
+            #     print(f"Upd{update} Step{step} | as_{'RED' if play_as_red else 'BLU'} | ids={learner_ids} | r0={r0:+.2f} r1={r1:+.2f} r2={r2:+.2f} r3={r3:+.2f} | sum={learner_sum:+.2f} | raw_act={raw_acts} env_act={env_acts}")
             
             # Shaping
             next_obs_raw = [next_obs_dict[env.agents[i]].float() for i in learner_ids]
