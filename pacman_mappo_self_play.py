@@ -131,21 +131,26 @@ class MAPPOAgent(nn.Module):
         super().__init__()
         self.obs_shape = obs_shape
         
+        # Deeper conv backbone
         self.conv = nn.Sequential(
             nn.Conv2d(obs_shape[0], 32, 3, padding=1), nn.ReLU(),
             nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
             nn.Flatten()
         )
         with torch.no_grad():
             flat_dim = self.conv(torch.zeros(1, *obs_shape)).shape[1]
         
+        # Deeper actor
         self.actor = nn.Sequential(
             nn.Linear(flat_dim, 512), nn.ReLU(),
+            nn.Linear(512, 512), nn.ReLU(),
             nn.Linear(512, action_dim)
         )
-        # Critic now takes same 8 channels (merged obs), not 16
+        # Deeper critic (same 8 channels merged obs)
         self.critic = nn.Sequential(
             nn.Linear(flat_dim, 512), nn.ReLU(),
+            nn.Linear(512, 512), nn.ReLU(),
             nn.Linear(512, 1)
         )
 
@@ -302,6 +307,45 @@ def train():
         'v_loss': []
     }
     
+    def verify_canonicalization(raw, canon, play_as_red, step, update):
+        """Check canonicalization is correct, raise error if not."""
+        if not play_as_red:
+            if not torch.equal(raw, canon):
+                raise ValueError(f"Update {update} Step {step}: Blue should have raw==canon but doesn't!")
+            return
+        
+        W = raw.shape[-1]
+        
+        # Check agent position flip
+        raw_loc = (raw[1] > 0).nonzero(as_tuple=False)
+        canon_loc = (canon[1] > 0).nonzero(as_tuple=False)
+        if len(raw_loc) > 0 and len(canon_loc) > 0:
+            rx = raw_loc[0][1].item()
+            cx = canon_loc[0][1].item()
+            expected = W - 1 - rx
+            if cx != expected:
+                raise ValueError(f"Update {update} Step {step}: Agent flip wrong! raw_x={rx}, canon_x={cx}, expected={expected}")
+        
+        # Check food swap
+        raw_blue = int(raw[6].sum().item())
+        raw_red = int(raw[7].sum().item())
+        canon_blue = int(canon[6].sum().item())
+        canon_red = int(canon[7].sum().item())
+        
+        if canon_blue != raw_red or canon_red != raw_blue:
+            raise ValueError(f"Update {update} Step {step}: Food swap wrong! raw(b={raw_blue},r={raw_red}) canon(b={canon_blue},r={canon_red})")
+        
+        # Check a specific position is flipped correctly (first food pellet)
+        if raw_red > 0:
+            raw_red_locs = (raw[7] > 0).nonzero(as_tuple=False)
+            canon_blue_locs = (canon[6] > 0).nonzero(as_tuple=False)
+            if len(raw_red_locs) > 0:
+                ry, rx = raw_red_locs[0].tolist()
+                expected_loc = [ry, W - 1 - rx]
+                found = any(loc.tolist() == expected_loc for loc in canon_blue_locs)
+                if not found:
+                    raise ValueError(f"Update {update} Step {step}: Food position flip wrong! raw_red[0]=({ry},{rx}) expected in canon_blue at ({ry},{W-1-rx})")
+    
     for update in range(1, TOTAL_UPDATES + 1):
         # Random side selection
         play_as_red = np.random.rand() > 0.5
@@ -311,39 +355,6 @@ def train():
         else:
             learner_ids = [1, 3]
             opponent_ids = [0, 2]
-        
-        # Debug print observation transformation (first 2 updates only, first step)
-        if update <= 2:
-            obs_dict_dbg, _ = env.reset()
-            raw = obs_dict_dbg[env.agents[learner_ids[0]]].float()
-            canon = canonicalize_obs(raw, play_as_red)
-            W = raw.shape[-1]
-            
-            print(f"\n=== UPDATE {update} | {'RED' if play_as_red else 'BLUE'} | Agent {learner_ids[0]} ===")
-            print(f"Map width: {W}")
-            
-            # Agent position (channel 1)
-            raw_loc = (raw[1] > 0).nonzero(as_tuple=False)
-            canon_loc = (canon[1] > 0).nonzero(as_tuple=False)
-            if len(raw_loc) > 0 and len(canon_loc) > 0:
-                ry, rx = raw_loc[0].tolist()
-                cy, cx = canon_loc[0].tolist()
-                expected_cx = W - 1 - rx if play_as_red else rx
-                print(f"Agent: raw=({ry},{rx}) canon=({cy},{cx}) expected_x={expected_cx} {'OK' if cx == expected_cx else 'WRONG!'}")
-            
-            # Food (channels 6, 7)
-            raw_blue_food = int(raw[6].sum().item())
-            raw_red_food = int(raw[7].sum().item())
-            canon_blue_food = int(canon[6].sum().item())
-            canon_red_food = int(canon[7].sum().item())
-            
-            if play_as_red:
-                # After canon: blue_food should have raw_red count, red_food should have raw_blue count
-                swap_ok = (canon_blue_food == raw_red_food and canon_red_food == raw_blue_food)
-                print(f"Food: raw(b={raw_blue_food},r={raw_red_food}) canon(b={canon_blue_food},r={canon_red_food}) swap={'OK' if swap_ok else 'WRONG!'}")
-            else:
-                print(f"Food: raw(b={raw_blue_food},r={raw_red_food}) canon(b={canon_blue_food},r={canon_red_food}) (no transform)")
-            print("=" * 50)
         # Random side selection
         play_as_red = np.random.rand() > 0.5
         if play_as_red:
@@ -375,6 +386,11 @@ def train():
             learner_obs_raw = [obs_dict[env.agents[i]].float() for i in learner_ids]
             learner_obs_canon = [canonicalize_obs(o, play_as_red) for o in learner_obs_raw]
             learner_obs = torch.stack(learner_obs_canon)
+            
+            # Verify canonicalization for first 5 updates
+            if update <= 5:
+                for i in range(num_agents):
+                    verify_canonicalization(learner_obs_raw[i], learner_obs_canon[i], play_as_red, step, update)
             
             # Merged obs for critic (8 channels with all team positions)
             merged_obs = merge_obs_for_critic(learner_obs_canon)
