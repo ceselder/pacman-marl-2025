@@ -348,7 +348,7 @@ def select_action(agent_q_network, state, legal_actions):
 def train_rainbow_qmix(env, agent_q_networks, target_q_networks, mixer, target_mixer, 
                replay_buffer, n_episodes=500, 
                batch_size=512, 
-               gamma=0.99, 
+               gamma=0.975, 
                lr=0.0001,
                updates_per_step=1,
                shaping_weight=0.02,
@@ -491,7 +491,7 @@ def train_rainbow_qmix(env, agent_q_networks, target_q_networks, mixer, target_m
         episode_rewards.append(episode_reward)
         episode_scores.append(score)
         
-        if (episode + 1) % 10 == 0:
+        if (episode + 1) % 5 == 0:
             avg_reward = np.mean(episode_rewards[-10:])
             print(f"Ep {episode + 1}/{n_episodes} | Rew: {avg_reward:.2f} | LR: {scheduler.get_last_lr()[0]:.5f}")
     
