@@ -24,6 +24,7 @@ UPDATE_EPOCHS = 5       # PPO Update epochs
 TOTAL_UPDATES = 500     # Total training iterations
 
 HIDDEN_DIM = 512
+HIDDEN_DIM_CRITIC = 1024
 
 OPPONENT_UPDATE_FREQ = 10  # Add current agent to pool every N updates
 OPPONENT_POOL_SIZE = 5     # Max opponents to keep
@@ -68,9 +69,9 @@ class MAPPOAgent(nn.Module):
             critic_flat = self.critic_conv(dummy_state).shape[1]
 
         self.critic = nn.Sequential(
-            nn.Linear(critic_flat, HIDDEN_DIM),  nn.ReLU(),
-            nn.Linear(HIDDEN_DIM, HIDDEN_DIM),   nn.ReLU(),
-            nn.Linear(HIDDEN_DIM, 1)
+            nn.Linear(critic_flat, HIDDEN_DIM_CRITIC),  nn.ReLU(),
+            nn.Linear(HIDDEN_DIM_CRITIC, HIDDEN_DIM_CRITIC),   nn.ReLU(),
+            nn.Linear(HIDDEN_DIM_CRITIC, 1)
         )
         
     def get_action(self, x):
