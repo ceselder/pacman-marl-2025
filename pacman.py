@@ -555,10 +555,10 @@ rewards_exp, scores_exp = train_rainbow_qmix(
     n_episodes=100,
     batch_size=512,
     lr=0.0005,
-    gamma=0.99,
+    gamma=0.97,
     updates_per_step=1,
     shaping_weight=0.00,
-    exploration_beta=0.15, 
+    exploration_beta=0.2, 
     n_step=3 
 )
 
