@@ -293,7 +293,7 @@ def select_action(agent_q_network, state, legal_actions):
 # --- TRAINING LOOP ---
 def train_rainbow_qmix_shared(env, agent_net, target_net, mixer, target_mixer, 
                replay_buffer, n_episodes=500, 
-               batch_size=512, 
+               batch_size=64, 
                gamma=0.98,
                lr=0.0001,
                shaping_weight=0.1, 
