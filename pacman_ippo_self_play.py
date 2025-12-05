@@ -12,15 +12,15 @@ import matplotlib.pyplot as plt
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 NUM_STEPS = 2048      # Steps to collect per agent before updating
-BATCH_SIZE = 128        # Minibatch size for PPO update
-LR = 2e-4
+BATCH_SIZE = 256        # Minibatch size for PPO update
+LR = 1e-4
 GAMMA = 0.98
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.15
 ENT_COEF = 0.01 #entropy penalty
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
-UPDATE_EPOCHS = 10     # How many times to re-use data
+UPDATE_EPOCHS = 5     # How many times to re-use data
 TOTAL_UPDATES = 250   # Total training loops
 
 HIDDEN_DIM = 512 #512 seems to work ok
