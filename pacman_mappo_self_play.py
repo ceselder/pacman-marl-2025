@@ -122,8 +122,6 @@ def process_obs(obs, is_red_team): #yeah okay so they said I dont have to do thi
     
     # Create a copy to avoid in-place modification issues
     new_obs = obs.clone()
-
-    print(new_obs)
     
     # Swap Capsules: Blue(2) <-> Red(3)
     new_obs[:, 2, :, :] = obs[:, 3, :, :]
