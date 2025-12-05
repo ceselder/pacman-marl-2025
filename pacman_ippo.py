@@ -21,9 +21,7 @@ MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 10     # How many times to re-use data
 TOTAL_UPDATES = 100   # Total training loops
 
-HIDDEN_DIM_SIZE = 512
-
-
+HIDDEN_DIM_SIZE = 512 #512 seems to work ok
 
 class ActorCritic(nn.Module):
     def __init__(self, obs_shape, action_dim):
@@ -167,6 +165,6 @@ if __name__ == "__main__":
     env = gymPacMan_parallel_env(
         layout_file=os.path.join('layouts', 'tinyCapture.lay'),
         display=False, reward_forLegalAction=True, defenceReward=False,
-        length=1000, enemieName='randomTeam', self_play=False, random_layout=False
+        length=1000, enemieName='randomTeam', self_play=True, random_layout=False
     )
     train_ppo(env)
