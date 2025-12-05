@@ -510,7 +510,7 @@ if __name__ == "__main__":
     rewards, scores = train_rainbow_qmix(
         env, agent_net, target_net, mixer, target_mixer, replay_buffer,
         n_episodes=200,
-        batch_size=512,
+        batch_size=256,
         lr=0.0003, 
         gamma=0.98,  
         exploration_beta=0.3,
