@@ -384,7 +384,13 @@ def train_mappo(env, eval_env):
         mean_ep_return = np.mean(episode_returns[-10:]) if episode_returns else 0
         side = "Red" if is_red_learner else "Blue"
         
-        print(f"Upd {update}/{TOTAL_UPDATES} [{side}] | Rwd: {mean_reward:.2f} | EpRet: {mean_ep_return:.2f} | Ent: {np.mean(entropies):.3f}")
+        print(f"Update {update:3d}/{TOTAL_UPDATES} [{side:<4}] | "
+              f"Reward: {mean_reward:6.2f} | "
+              f"Mean Episodic return: {mean_ep_return:6.2f} | "
+              f"Entropy: {np.mean(entropies):.3f} | "
+              f"PLoss: {np.mean(pg_losses):6.3f} | "
+              f"VLoss: {np.mean(v_losses):6.3f} | "
+              f"Clip: {np.mean(clip_fracs):.3f}")
 
         # Store logs
         log['update'].append(update)
