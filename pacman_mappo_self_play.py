@@ -187,7 +187,7 @@ def train():
     env = gymPacMan_parallel_env(
         layout_file='layouts/tinyCapture.lay',
         display=False,
-        reward_forLegalAction=False,
+        reward_forLegalAction=True,
         defenceReward=True,
         length=300,
         enemieName='randomTeam',
