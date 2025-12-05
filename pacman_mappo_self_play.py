@@ -39,11 +39,13 @@ def canonicalize_obs(obs, is_red_agent, debug=False):
     
     if debug:
         print(f"  [canonicalize] Input shape: {obs.shape}, dim={obs.dim()}")
-        print(f"  [canonicalize] Before swap - ch6 sum: {canon[6].sum().item():.0f}, ch7 sum: {canon[7].sum().item():.0f}")
     
     # Swap capsules: blue (2) <-> red (3)
     # Swap food: blue (6) <-> red (7)
     if canon.dim() == 3:
+        if debug:
+            print(f"  [canonicalize] 3D path - Before swap: ch6 sum={canon[6].sum().item():.0f}, ch7 sum={canon[7].sum().item():.0f}")
+        
         temp = canon[2, :, :].clone()
         canon[2, :, :] = canon[3, :, :]
         canon[3, :, :] = temp
@@ -51,7 +53,13 @@ def canonicalize_obs(obs, is_red_agent, debug=False):
         temp = canon[6, :, :].clone()
         canon[6, :, :] = canon[7, :, :]
         canon[7, :, :] = temp
+        
+        if debug:
+            print(f"  [canonicalize] 3D path - After swap: ch6 sum={canon[6].sum().item():.0f}, ch7 sum={canon[7].sum().item():.0f}")
     else:  # dim == 4, shape is (1, C, H, W)
+        if debug:
+            print(f"  [canonicalize] 4D path - Before swap: ch6 sum={canon[:, 6].sum().item():.0f}, ch7 sum={canon[:, 7].sum().item():.0f}")
+        
         temp = canon[:, 2, :, :].clone()
         canon[:, 2, :, :] = canon[:, 3, :, :]
         canon[:, 3, :, :] = temp
@@ -59,9 +67,9 @@ def canonicalize_obs(obs, is_red_agent, debug=False):
         temp = canon[:, 6, :, :].clone()
         canon[:, 6, :, :] = canon[:, 7, :, :]
         canon[:, 7, :, :] = temp
-    
-    if debug:
-        print(f"  [canonicalize] After swap - ch6 sum: {canon[6].sum().item():.0f}, ch7 sum: {canon[7].sum().item():.0f}")
+        
+        if debug:
+            print(f"  [canonicalize] 4D path - After swap: ch6 sum={canon[:, 6].sum().item():.0f}, ch7 sum={canon[:, 7].sum().item():.0f}")
     
     return canon
 
