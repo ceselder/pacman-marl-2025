@@ -222,7 +222,7 @@ def train():
     env = gymPacMan_parallel_env(
         layout_file='layouts/bloxCapture.lay',
         display=False,
-        reward_forLegalAction=False,
+        reward_forLegalAction=True,
         defenceReward=True,
         length=300,
         enemieName='randomTeam',
@@ -233,7 +233,7 @@ def train():
     eval_env = gymPacMan_parallel_env(
         layout_file='layouts/bloxCapture.lay',
         display=False,
-        reward_forLegalAction=False,
+        reward_forLegalAction=True,
         defenceReward=True,
         length=300,
         enemieName='randomTeam',
@@ -246,7 +246,7 @@ def train():
     agent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
     optimizer = torch.optim.Adam(agent.parameters(), lr=LR, eps=1e-5)
 
-    state_dict = torch.load("mappo_100.pt", map_location=device)
+    state_dict = torch.load("mappo_cehckpoint.pt", map_location=device) # load from checkpoint
     agent.load_state_dict(state_dict)
 
 
