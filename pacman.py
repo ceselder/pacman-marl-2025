@@ -557,7 +557,7 @@ rewards_exp, scores_exp = train_rainbow_qmix(
     lr=0.0005,
     gamma=0.99,
     updates_per_step=1,
-    shaping_weight=0.01,
+    shaping_weight=0.00,
     exploration_beta=0.15, 
     n_step=3 
 )
