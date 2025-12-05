@@ -212,6 +212,7 @@ def get_min_food_dist(obs, agent_index):
         dists = np.sum(np.abs(np.stack([f_ys, f_xs], axis=1) - my_pos), axis=1)
         return np.min(dists)
     except: 
+        print("issue food distance")
         return 0
 
 def get_exploration_bonus(obs, visit_counts, agent_index, beta=0.1):
@@ -220,7 +221,9 @@ def get_exploration_bonus(obs, visit_counts, agent_index, beta=0.1):
         ys, xs = np.nonzero(obs[1])
         if len(ys) > 0: 
             pos = (int(ys[0]), int(xs[0]))
-    except: pass
+    except: 
+        print("issue exploration distance")
+        pass
     team_id = agent_index % 2
     key = (team_id, pos)
     visit_counts[key] = visit_counts.get(key, 0) + 1
@@ -509,7 +512,7 @@ rewards_exp, scores_exp = train_rainbow_qmix_shared(
     lr=0.0003, 
     gamma=0.98,
     shaping_weight=0.1,    
-    exploration_beta=0.3, 
+    exploration_beta=0.5, 
     n_step=3 
 )
 
