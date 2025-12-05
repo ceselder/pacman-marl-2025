@@ -120,6 +120,7 @@ def compute_gae(rewards, values, dones, last_value, last_done):
 
 def process_obs(obs, is_red_team): 
     #yeah okay so they said I dont have to do this but im pretty sure if I wanna do self play I do actually
+    return obs
     if not is_red_team:
         return obs # Blue is already default
 
