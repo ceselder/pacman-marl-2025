@@ -27,6 +27,9 @@ TOTAL_UPDATES = 1000
 OPPONENT_POOL_SIZE = 5
 OPPONENT_UPDATE_FREQ = 20
 
+# Reward shaping
+SHAPING_SCALE = 0.1  # Multiplier for potential-based shaping
+
 
 def canonicalize_obs(obs, is_red_agent):
     """
@@ -91,6 +94,77 @@ def canonicalize_action(action, is_red_agent):
     else:
         mapper = {0: 0, 1: 3, 2: 2, 3: 1, 4: 4}
         return mapper[action]
+
+
+def compute_potential(obs_canon):
+    """
+    Compute potential for potential-based reward shaping.
+    
+    After canonicalization:
+    - Channel 1: agent location (value = 1 + numCarrying)
+    - Channel 7: enemy food (what we want to eat)
+    - Home is on the LEFT side (low x/column values)
+    
+    Potential = -distance_to_target
+    - If not carrying: target is nearest food
+    - If carrying: target is home (left edge), scaled by carrying amount
+    
+    obs_canon: (C, H, W) single agent observation, already canonicalized
+    Returns: scalar potential value
+    """
+    # Find agent position
+    agent_channel = obs_canon[1]  # (H, W)
+    agent_loc = (agent_channel > 0).nonzero(as_tuple=False)
+    
+    if len(agent_loc) == 0:
+        return 0.0
+    
+    agent_pos = agent_loc[0].float()  # (row, col) = (y, x)
+    agent_y, agent_x = agent_pos[0], agent_pos[1]
+    
+    # Get carrying amount (channel value is 1 + carrying)
+    carrying = agent_channel[int(agent_y), int(agent_x)].item() - 1
+    
+    if carrying > 0:
+        # Go home - home is left side (x = 0)
+        # Potential = -distance_to_home * (1 + carrying)
+        # More carrying = stronger pull home
+        dist_to_home = agent_x  # distance to left edge
+        potential = -dist_to_home * (1 + carrying)
+    else:
+        # Go to food - channel 7 is enemy food
+        food_channel = obs_canon[7]  # (H, W)
+        food_locs = (food_channel > 0).nonzero(as_tuple=False).float()
+        
+        if len(food_locs) == 0:
+            return 0.0
+        
+        # Manhattan distance to nearest food
+        distances = (food_locs - agent_pos.unsqueeze(0)).abs().sum(dim=1)
+        min_dist = distances.min().item()
+        potential = -min_dist
+    
+    return potential
+
+
+def compute_shaping_reward(obs_canon_curr, obs_canon_next, gamma=GAMMA):
+    """
+    Potential-based shaping: r_shaping = gamma * potential(s') - potential(s)
+    
+    This is guaranteed not to change the optimal policy.
+    
+    obs_canon_curr: list of (C, H, W) for each agent at time t
+    obs_canon_next: list of (C, H, W) for each agent at time t+1
+    
+    Returns: list of shaping rewards for each agent
+    """
+    shaping_rewards = []
+    for curr, next_ in zip(obs_canon_curr, obs_canon_next):
+        pot_curr = compute_potential(curr)
+        pot_next = compute_potential(next_)
+        shaping = gamma * pot_next - pot_curr
+        shaping_rewards.append(shaping)
+    return shaping_rewards
 
 
 class MAPPOAgent(nn.Module):
@@ -311,14 +385,26 @@ def train():
             # Step
             next_obs_dict, rewards, dones, info = env.step(env_actions)
             
-            # Team reward
+            done = any(dones.values())
+            
+            # Get next observations (canonicalized) for shaping
+            next_obs_raw = [next_obs_dict[env.agents[i]].float() for i in learner_ids]
+            next_obs_canon = [canonicalize_obs(o.unsqueeze(0), play_as_red).squeeze(0) for o in next_obs_raw]
+            
+            # Compute potential-based shaping reward
+            # If episode ends, next potential is 0 (don't use reset state's potential)
+            if done:
+                shaping_rewards = [-compute_potential(curr) for curr in learner_obs_canon]
+            else:
+                shaping_rewards = compute_shaping_reward(learner_obs_canon, next_obs_canon)
+            
+            # Team reward + shaping
             team_reward = sum(rewards[env.agents[i]] for i in learner_ids)
             episode_return += team_reward
             
             for i in range(num_agents):
-                reward_buf[step, i] = team_reward
+                reward_buf[step, i] = team_reward + SHAPING_SCALE * shaping_rewards[i]
             
-            done = any(dones.values())
             done_buf[step] = float(done)
             
             if done:
