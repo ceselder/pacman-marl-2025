@@ -351,7 +351,7 @@ def train_rainbow_qmix(env, agent_q_networks, target_q_networks, mixer, target_m
                gamma=0.99, 
                lr=0.0001,
                updates_per_step=1,
-               shaping_weight=0.05,
+               shaping_weight=0.02,
                exploration_beta=0.1, 
                n_step=3):
     
