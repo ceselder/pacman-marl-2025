@@ -18,7 +18,6 @@ elif torch.backends.mps.is_available():
 print(f"Device: {device}")
 
 
-# --- RAINBOW NOISY LAYER ---
 class NoisyLinear(nn.Module):
     def __init__(self, in_features, out_features, std_init=0.5):
         super(NoisyLinear, self).__init__()
@@ -63,7 +62,6 @@ class NoisyLinear(nn.Module):
             return F.linear(input, self.weight_mu, self.bias_mu)
 
 
-# --- AGENT NETWORK ---
 class AgentQNetwork(nn.Module):
     def __init__(self, obs_shape, action_dim, hidden_dim=512):
         super(AgentQNetwork, self).__init__()
@@ -223,10 +221,9 @@ class NaivePrioritizedBuffer:
 
 # --- HELPERS ---
 def get_exploration_bonus(obs, visit_counts, agent_index, beta=0.1):
-    # Added safety check: if agent is dead/eaten, it might not appear in channel 1
     nonzero = np.nonzero(obs[1]).tolist()[0]
         
-    pos = (int(nonzero[0][0]), int(nonzero[1][0]))
+    pos = (int(nonzero[0]), int(nonzero[1]))
     
     team_id = agent_index % 2
     key = (team_id, pos)
@@ -509,9 +506,6 @@ if __name__ == "__main__":
     target_mixer.load_state_dict(mixer.state_dict())
 
     replay_buffer = NaivePrioritizedBuffer(capacity=100_000, alpha=0.6)
-
-    print(f"Obs shape: {obs_shape}, Action dim: {action_dim}, Agents: {n_agents}")
-    print("Starting Rainbow QMIX Training...")
     
     rewards, scores = train_rainbow_qmix(
         env, agent_net, target_net, mixer, target_mixer, replay_buffer,
