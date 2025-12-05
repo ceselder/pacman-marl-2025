@@ -329,8 +329,8 @@ def train_rainbow_qmix_shared(env, agent_net, target_net, mixer, target_mixer,
         n_step_buffer.reset()
         
         # Reset count every 50 episodes
-        if episode % 50 == 0:
-            visit_counts.clear()
+        # if episode % 50 == 0:
+        #     visit_counts.clear()
         
         episode_reward = 0
         score = 0
