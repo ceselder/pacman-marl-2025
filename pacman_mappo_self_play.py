@@ -72,6 +72,29 @@ class MAPPOAgent(nn.Module):
             nn.Linear(HIDDEN_DIM, HIDDEN_DIM),   nn.ReLU(),
             nn.Linear(HIDDEN_DIM, 1)
         )
+        
+    def get_action(self, x):
+        hidden = self.actor_conv(x)
+        logits = self.actor(hidden)
+        dist = Categorical(logits=logits)
+        action = dist.sample()
+        return action, dist.log_prob(action)
+
+    def get_value(self, state):
+        hidden = self.critic_conv(state)
+        return self.critic(hidden).squeeze(-1)
+
+    def evaluate(self, obs, state, action):
+        a_hidden = self.actor_conv(obs)
+        logits = self.actor(a_hidden)
+        dist = Categorical(logits=logits)
+        log_probs = dist.log_prob(action)
+        entropy = dist.entropy()
+        
+        c_hidden = self.critic_conv(state)
+        values = self.critic(c_hidden).squeeze(-1)
+        
+        return values, log_probs, entropy
 
 # --- Helper Functions ---
 
