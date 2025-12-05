@@ -12,7 +12,7 @@ print(f"Using device: {device}")
 
 # --- Hyperparameters ---
 NUM_STEPS = 2048
-BATCH_SIZE = 512
+BATCH_SIZE = 32
 LR = 5e-4
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
@@ -239,6 +239,9 @@ def train():
         value_buf = torch.zeros(NUM_STEPS, num_agents)
         
         obs_dict, _ = env.reset()
+
+        print(f"Agent positions: {[env.game.state.getAgentPosition(i) for i in range(4)]}")
+        print(f"Learner IDs: {learner_ids}, Opponent IDs: {opponent_ids}")
         episode_return = 0
         episode_returns = []
         
