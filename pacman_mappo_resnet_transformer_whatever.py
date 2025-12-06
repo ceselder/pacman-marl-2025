@@ -26,7 +26,7 @@ TOTAL_UPDATES = 1000
 # === LEARNING RATES ===
 LR_START = 2e-4
 LR_END = 5e-5
-ENT_COEF_START = 0.1 
+ENT_COEF_START = 0.01 
 ENT_COEF_END = 0.005
 
 # Settings
@@ -37,7 +37,7 @@ EVAL_FREQ = 50
 EVAL_EPISODES = 10
 
 # === CURRICULUM TEAMS ===
-PHASE1_TEAMS = ['baselineTeam', 'randomTeam']
+PHASE1_TEAMS = ['randomTeam']
 PHASE2_TEAMS = ['AstarTeam', 'approxQTeam', 'randomTeam']
 SANITY_TEAMS = ['AstarTeam', 'approxQTeam', 'randomTeam']
 HARD_TEAM = 'MCTSTeam'
