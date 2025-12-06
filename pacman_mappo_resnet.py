@@ -84,7 +84,6 @@ class MAPPOAgent(nn.Module):
             dummy = torch.zeros(1, *obs_shape)
             flat_dim = self.network(dummy).shape[1]
 
-        # Hidden size for heads
         hidden_dim = 512 #bigger didn't work well
 
         # --- Actor Head ---
@@ -130,17 +129,8 @@ class MAPPOAgent(nn.Module):
         action = dist.sample()
         log_prob = dist.log_prob(action)
         
-        # Critic Logic (Handling Centralized Training)
-        if all_obs_list[0].dim() == 4:
-            # If input is a list of tensors [Agent1, Agent2]
-            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
-        else:
-            print("baa")
-            # If input is already batched list (rare in rollout, common in logic)
-            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
-        
-        # Move merged obs to device just in case
-        critic_feat = self.network(merged.to(obs.device))
+        merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
+        critic_feat = self.network(merged)
         value = self.critic(critic_feat).squeeze(-1)
         
         return action, log_prob, value, dist.entropy()
