@@ -132,7 +132,6 @@ class MAPPOAgent(nn.Module):
         
         # Critic Logic (Handling Centralized Training)
         if all_obs_list[0].dim() == 4:
-            print("waa")
             # If input is a list of tensors [Agent1, Agent2]
             merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
         else:
