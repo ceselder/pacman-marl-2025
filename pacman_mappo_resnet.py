@@ -11,7 +11,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # ============================================
-# HYPERPARAMETERS - MOTHER OF ALL RUNS
+# HYPERPARAMETERS - resnet OF ALL RUNS
 # ============================================
 NUM_STEPS = 2048
 BATCH_SIZE = 256
@@ -156,8 +156,6 @@ class MAPPOAgent(nn.Module):
         super().__init__()
         self.obs_shape = obs_shape
         
-        # H100 Setup: Go wider. 
-        # 16 channels is too small. 64 or 128 is better for H100 utilization.
         C = 64  
         
         # 1. Initial Projection
@@ -205,7 +203,6 @@ class MAPPOAgent(nn.Module):
             nn.Linear(hidden_dim // 2, 1)
         )
         
-        # Initialize weights (Crucial for PPO)
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -573,9 +570,9 @@ def train():
               f"{eval_str}")
         
         if update % 100 == 0:
-            torch.save(agent.state_dict(), f"mappo_mother_{update}.pt")
+            torch.save(agent.state_dict(), f"mappo_resnet_{update}.pt")
 
-    torch.save(agent.state_dict(), "mappo_mother_final.pt")
+    torch.save(agent.state_dict(), "mappo_resnet_final.pt")
     
     # Plotting
     fig, axes = plt.subplots(3, 3, figsize=(15, 12))
@@ -622,11 +619,10 @@ def train():
     axes[2, 2].set_xlabel('Update')
     
     plt.tight_layout()
-    plt.savefig("mappo_mother_training.png", dpi=150)
+    plt.savefig("mappo_resnet_training.png", dpi=150)
     plt.close()
     
     print(f"\n{'='*60}")
-    print(f"MOTHER OF ALL RUNS COMPLETE!")
     print(f"Final eval: {log['eval_return'][-1]:.1f} return, {log['eval_winrate'][-1]*100:.1f}% winrate")
     print(f"{'='*60}")
 
