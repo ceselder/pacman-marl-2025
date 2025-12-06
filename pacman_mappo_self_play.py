@@ -11,7 +11,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # ============================================
-# HYPERPARAMETERS - MOTHER OF ALL RUNS
+# HYPERPARAMETERS - resnet OF ALL RUNS
 # ============================================
 NUM_STEPS = 2048
 BATCH_SIZE = 256
@@ -26,23 +26,138 @@ TOTAL_UPDATES = 1000
 # Annealed hyperparameters
 LR_START = 2e-4
 LR_END = 5e-5
-ENT_COEF_START = 0.02
-ENT_COEF_END = 0.0005
+ENT_COEF_START = 0.015
+ENT_COEF_END = 0.00005
 
 # Settings
 OPPONENT_POOL_SIZE = 5
 OPPONENT_UPDATE_FREQ = 20
-SHAPING_SCALE = 0.15           # Higher so stop penalty gets through
-EVAL_FREQ = 50                # 1000/50 = 20 evals total
+SHAPING_SCALE = 0.15
+EVAL_FREQ = 50
 EVAL_EPISODES = 20
-RANDOM_OPPONENT_PROB = 0.2    # 20% games vs random
+
+# Opponent selection: 50% self-play, 10% each bot
+SELF_PLAY_PROB = 0.5
+OPPONENT_TEAMS = ['randomTeam', 'approxQTeam', 'AstarTeam', 'baselineTeam', 'heuristicTeam']
 
 # Checkpoint
 LOAD_CHECKPOINT = None
 
 
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, stride=1)
+        self.gn1 = nn.GroupNorm(4, channels) 
+        self.act = nn.GELU()
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, stride=1)
+        self.gn2 = nn.GroupNorm(4, channels)
+        
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.gn1(out)
+        out = self.act(out)
+        out = self.conv2(out)
+        out = self.gn2(out)
+        out += residual
+        out = self.act(out)
+        return out
+
+
+class MAPPOAgent(nn.Module):
+    def __init__(self, obs_shape, action_dim, num_agents=2):
+        super().__init__()
+        self.obs_shape = obs_shape
+        
+        C = 32
+        
+        self.network = nn.Sequential(
+            nn.Conv2d(obs_shape[0], C, kernel_size=3, padding=1, stride=1),
+            nn.GELU(),
+            
+            ResidualBlock(C),
+            ResidualBlock(C),
+            ResidualBlock(C),
+            
+            nn.Flatten()
+        )
+        
+        with torch.no_grad():
+            dummy = torch.zeros(1, *obs_shape)
+            flat_dim = self.network(dummy).shape[1]
+            print(f"Observation shape: {obs_shape}, Flattened dim: {flat_dim}")
+
+        hidden_dim = 512
+
+        self.actor = nn.Sequential(
+            nn.Linear(flat_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, action_dim)
+        )
+
+        self.critic = nn.Sequential(
+            nn.Linear(flat_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+        self.apply(self._init_weights)
+        
+        nn.init.orthogonal_(self.actor[-1].weight, gain=0.01)
+        nn.init.constant_(self.actor[-1].bias, 0.0)
+        nn.init.orthogonal_(self.critic[-1].weight, gain=1.0)
+        nn.init.constant_(self.critic[-1].bias, 0.0)
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
+            nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+            if module.bias is not None:
+                module.bias.data.fill_(0.0)
+
+    def get_action_and_value(self, obs, all_obs_list):
+        h = self.network(obs)
+        logits = self.actor(h)
+        dist = Categorical(logits=logits)
+        action = dist.sample()
+        log_prob = dist.log_prob(action)
+        
+        merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
+        critic_feat = self.network(merged.to(obs.device))
+        value = self.critic(critic_feat).squeeze(-1)
+        
+        return action, log_prob, value, dist.entropy()
+
+    def get_value(self, all_obs_list):
+        if all_obs_list[0].dim() == 4:
+            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
+        else:
+            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
+        
+        critic_feat = self.network(merged.to(all_obs_list[0].device))
+        return self.critic(critic_feat).squeeze(-1)
+
+    def evaluate(self, obs, merged_obs, action, num_agents, obs_shape):
+        h = self.network(obs)
+        logits = self.actor(h)
+        dist = Categorical(logits=logits)
+        log_prob = dist.log_prob(action)
+        entropy = dist.entropy()
+        
+        critic_feat = self.network(merged_obs)
+        value = self.critic(critic_feat).squeeze(-1)
+        return value, log_prob, entropy
+    
+    def get_deterministic_action(self, obs):
+        with torch.no_grad():
+            h = self.network(obs)
+            logits = self.actor(h)
+            return logits.argmax(dim=-1)
+
+
 def canonicalize_obs(obs, is_red_agent):
-    """Canonicalize observation so red team sees the world as if they were blue."""
     if not is_red_agent:
         return obs
     
@@ -51,8 +166,8 @@ def canonicalize_obs(obs, is_red_agent):
         obs = obs.unsqueeze(0)
     
     canon = torch.flip(obs.clone(), dims=[-1])
-    canon[:, [2, 3], :, :] = canon[:, [3, 2], :, :]  # Swap capsules
-    canon[:, [6, 7], :, :] = canon[:, [7, 6], :, :]  # Swap food
+    canon[:, [2, 3], :, :] = canon[:, [3, 2], :, :]
+    canon[:, [6, 7], :, :] = canon[:, [7, 6], :, :]
     
     if not is_batched:
         canon = canon.squeeze(0)
@@ -60,7 +175,6 @@ def canonicalize_obs(obs, is_red_agent):
 
 
 def canonicalize_action(action, is_red_agent):
-    """Swap East <-> West for red team."""
     if not is_red_agent:
         return action
     if isinstance(action, torch.Tensor):
@@ -84,30 +198,23 @@ def compute_heuristic_shaping(obs_curr, obs_next):
     pos_next, carry_next = get_agent_state(obs_next)
     
     if pos_curr is None or pos_next is None:
-        print("NONE") # should never happen?
         return 0.0
     
-    # No shaping on eat/score - env handles these
     if carry_next > carry_curr or (carry_curr > 0 and carry_next == 0):
         return 0.0
 
-    # Death detection (teleported), death is worse depending on carrying
     dist_moved = abs(pos_curr[0] - pos_next[0]) + abs(pos_curr[1] - pos_next[1])
     if dist_moved > 1.5:
         return -0.5 - (0.25 * carry_curr)
     
-    # 20XX prevention where everyone just decides to stand still
     if dist_moved < 0.1:
         return -0.05
     
-    # Carrying: move toward home, very slightly scaled depending on how much were carrying
-    # never want this to overpower succesful greed
     if carry_curr > 0:
         dist_curr = pos_curr[1]
         dist_next = pos_next[1]
         return (dist_curr - dist_next) * (1 + (0.1 * carry_curr)) 
 
-    # else, just move towards food
     food_ch = obs_curr[7]
     food_locs = (food_ch > 0).nonzero(as_tuple=False).float()
     if len(food_locs) == 0:
@@ -121,7 +228,6 @@ def compute_heuristic_shaping(obs_curr, obs_next):
 
 
 def merge_obs_for_critic(obs_list):
-    """Merge multiple agent observations into single 8-channel obs for critic."""
     merged = obs_list[0].clone()
     team_locs = torch.zeros_like(merged[1])
     for obs in obs_list:
@@ -129,76 +235,6 @@ def merge_obs_for_critic(obs_list):
     merged[1] = team_locs
     merged[4] = torch.zeros_like(merged[4])
     return merged
-
-
-class MAPPOAgent(nn.Module):
-    def __init__(self, obs_shape, action_dim, num_agents=2):
-        super().__init__()
-        self.obs_shape = obs_shape
-        
-        self.conv = nn.Sequential(
-            nn.Conv2d(obs_shape[0], 16, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(),
-            nn.Flatten()
-        )
-        with torch.no_grad():
-            flat_dim = self.conv(torch.zeros(1, *obs_shape)).shape[1]
-            print(flat_dim)
-        
-        self.actor = nn.Sequential(
-            nn.Linear(flat_dim, 512), nn.ReLU(),
-            nn.Linear(512, 256), nn.ReLU(),
-            nn.Linear(256, action_dim)
-        )
-
-        self.critic = nn.Sequential(
-            nn.Linear(flat_dim, 512), nn.ReLU(),
-            nn.Linear(512, 256), nn.ReLU(),
-            nn.Linear(256, 1)
-        )
-
-    def get_action_and_value(self, obs, all_obs_list):
-        h = self.conv(obs)
-        logits = self.actor(h)
-        dist = Categorical(logits=logits)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
-        
-        if all_obs_list[0].dim() == 4:
-            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
-        else:
-            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
-        
-        critic_feat = self.conv(merged.to(obs.device))
-        value = self.critic(critic_feat).squeeze(-1)
-        return action, log_prob, value, dist.entropy()
-
-    def get_value(self, all_obs_list):
-        if all_obs_list[0].dim() == 4:
-            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
-        else:
-            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
-        
-        critic_feat = self.conv(merged.to(all_obs_list[0].device))
-        return self.critic(critic_feat).squeeze(-1)
-
-    def evaluate(self, obs, merged_obs, action, num_agents, obs_shape):
-        h = self.conv(obs)
-        logits = self.actor(h)
-        dist = Categorical(logits=logits)
-        log_prob = dist.log_prob(action)
-        entropy = dist.entropy()
-        
-        critic_feat = self.conv(merged_obs)
-        value = self.critic(critic_feat).squeeze(-1)
-        return value, log_prob, entropy
-    
-    def get_deterministic_action(self, obs):
-        with torch.no_grad():
-            h = self.conv(obs)
-            logits = self.actor(h)
-            return logits.argmax(dim=-1)
 
 
 def compute_gae(rewards, values, dones, last_value, gamma):
@@ -217,39 +253,48 @@ def compute_gae(rewards, values, dones, last_value, gamma):
     return advantages, advantages + values
 
 
-def evaluate_vs_random(agent, env, num_episodes=10):
-    """Evaluate agent playing as blue vs random red."""
+def evaluate_vs_bots(agent, num_episodes=20):
+    """Evaluate agent against random selection of bot opponents."""
     agent.eval()
     returns = []
     wins = 0
     
     learner_ids = [1, 3]
-    opponent_ids = [0, 2]
     
     for _ in range(num_episodes):
-        obs_dict, info = env.reset()
+        # Random opponent each episode
+        opp_name = np.random.choice(OPPONENT_TEAMS)
+        
+        eval_env = gymPacMan_parallel_env(
+            layout_file='layouts/bloxCapture.lay',
+            display=False,
+            reward_forLegalAction=True,
+            defenceReward=True,
+            length=300,
+            enemieName=opp_name,
+            self_play=False
+        )
+        
+        obs_dict, info = eval_env.reset()
         episode_return = 0
         done = False
         
         while not done:
-            learner_obs = torch.stack([obs_dict[env.agents[i]].float() for i in learner_ids])
+            learner_obs = torch.stack([obs_dict[eval_env.agents[i]].float() for i in learner_ids])
             
             with torch.no_grad():
                 actions = agent.get_deterministic_action(learner_obs.to(device)).cpu()
             
             env_actions = {}
             for i, aid in enumerate(learner_ids):
-                env_actions[env.agents[aid]] = actions[i].item()
-            for aid in opponent_ids:
-                legal = info['legal_actions'][env.agents[aid]]
-                env_actions[env.agents[aid]] = np.random.choice(legal)
+                env_actions[eval_env.agents[aid]] = actions[i].item()
             
-            obs_dict, rewards, dones, info = env.step(env_actions)
-            episode_return += sum(rewards[env.agents[i]] for i in learner_ids)
+            obs_dict, rewards, dones, info = eval_env.step(env_actions)
+            episode_return += sum(rewards[eval_env.agents[i]] for i in learner_ids)
             done = any(dones.values())
         
         returns.append(episode_return)
-        final_score = env.game.state.data.score
+        final_score = eval_env.game.state.data.score
         if final_score > 0:
             wins += 1
     
@@ -258,7 +303,8 @@ def evaluate_vs_random(agent, env, num_episodes=10):
 
 
 def train():
-    env = gymPacMan_parallel_env(
+    # Self-play env
+    env_selfplay = gymPacMan_parallel_env(
         layout_file='layouts/bloxCapture.lay',
         display=False,
         reward_forLegalAction=True,
@@ -268,17 +314,18 @@ def train():
         self_play=True
     )
     
-    eval_env = gymPacMan_parallel_env(
+    # Bot opponent env (we play as blue, bots are red)
+    env_bot = gymPacMan_parallel_env(
         layout_file='layouts/bloxCapture.lay',
         display=False,
         reward_forLegalAction=True,
         defenceReward=True,
         length=300,
         enemieName='randomTeam',
-        self_play=True
+        self_play=False
     )
     
-    obs_shape = env.get_Observation(0).shape
+    obs_shape = env_selfplay.get_Observation(0).shape
     num_agents = 2
     
     agent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
@@ -292,7 +339,6 @@ def train():
     opponent_pool = deque(maxlen=OPPONENT_POOL_SIZE)
     opponent_pool.append(copy.deepcopy(agent.state_dict()))
     
-    # Logging
     log = {
         'update': [], 'reward': [], 'ep_return': [],
         'eval_return': [], 'eval_winrate': [],
@@ -309,22 +355,31 @@ def train():
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
         
-        # === SIDE SELECTION (50/50) ===
-        play_as_red = np.random.rand() > 0.5
+        # === OPPONENT SELECTION ===
+        if np.random.rand() < SELF_PLAY_PROB:
+            # Self-play: random side
+            use_bot_opponent = False
+            play_as_red = np.random.rand() > 0.5
+            opp_name = "Self"
+            env = env_selfplay
+            
+            opponent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
+            opponent.load_state_dict(opponent_pool[np.random.randint(len(opponent_pool))])
+            opponent.eval()
+        else:
+            # Bot opponent: always play as blue (bots control red)
+            use_bot_opponent = True
+            play_as_red = False
+            opp_name = np.random.choice(OPPONENT_TEAMS)
+            env = env_bot
+            env.reset(enemieName=opp_name)
+        
         if play_as_red:
             learner_ids = [0, 2]
             opponent_ids = [1, 3]
         else:
             learner_ids = [1, 3]
             opponent_ids = [0, 2]
-
-        # === OPPONENT SELECTION ===
-        use_random_opponent = np.random.rand() < RANDOM_OPPONENT_PROB
-        
-        if not use_random_opponent:
-            opponent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
-            opponent.load_state_dict(opponent_pool[np.random.randint(len(opponent_pool))])
-            opponent.eval()
         
         # Buffers
         obs_buf = torch.zeros(NUM_STEPS, num_agents, *obs_shape)
@@ -368,10 +423,17 @@ def train():
             logprob_buf[step] = log_probs.cpu()
             value_buf[step] = values.cpu()
             
-            # === OPPONENT ACTIONS ===
-            if use_random_opponent:
-                opp_actions = torch.tensor([np.random.randint(5) for _ in range(num_agents)])
+            # === BUILD ENV ACTIONS ===
+            env_actions = {}
+            for i, aid in enumerate(learner_ids):
+                env_actions[env.agents[aid]] = canonicalize_action(actions[i], play_as_red).item()
+            
+            if use_bot_opponent:
+                # Bot opponent: env handles their actions, but we need to provide something
+                # The env will override with bot actions when self_play=False
+                pass  # Don't add opponent actions, env controls them
             else:
+                # Self-play opponent
                 opp_obs_raw = [obs_dict[env.agents[i]].float() for i in opponent_ids]
                 opp_obs_canon = [canonicalize_obs(o, not play_as_red) for o in opp_obs_raw]
                 opp_obs = torch.stack(opp_obs_canon)
@@ -383,12 +445,9 @@ def train():
                         a, _, _, _ = opponent.get_action_and_value(opp_obs[i:i+1].to(device), opp_list)
                         opp_actions.append(a)
                     opp_actions = torch.cat(opp_actions)
-            
-            env_actions = {}
-            for i, aid in enumerate(learner_ids):
-                env_actions[env.agents[aid]] = canonicalize_action(actions[i], play_as_red).item()
-            for i, aid in enumerate(opponent_ids):
-                env_actions[env.agents[aid]] = canonicalize_action(opp_actions[i], not play_as_red).item()
+                
+                for i, aid in enumerate(opponent_ids):
+                    env_actions[env.agents[aid]] = canonicalize_action(opp_actions[i], not play_as_red).item()
             
             next_obs_dict, rewards, dones, _ = env.step(env_actions)
             
@@ -478,7 +537,7 @@ def train():
         
         # Evaluation
         if update % EVAL_FREQ == 0:
-            eval_ret, eval_std, eval_wr = evaluate_vs_random(agent, eval_env, EVAL_EPISODES)
+            eval_ret, eval_std, eval_wr = evaluate_vs_bots(agent, EVAL_EPISODES)
             log['eval_return'].append(eval_ret)
             log['eval_winrate'].append(eval_wr)
         else:
@@ -500,9 +559,8 @@ def train():
         log['ent_coef'].append(ent_coef)
         
         side = "Red " if play_as_red else "Blue"
-        opp_type = "Rand" if use_random_opponent else "Self"
         eval_str = f"| Eval: {log['eval_return'][-1]:6.1f} ({log['eval_winrate'][-1]*100:4.1f}%)" if update % EVAL_FREQ == 0 else ""
-        print(f"Upd {update:4d} [{side}|{opp_type}] | "
+        print(f"Upd {update:4d} [{side}|{opp_name:8s}] | "
               f"Rew: {mean_reward:7.1f} | "
               f"EpRet: {mean_ep_return:6.1f} | "
               f"Ent: {np.mean(ent_l):.3f} | "
@@ -510,10 +568,10 @@ def train():
               f"LR: {lr:.2e} "
               f"{eval_str}")
         
-        if update % 100 == 0:
-            torch.save(agent.state_dict(), f"mappo_mother_{update}.pt")
+        if update % 200 == 0:
+            torch.save(agent.state_dict(), f"mappo_resnet_{update}.pt")
 
-    torch.save(agent.state_dict(), "mappo_mother_final.pt")
+    torch.save(agent.state_dict(), "mappo_resnet_final.pt")
     
     # Plotting
     fig, axes = plt.subplots(3, 3, figsize=(15, 12))
@@ -560,11 +618,10 @@ def train():
     axes[2, 2].set_xlabel('Update')
     
     plt.tight_layout()
-    plt.savefig("mappo_mother_training.png", dpi=150)
+    plt.savefig("mappo_resnet_training.png", dpi=150)
     plt.close()
     
     print(f"\n{'='*60}")
-    print(f"MOTHER OF ALL RUNS COMPLETE!")
     print(f"Final eval: {log['eval_return'][-1]:.1f} return, {log['eval_winrate'][-1]*100:.1f}% winrate")
     print(f"{'='*60}")
 

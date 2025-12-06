@@ -40,13 +40,16 @@ RANDOM_OPPONENT_PROB = 0.2    # 20% games vs random
 # Checkpoint
 LOAD_CHECKPOINT = None
 
+# Opponent selection probabilities
+OPPONENT_TEAMS = ['randomTeam', 'approxQTeam', 'AstarTeam', 'baselineTeam', 'heuristicTeam']
+SELF_PLAY_PROB = 0.5  # 50% self-play, 50% vs bots (10% each)
+
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, stride=1)
         self.gn1 = nn.GroupNorm(4, channels) 
         self.act = nn.GELU()
-        
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, stride=1)
         self.gn2 = nn.GroupNorm(4, channels)
         
@@ -66,7 +69,7 @@ class MAPPOAgent(nn.Module):
         super().__init__()
         self.obs_shape = obs_shape
         
-        C = 32 #from IMPALA
+        C = 24 #from IMPALA
         
         self.network = nn.Sequential(
             nn.Conv2d(obs_shape[0], C, kernel_size=3, padding=1, stride=1),
