@@ -69,7 +69,7 @@ class MAPPOAgent(nn.Module):
         super().__init__()
         self.obs_shape = obs_shape
         
-        C = 24 #from IMPALA
+        C = 32 #couldn't decide on 16 or 32 >.<
         
         self.network = nn.Sequential(
             nn.Conv2d(obs_shape[0], C, kernel_size=3, padding=1, stride=1),
