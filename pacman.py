@@ -68,7 +68,9 @@ class AgentQNetwork(nn.Module):
         self.conv1 = nn.Conv2d(obs_shape[0], 16, kernel_size=3, stride=1, padding=1)
         self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)
         self.conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
-        
+        with torch.no_grad():
+            flat_dim = self.conv(torch.zeros(1, *obs_shape)).shape[1]
+            print(f"Observation shape: {obs_shape}, Flattened dim: {flat_dim}")
         conv_output_shape = obs_shape[1] * obs_shape[2] * 64 
         self.flatten = nn.Flatten()
         
@@ -426,7 +428,9 @@ def train_rainbow_qmix(env, agent_net, target_net, mixer, target_mixer,
             avg_reward = np.mean(episode_rewards[-5:])
             avg_score = np.mean(episode_scores[-5:])
             print(f"Ep {episode + 1}/{n_episodes} | Rew: {avg_reward:.2f} | Score: {avg_score:.2f} | LR: {scheduler.get_last_lr()[0]:.6f}")
-    
+        
+
+
     return episode_rewards, episode_scores
 
 
