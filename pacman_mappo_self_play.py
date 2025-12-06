@@ -26,7 +26,7 @@ TOTAL_UPDATES = 1200
 # Annealed hyperparameters
 LR_START = 2e-4
 LR_END = 7e-5
-ENT_COEF_START = 0.01
+ENT_COEF_START = 0.015
 ENT_COEF_END = 0.002
 
 # Settings
