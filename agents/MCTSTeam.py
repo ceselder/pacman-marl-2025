@@ -986,7 +986,7 @@ class mctsSoloAgent(BaseAgent):
       pass
     else:
       mcts.iterate(time_limit_seconds=.8, number_of_itr=200)
-      print(f"index {self.index}, depth {mcts.mctsIntialNode.num_times_visited}")
+      #print(f"index {self.index}, depth {mcts.mctsIntialNode.num_times_visited}")
 
     ##### decide if use mcts tree #######
     # if far away from reward/punishment MCTS will no be helpful. Use helper to git it to a better location
