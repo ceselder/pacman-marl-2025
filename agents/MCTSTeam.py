@@ -1107,7 +1107,7 @@ class mctsTeamWorkAgent(BaseAgent):
     self_shared_info = getattr(mctsTeamWorkAgent, f"agent{self.index}")
     self_shared_info["expected_actions"] = expected_actions
 
-    print(f"index {self.index}, action {action}, depth {mcts.mctsIntialNode.num_times_visited}")
+    #print(f"index {self.index}, action {action}, depth {mcts.mctsIntialNode.num_times_visited}")
     if action != None:
       return action
     else:
