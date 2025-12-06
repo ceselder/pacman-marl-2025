@@ -80,6 +80,7 @@ class ViTMAPPOAgent(nn.Module):
             nn.GELU(),
             ResidualBlock(C),
             ResidualBlock(C),
+            ResidualBlock(C),
             nn.Conv2d(C, C, kernel_size=3, padding=1, stride=1), 
             nn.GELU()
         )
