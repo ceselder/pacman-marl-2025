@@ -70,7 +70,7 @@ class MAPPOAgent(nn.Module):
         super().__init__()
         self.obs_shape = obs_shape
         
-        C = 16
+        C = 24 #couldn't decide on 16 or 32, bleh
         
         self.network = nn.Sequential(
             nn.Conv2d(obs_shape[0], C, kernel_size=3, padding=1, stride=1),
@@ -86,7 +86,6 @@ class MAPPOAgent(nn.Module):
         with torch.no_grad():
             dummy = torch.zeros(1, *obs_shape)
             flat_dim = self.network(dummy).shape[1]
-            print(f"Observation shape: {obs_shape}, Flattened dim: {flat_dim}")
 
         hidden_dim = 512
 
