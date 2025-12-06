@@ -21,7 +21,7 @@ CLIP_EPS = 0.15
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
-TOTAL_UPDATES = 1000
+TOTAL_UPDATES = 500
 
 # Annealed hyperparameters
 LR_START = 2e-4
@@ -83,7 +83,6 @@ class MAPPOAgent(nn.Module):
         with torch.no_grad():
             dummy = torch.zeros(1, *obs_shape)
             flat_dim = self.network(dummy).shape[1]
-            print(f"Network Flat Dim: {flat_dim} (Target: ~12800)")
 
         # Hidden size for heads
         hidden_dim = 512
