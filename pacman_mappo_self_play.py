@@ -17,7 +17,7 @@ LR = 1.5e-4                 # Reduced
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.13           # Reduced from 0.2 for stability
-ENT_COEF = 0.02           # Higher entropy for exploration
+ENT_COEF = 0.005           # Higher entropy for exploration
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
@@ -75,23 +75,63 @@ def compute_heuristic_shaping(obs_curr, obs_next):
     
     if pos_curr is None or pos_next is None:
         return 0.0
-    if carry_next > carry_curr or (carry_curr > 0 and carry_next == 0):
-        return 0.0
 
+    # 1. DETECT DEATH (Teleportation)
+    # If the agent moved more than 1 tile in one step, they died and respawned.
+    dist_moved = abs(pos_curr[0] - pos_next[0]) + abs(pos_curr[1] - pos_next[1])
+    
+    if dist_moved > 1.5: #if died
+        base_penalty = -1.0
+        
+        # dying with food even worse
+        cargo_penalty = -1.0 * carry_curr
+        
+        return base_penalty + cargo_penalty
+    
+    if dist_moved < 0.1:
+        # we stopped, this is not good, because local minima
+        return -0.025 #tiny nudge
+
+    # Get map info for standard navigation
+    width = obs_curr.shape[-1]
+    boundary_x = width // 2 
+
+    # 2. STATE: CARRYING FOOD (Goal: Run Home)
     if carry_curr > 0:
         dist_curr = pos_curr[1]
         dist_next = pos_next[1]
+
+        # Check for Scoring (Carrying dropped to 0, but we didn't die)
+        if carry_next == 0:
+            if dist_next < boundary_x + 2:
+                # HUGE Reward for successfully capping. 
+                # Connects the dots between "moving left" and "score goes up".
+                return (dist_curr) * (2.0 + carry_curr)
+            else:
+                return 0.0
+
+        diff = dist_curr - dist_next 
+
+        multiplier = 1.0 + (carry_curr / 2) #want to get to base really badly depending on how much carrying
+        
+        return diff * multiplier
+
+    # 3. STATE: HUNTING (Goal: Find Food)
     else:
-        food_ch = obs_curr[7]
+        food_ch = obs_curr[7] 
         food_locs = (food_ch > 0).nonzero(as_tuple=False).float()
+        
         if len(food_locs) == 0:
             return 0.0
+            
         curr_p = torch.tensor(pos_curr).float()
         next_p = torch.tensor(pos_next).float()
-        dist_curr = (food_locs - curr_p).abs().sum(dim=1).min().item()
-        dist_next = (food_locs - next_p).abs().sum(dim=1).min().item()
-
-    return dist_curr - dist_next
+        
+        d_c = (food_locs - curr_p).abs().sum(dim=1).min().item()
+        d_n = (food_locs - next_p).abs().sum(dim=1).min().item()
+        
+        # Small reward for getting closer to food
+        return (d_c - d_n) * 0.5
 
 
 def merge_obs_for_critic(obs_list):

@@ -171,13 +171,24 @@ class gymPacMan_parallel_env:
         blue_reward = blue_reward + max(blue_score_change, 0)
         red_reward =  red_reward + max(red_score_change, 0)
 
+        terminations = self.check_termination()
+
+        # Win/lose bonus - only on game end!
+        if any(terminations.values()):
+            print("GAME OVER")
+            final_score = self.game.state.data.score
+            if final_score > 0:
+                blue_reward += 20.0
+            elif final_score < 0:
+                red_reward += 20.0
+
         for agentIndex in range(len(self.agents)):
             if agentIndex in [0,2]:
                 rewards[self.agents[agentIndex]] = red_reward
             else:
                 rewards[self.agents[agentIndex]] = blue_reward
-        terminations = self.check_termination()
         self.steps += 1
+
         return observations, rewards, terminations, {'legal_actions': {
                 self.agents[x]: [self.reversed_action_mapping[y] for y in self.game.state.getLegalActions(x)] for x in
                 range(len(self.agents))}, "score_change": score_change}
