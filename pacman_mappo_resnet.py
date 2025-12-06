@@ -21,7 +21,7 @@ CLIP_EPS = 0.15
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
-TOTAL_UPDATES = 500
+TOTAL_UPDATES = 1000
 
 # Annealed hyperparameters
 LR_START = 2e-4
@@ -568,7 +568,7 @@ def train():
               f"LR: {lr:.2e} "
               f"{eval_str}")
         
-        if update % 100 == 0:
+        if update % 200 == 0:
             torch.save(agent.state_dict(), f"mappo_resnet_{update}.pt")
 
     torch.save(agent.state_dict(), "mappo_resnet_final.pt")
