@@ -177,9 +177,9 @@ class gymPacMan_parallel_env:
         if any(terminations.values()):
             final_score = self.game.state.data.score
             if final_score > 0:
-                blue_reward += 25.0
+                blue_reward += 50.0 + abs(final_score)
             elif final_score < 0:
-                red_reward += 25.0
+                red_reward += 50.0 + abs(final_score)
 
         for agentIndex in range(len(self.agents)):
             if agentIndex in [0,2]:
