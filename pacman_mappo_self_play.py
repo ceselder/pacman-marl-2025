@@ -10,25 +10,35 @@ import matplotlib.pyplot as plt
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-# --- Hyperparameters (more conservative) ---
+# ============================================
+# HYPERPARAMETERS - MOTHER OF ALL RUNS
+# ============================================
 NUM_STEPS = 2048
-BATCH_SIZE = 256          # Smaller batches = more updates = smoother
-LR = 1.5e-4                 # Reduced
+BATCH_SIZE = 256
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
-CLIP_EPS = 0.13           # Reduced from 0.2 for stability
-ENT_COEF = 0.01           # Higher entropy for exploration
+CLIP_EPS = 0.15
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
-TOTAL_UPDATES = 500
+TOTAL_UPDATES = 1000
+
+# Annealed hyperparameters
+LR_START = 2e-4
+LR_END = 5e-5
+ENT_COEF_START = 0.02
+ENT_COEF_END = 0.0005
 
 # Settings
 OPPONENT_POOL_SIZE = 5
 OPPONENT_UPDATE_FREQ = 20
-SHAPING_SCALE = 0.15
-EVAL_FREQ = 20            # Eval every N updates
-EVAL_EPISODES = 10        # Episodes per eval
+SHAPING_SCALE = 0.15           # Higher so stop penalty gets through
+EVAL_FREQ = 50                # 1000/50 = 20 evals total
+EVAL_EPISODES = 20
+RANDOM_OPPONENT_PROB = 0.2    # 20% games vs random
+
+# Checkpoint
+LOAD_CHECKPOINT = None
 
 
 def canonicalize_obs(obs, is_red_agent):
@@ -74,57 +84,50 @@ def compute_heuristic_shaping(obs_curr, obs_next):
     pos_next, carry_next = get_agent_state(obs_next)
     
     if pos_curr is None or pos_next is None:
-        print("erm")
+        print("NONE") # should never happen?
         return 0.0
-    
-    # Death detection (teleported)
-    dist_moved = abs(pos_curr[0] - pos_next[0]) + abs(pos_curr[1] - pos_next[1])
-    if dist_moved > 1.5:
-        return -0.5 - (0.25 * carry_curr)
-    
-    # Small anti-stopping nudge
-    if dist_moved < 0.1:
-        return -0.05
     
     # No shaping on eat/score - env handles these
     if carry_next > carry_curr or (carry_curr > 0 and carry_next == 0):
         return 0.0
 
-    # Carrying: move toward home
+    # Death detection (teleported), death is worse depending on carrying
+    dist_moved = abs(pos_curr[0] - pos_next[0]) + abs(pos_curr[1] - pos_next[1])
+    if dist_moved > 1.5:
+        return -0.5 - (0.25 * carry_curr)
+    
+    # 20XX prevention where everyone just decides to stand still
+    if dist_moved < 0.1:
+        return -0.05
+    
+    # Carrying: move toward home, very slightly scaled depending on how much were carrying
+    # never want this to overpower succesful greed
     if carry_curr > 0:
         dist_curr = pos_curr[1]
         dist_next = pos_next[1]
-        return dist_curr - dist_next
-    
-    # Hunting: move toward food
+        return (dist_curr - dist_next) * (1 + (0.1 * carry_curr)) 
+
+    # else, just move towards food
     food_ch = obs_curr[7]
     food_locs = (food_ch > 0).nonzero(as_tuple=False).float()
     if len(food_locs) == 0:
         return 0.0
-    
     curr_p = torch.tensor(pos_curr).float()
     next_p = torch.tensor(pos_next).float()
-    d_curr = (food_locs - curr_p).abs().sum(dim=1).min().item()
-    d_next = (food_locs - next_p).abs().sum(dim=1).min().item()
-    
-    return d_curr - d_next
+    dist_curr = (food_locs - curr_p).abs().sum(dim=1).min().item()
+    dist_next = (food_locs - next_p).abs().sum(dim=1).min().item()
+
+    return dist_curr - dist_next
 
 
 def merge_obs_for_critic(obs_list):
-    # Start with first agent's observation as base
+    """Merge multiple agent observations into single 8-channel obs for critic."""
     merged = obs_list[0].clone()
-    
-    # Merge all agent locations into channel 1 (team positions)
-    # We want: channel 1 = all friendly positions, channel 4 = 0 (or keep enemies)
-    
-    # Actually simpler: just add all self_loc channels together
     team_locs = torch.zeros_like(merged[1])
     for obs in obs_list:
-        team_locs = torch.maximum(team_locs, obs[1])  # max to handle overlapping (keeps carrying info)
-    
+        team_locs = torch.maximum(team_locs, obs[1])
     merged[1] = team_locs
-    merged[4] = torch.zeros_like(merged[4])  # Clear ally channel since it's now in channel 1
-    
+    merged[4] = torch.zeros_like(merged[4])
     return merged
 
 
@@ -133,7 +136,6 @@ class MAPPOAgent(nn.Module):
         super().__init__()
         self.obs_shape = obs_shape
         
-        # Deeper conv backbone
         self.conv = nn.Sequential(
             nn.Conv2d(obs_shape[0], 32, 3, padding=1), nn.ReLU(),
             nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
@@ -143,17 +145,16 @@ class MAPPOAgent(nn.Module):
         with torch.no_grad():
             flat_dim = self.conv(torch.zeros(1, *obs_shape)).shape[1]
         
-        # Deeper actor
         self.actor = nn.Sequential(
             nn.Linear(flat_dim, 512), nn.ReLU(),
-            nn.Linear(512, 512), nn.ReLU(),
-            nn.Linear(512, action_dim)
+            nn.Linear(512, 256), nn.ReLU(),
+            nn.Linear(256, action_dim)
         )
-        # Deeper critic (same 8 channels merged obs)
+
         self.critic = nn.Sequential(
             nn.Linear(flat_dim, 512), nn.ReLU(),
-            nn.Linear(512, 512), nn.ReLU(),
-            nn.Linear(512, 1)
+            nn.Linear(512, 256), nn.ReLU(),
+            nn.Linear(256, 1)
         )
 
     def get_action_and_value(self, obs, all_obs_list):
@@ -163,8 +164,7 @@ class MAPPOAgent(nn.Module):
         action = dist.sample()
         log_prob = dist.log_prob(action)
         
-        # Merge observations for critic (handles batched and unbatched)
-        if all_obs_list[0].dim() == 4:  # Batched: (1, C, H, W)
+        if all_obs_list[0].dim() == 4:
             merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
         else:
             merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
@@ -183,10 +183,6 @@ class MAPPOAgent(nn.Module):
         return self.critic(critic_feat).squeeze(-1)
 
     def evaluate(self, obs, merged_obs, action, num_agents, obs_shape):
-        """
-        obs: (batch, C, H, W) - individual agent obs for actor
-        merged_obs: (batch, C, H, W) - merged obs for critic (same shape, 8 channels)
-        """
         h = self.conv(obs)
         logits = self.actor(h)
         dist = Categorical(logits=logits)
@@ -198,14 +194,13 @@ class MAPPOAgent(nn.Module):
         return value, log_prob, entropy
     
     def get_deterministic_action(self, obs):
-        """Get greedy action for evaluation."""
         with torch.no_grad():
             h = self.conv(obs)
             logits = self.actor(h)
             return logits.argmax(dim=-1)
 
 
-def compute_gae(rewards, values, dones, last_value):
+def compute_gae(rewards, values, dones, last_value, gamma):
     T = len(rewards)
     advantages = torch.zeros_like(rewards)
     lastgaelam = 0
@@ -216,8 +211,8 @@ def compute_gae(rewards, values, dones, last_value):
         else:
             next_val = values[t + 1]
             next_nonterm = 1.0 - dones[t]
-        delta = rewards[t] + GAMMA * next_val * next_nonterm - values[t]
-        advantages[t] = lastgaelam = delta + GAMMA * GAE_LAMBDA * next_nonterm * lastgaelam
+        delta = rewards[t] + gamma * next_val * next_nonterm - values[t]
+        advantages[t] = lastgaelam = delta + gamma * GAE_LAMBDA * next_nonterm * lastgaelam
     return advantages, advantages + values
 
 
@@ -236,14 +231,11 @@ def evaluate_vs_random(agent, env, num_episodes=10):
         done = False
         
         while not done:
-            # Get learner observations (no canonicalization needed - playing blue)
             learner_obs = torch.stack([obs_dict[env.agents[i]].float() for i in learner_ids])
             
-            # Deterministic actions for eval
             with torch.no_grad():
                 actions = agent.get_deterministic_action(learner_obs.to(device)).cpu()
             
-            # Random opponent actions
             env_actions = {}
             for i, aid in enumerate(learner_ids):
                 env_actions[env.agents[aid]] = actions[i].item()
@@ -256,9 +248,8 @@ def evaluate_vs_random(agent, env, num_episodes=10):
             done = any(dones.values())
         
         returns.append(episode_return)
-        # Win if positive score (simplified)
         final_score = env.game.state.data.score
-        if final_score > 0:  # Blue (our team) winning
+        if final_score > 0:
             wins += 1
     
     agent.train()
@@ -269,18 +260,17 @@ def train():
     env = gymPacMan_parallel_env(
         layout_file='layouts/bloxCapture.lay',
         display=False,
-        reward_forLegalAction=True,
+        reward_forLegalAction=False,
         defenceReward=True,
         length=300,
         enemieName='randomTeam',
         self_play=True
     )
     
-    # Separate eval env
     eval_env = gymPacMan_parallel_env(
         layout_file='layouts/bloxCapture.lay',
         display=False,
-        reward_forLegalAction=True,
+        reward_forLegalAction=False,
         defenceReward=True,
         length=300,
         enemieName='randomTeam',
@@ -291,31 +281,35 @@ def train():
     num_agents = 2
     
     agent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
-    optimizer = torch.optim.Adam(agent.parameters(), lr=LR, eps=1e-5)
-
-    state_dict = torch.load("mappo_checkpoint.pt", map_location=device) #continue old training run
-    agent.load_state_dict(state_dict)
+    optimizer = torch.optim.Adam(agent.parameters(), lr=LR_START, eps=1e-5)
+    
+    if LOAD_CHECKPOINT is not None:
+        print(f"Loading checkpoint: {LOAD_CHECKPOINT}")
+        state_dict = torch.load(LOAD_CHECKPOINT, map_location=device)
+        agent.load_state_dict(state_dict)
     
     opponent_pool = deque(maxlen=OPPONENT_POOL_SIZE)
     opponent_pool.append(copy.deepcopy(agent.state_dict()))
     
     # Logging
     log = {
-        'update': [],
-        'reward': [],
-        'ep_return': [],
-        'eval_return': [],
-        'eval_winrate': [],
-        'entropy': [],
-        'clip_frac': [],
-        'pg_loss': [],
-        'v_loss': []
+        'update': [], 'reward': [], 'ep_return': [],
+        'eval_return': [], 'eval_winrate': [],
+        'entropy': [], 'clip_frac': [], 'pg_loss': [], 'v_loss': [],
+        'lr': [], 'ent_coef': []
     }
     
-    
     for update in range(1, TOTAL_UPDATES + 1):
-        # Random side selection
-        play_as_red = np.random.rand() > 0.9
+        # === ANNEAL HYPERPARAMETERS ===
+        progress = update / TOTAL_UPDATES
+        lr = LR_START - (LR_START - LR_END) * progress
+        ent_coef = ENT_COEF_START - (ENT_COEF_START - ENT_COEF_END) * progress
+        
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        
+        # === SIDE SELECTION (50/50) ===
+        play_as_red = np.random.rand() > 0.5
         if play_as_red:
             learner_ids = [0, 2]
             opponent_ids = [1, 3]
@@ -323,14 +317,17 @@ def train():
             learner_ids = [1, 3]
             opponent_ids = [0, 2]
 
-        # Load opponent from pool
-        opponent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
-        opponent.load_state_dict(opponent_pool[np.random.randint(len(opponent_pool))])
-        opponent.eval()
+        # === OPPONENT SELECTION ===
+        use_random_opponent = np.random.rand() < RANDOM_OPPONENT_PROB
+        
+        if not use_random_opponent:
+            opponent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
+            opponent.load_state_dict(opponent_pool[np.random.randint(len(opponent_pool))])
+            opponent.eval()
         
         # Buffers
         obs_buf = torch.zeros(NUM_STEPS, num_agents, *obs_shape)
-        merged_obs_buf = torch.zeros(NUM_STEPS, num_agents, *obs_shape)  # 8 channels, not 16
+        merged_obs_buf = torch.zeros(NUM_STEPS, num_agents, *obs_shape)
         action_buf = torch.zeros(NUM_STEPS, num_agents, dtype=torch.long)
         logprob_buf = torch.zeros(NUM_STEPS, num_agents)
         reward_buf = torch.zeros(NUM_STEPS, num_agents)
@@ -346,7 +343,6 @@ def train():
             learner_obs_canon = [canonicalize_obs(o, play_as_red) for o in learner_obs_raw]
             learner_obs = torch.stack(learner_obs_canon)
             
-            # Merged obs for critic (8 channels with all team positions)
             merged_obs = merge_obs_for_critic(learner_obs_canon)
             merged_obs_batch = merged_obs.unsqueeze(0).expand(num_agents, -1, -1, -1)
             
@@ -371,18 +367,21 @@ def train():
             logprob_buf[step] = log_probs.cpu()
             value_buf[step] = values.cpu()
             
-            # Opponent actions
-            opp_obs_raw = [obs_dict[env.agents[i]].float() for i in opponent_ids]
-            opp_obs_canon = [canonicalize_obs(o, not play_as_red) for o in opp_obs_raw]
-            opp_obs = torch.stack(opp_obs_canon)
-            
-            with torch.no_grad():
-                opp_list = [opp_obs[i:i+1].to(device) for i in range(num_agents)]
-                opp_actions = []
-                for i in range(num_agents):
-                    a, _, _, _ = opponent.get_action_and_value(opp_obs[i:i+1].to(device), opp_list)
-                    opp_actions.append(a)
-                opp_actions = torch.cat(opp_actions)
+            # === OPPONENT ACTIONS ===
+            if use_random_opponent:
+                opp_actions = torch.tensor([np.random.randint(5) for _ in range(num_agents)])
+            else:
+                opp_obs_raw = [obs_dict[env.agents[i]].float() for i in opponent_ids]
+                opp_obs_canon = [canonicalize_obs(o, not play_as_red) for o in opp_obs_raw]
+                opp_obs = torch.stack(opp_obs_canon)
+                
+                with torch.no_grad():
+                    opp_list = [opp_obs[i:i+1].to(device) for i in range(num_agents)]
+                    opp_actions = []
+                    for i in range(num_agents):
+                        a, _, _, _ = opponent.get_action_and_value(opp_obs[i:i+1].to(device), opp_list)
+                        opp_actions.append(a)
+                    opp_actions = torch.cat(opp_actions)
             
             env_actions = {}
             for i, aid in enumerate(learner_ids):
@@ -391,19 +390,6 @@ def train():
                 env_actions[env.agents[aid]] = canonicalize_action(opp_actions[i], not play_as_red).item()
             
             next_obs_dict, rewards, dones, _ = env.step(env_actions)
-            
-            # DEBUG: Print when any reward is non-zero
-            # if (rewards[env.agents[0]] > 0.01 or rewards[env.agents[1]] > 0.01) and step > 900 and step < 905:
-            #     r0 = rewards[env.agents[0]]
-            #     r1 = rewards[env.agents[1]]
-            #     r2 = rewards[env.agents[2]]
-            #     r3 = rewards[env.agents[3]]
-            #     learner_sum = sum(rewards[env.agents[i]] for i in learner_ids)
-            #     # Also show what actions were taken
-            #     act_names = ['N', 'E', 'S', 'W', 'X']
-            #     raw_acts = [act_names[a.item()] for a in actions]
-            #     env_acts = [act_names[env_actions[env.agents[i]]] for i in learner_ids]
-            #     print(f"Upd{update} Step{step} | as_{'RED' if play_as_red else 'BLU'} | ids={learner_ids} | r0={r0:+.2f} r1={r1:+.2f} r2={r2:+.2f} r3={r3:+.2f} | sum={learner_sum:+.2f} | raw_act={raw_acts} env_act={env_acts}")
             
             # Shaping
             next_obs_raw = [next_obs_dict[env.agents[i]].float() for i in learner_ids]
@@ -438,13 +424,13 @@ def train():
         advantages = torch.zeros_like(reward_buf)
         returns = torch.zeros_like(reward_buf)
         for i in range(num_agents):
-            adv, ret = compute_gae(reward_buf[:, i], value_buf[:, i], done_buf[:, i], last_value)
+            adv, ret = compute_gae(reward_buf[:, i], value_buf[:, i], done_buf[:, i], last_value, GAMMA)
             advantages[:, i] = adv
             returns[:, i] = ret
             
         # PPO Update
         b_obs = obs_buf.reshape(-1, *obs_shape)
-        b_merged = merged_obs_buf.reshape(-1, *obs_shape)  # 8 channels, same as obs
+        b_merged = merged_obs_buf.reshape(-1, *obs_shape)
         b_act = action_buf.reshape(-1)
         b_logp = logprob_buf.reshape(-1)
         b_adv = advantages.reshape(-1)
@@ -473,7 +459,7 @@ def train():
                     norm_adv.to(device) * torch.clamp(ratio, 1-CLIP_EPS, 1+CLIP_EPS)
                 ).mean()
                 vl = 0.5 * ((vals - b_ret[mb].to(device))**2).mean()
-                loss = pg + VF_COEF*vl - ENT_COEF*ent.mean()
+                loss = pg + VF_COEF*vl - ent_coef*ent.mean()
                 
                 optimizer.zero_grad()
                 loss.backward()
@@ -509,23 +495,27 @@ def train():
         log['clip_frac'].append(np.mean(clip_l))
         log['pg_loss'].append(np.mean(pg_l))
         log['v_loss'].append(np.mean(v_l))
+        log['lr'].append(lr)
+        log['ent_coef'].append(ent_coef)
         
         side = "Red " if play_as_red else "Blue"
+        opp_type = "Rand" if use_random_opponent else "Self"
         eval_str = f"| Eval: {log['eval_return'][-1]:6.1f} ({log['eval_winrate'][-1]*100:4.1f}%)" if update % EVAL_FREQ == 0 else ""
-        print(f"Upd {update:4d} [{side}] | "
+        print(f"Upd {update:4d} [{side}|{opp_type}] | "
               f"Rew: {mean_reward:7.1f} | "
               f"EpRet: {mean_ep_return:6.1f} | "
               f"Ent: {np.mean(ent_l):.3f} | "
-              f"Clip: {np.mean(clip_l):.3f} "
+              f"Clip: {np.mean(clip_l):.3f} | "
+              f"LR: {lr:.2e} "
               f"{eval_str}")
         
         if update % 100 == 0:
-            torch.save(agent.state_dict(), f"mappo_{update}.pt")
+            torch.save(agent.state_dict(), f"mappo_mother_{update}.pt")
 
-    torch.save(agent.state_dict(), "mappo_final.pt")
+    torch.save(agent.state_dict(), "mappo_mother_final.pt")
     
     # Plotting
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    fig, axes = plt.subplots(3, 3, figsize=(15, 12))
     
     axes[0, 0].plot(log['update'], log['reward'])
     axes[0, 0].set_title('Rollout Reward')
@@ -556,11 +546,26 @@ def train():
     axes[1, 2].set_title('Value Loss')
     axes[1, 2].set_xlabel('Update')
     
+    axes[2, 0].plot(log['update'], log['lr'])
+    axes[2, 0].set_title('Learning Rate (annealed)')
+    axes[2, 0].set_xlabel('Update')
+    
+    axes[2, 1].plot(log['update'], log['ent_coef'])
+    axes[2, 1].set_title('Entropy Coef (annealed)')
+    axes[2, 1].set_xlabel('Update')
+    
+    axes[2, 2].plot(log['update'], log['pg_loss'])
+    axes[2, 2].set_title('Policy Loss')
+    axes[2, 2].set_xlabel('Update')
+    
     plt.tight_layout()
-    plt.savefig("mappo_training.png", dpi=150)
+    plt.savefig("mappo_mother_training.png", dpi=150)
     plt.close()
     
-    print(f"\nTraining complete! Final eval: {log['eval_return'][-1]:.1f} return, {log['eval_winrate'][-1]*100:.1f}% winrate")
+    print(f"\n{'='*60}")
+    print(f"MOTHER OF ALL RUNS COMPLETE!")
+    print(f"Final eval: {log['eval_return'][-1]:.1f} return, {log['eval_winrate'][-1]*100:.1f}% winrate")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":
