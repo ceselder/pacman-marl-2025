@@ -40,6 +40,140 @@ RANDOM_OPPONENT_PROB = 0.2    # 20% games vs random
 # Checkpoint
 LOAD_CHECKPOINT = None
 
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, stride=1)
+        self.gn1 = nn.GroupNorm(4, channels) 
+        self.act = nn.GELU()
+        
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, stride=1)
+        self.gn2 = nn.GroupNorm(4, channels)
+        
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.gn1(out)
+        out = self.act(out)
+        out = self.conv2(out)
+        out = self.gn2(out)
+        out += residual # Skip connection
+        out = self.act(out)
+        return out
+
+class MAPPOAgent(nn.Module):
+    def __init__(self, obs_shape, action_dim, num_agents=2):
+        super().__init__()
+        self.obs_shape = obs_shape
+        
+        C = 32 #from IMPALA
+        
+        self.network = nn.Sequential(
+            nn.Conv2d(obs_shape[0], C, kernel_size=3, padding=1, stride=1),
+            nn.GELU(),
+            
+            ResidualBlock(C),
+            ResidualBlock(C),
+            ResidualBlock(C),
+            
+            nn.Flatten()
+        )
+        
+        # Calculate Flatten Dimension
+        with torch.no_grad():
+            dummy = torch.zeros(1, *obs_shape)
+            flat_dim = self.network(dummy).shape[1]
+            print(f"Network Flat Dim: {flat_dim} (Target: ~12800)")
+
+        # Hidden size for heads
+        hidden_dim = 512
+
+        # --- Actor Head ---
+        self.actor = nn.Sequential(
+            nn.Linear(flat_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, action_dim)
+        )
+
+        # --- Critic Head ---
+        self.critic = nn.Sequential(
+            nn.Linear(flat_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+        # --- 1. General Orthogonal Init ---
+        self.apply(self._init_weights)
+        
+        # --- 2. SPECIAL SAUCE: High Entropy Init ---
+        # We re-initialize the LAST layer of the actor with very small weights.
+        # This ensures logits are ~0, so probabilities are uniform (max entropy).
+        nn.init.orthogonal_(self.actor[-1].weight, gain=0.01)
+        nn.init.constant_(self.actor[-1].bias, 0.0)
+
+        # (Optional) Critic last layer usually gets gain=1.0
+        nn.init.orthogonal_(self.critic[-1].weight, gain=1.0)
+        nn.init.constant_(self.critic[-1].bias, 0.0)
+
+    def _init_weights(self, module):
+        """Standard orthogonal init for hidden layers"""
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
+            nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+            if module.bias is not None:
+                module.bias.data.fill_(0.0)
+
+    def get_action_and_value(self, obs, all_obs_list):
+        h = self.network(obs)
+        logits = self.actor(h)
+        dist = Categorical(logits=logits)
+        action = dist.sample()
+        log_prob = dist.log_prob(action)
+        
+        # Critic Logic (Handling Centralized Training)
+        if all_obs_list[0].dim() == 4:
+            # If input is a list of tensors [Agent1, Agent2]
+            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
+        else:
+            # If input is already batched list (rare in rollout, common in logic)
+            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
+        
+        # Move merged obs to device just in case
+        critic_feat = self.network(merged.to(obs.device))
+        value = self.critic(critic_feat).squeeze(-1)
+        
+        return action, log_prob, value, dist.entropy()
+
+    def get_value(self, all_obs_list):
+        """Helper for GAE calculation"""
+        if all_obs_list[0].dim() == 4:
+            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
+        else:
+            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
+        
+        critic_feat = self.network(merged.to(all_obs_list[0].device))
+        return self.critic(critic_feat).squeeze(-1)
+
+    def evaluate(self, obs, merged_obs, action, num_agents, obs_shape):
+        """Called during PPO update loop"""
+        h = self.network(obs)
+        logits = self.actor(h)
+        dist = Categorical(logits=logits)
+        log_prob = dist.log_prob(action)
+        entropy = dist.entropy()
+        
+        critic_feat = self.network(merged_obs)
+        value = self.critic(critic_feat).squeeze(-1)
+        return value, log_prob, entropy
+    
+    def get_deterministic_action(self, obs):
+        """For evaluation mode"""
+        with torch.no_grad():
+            h = self.network(obs)
+            logits = self.actor(h)
+            return logits.argmax(dim=-1)
+
 
 def canonicalize_obs(obs, is_red_agent):
     """Canonicalize observation so red team sees the world as if they were blue."""
@@ -131,133 +265,6 @@ def merge_obs_for_critic(obs_list):
     return merged
 
 
-class ResidualBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.gn1 = nn.GroupNorm(8, channels) # GroupNorm is more stable for RL than BatchNorm
-        self.act = nn.GELU()
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.gn2 = nn.GroupNorm(8, channels)
-        
-    def forward(self, x):
-        residual = x
-        out = self.conv1(x)
-        out = self.gn1(out)
-        out = self.act(out)
-        out = self.conv2(out)
-        out = self.gn2(out)
-        out += residual # The Skip Connection
-        out = self.act(out)
-        return out
-
-class MAPPOAgent(nn.Module):
-    def __init__(self, obs_shape, action_dim, num_agents=2):
-        super().__init__()
-        self.obs_shape = obs_shape
-        
-        C = 64  
-        
-        # 1. Initial Projection
-        self.entry = nn.Sequential(
-            nn.Conv2d(obs_shape[0], C, kernel_size=3, padding=1),
-            nn.GroupNorm(8, C),
-            nn.GELU()
-        )
-        
-        # 2. Residual Tower (The "Brain")
-        # 3 blocks is usually the sweet spot for 2D grid games
-        self.blocks = nn.Sequential(
-            ResidualBlock(C),
-            ResidualBlock(C),
-            ResidualBlock(C)
-        )
-        
-        # 3. Calculate Flatten Dim
-        with torch.no_grad():
-            dummy = torch.zeros(1, *obs_shape)
-            out = self.entry(dummy)
-            out = self.blocks(out)
-            flat_dim = out.flatten(1).shape[1]
-            print(f"Network Flat Dim: {flat_dim}")
-            
-        # 4. Heads
-        # Increased hidden size to 512 or 1024 to use the H100 compute
-        hidden_dim = 1024 
-        
-        self.actor = nn.Sequential(
-            nn.Linear(flat_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim), # LayerNorm helps PPO stability
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, action_dim)
-        )
-
-        self.critic = nn.Sequential(
-            nn.Linear(flat_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, 1)
-        )
-        
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Conv2d)):
-            nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
-            if module.bias is not None:
-                module.bias.data.fill_(0.0)
-
-    def get_features(self, x):
-        x = self.entry(x)
-        x = self.blocks(x)
-        return x.flatten(1)
-
-    def get_action_and_value(self, obs, all_obs_list):
-        h = self.get_features(obs)
-        logits = self.actor(h)
-        dist = Categorical(logits=logits)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
-        
-        # Critic Logic
-        if all_obs_list[0].dim() == 4:
-            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
-        else:
-            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
-        
-        critic_feat = self.get_features(merged.to(obs.device))
-        value = self.critic(critic_feat).squeeze(-1)
-        
-        return action, log_prob, value, dist.entropy()
-
-    def get_value(self, all_obs_list):
-        if all_obs_list[0].dim() == 4:
-            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
-        else:
-            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
-        critic_feat = self.get_features(merged.to(all_obs_list[0].device))
-        return self.critic(critic_feat).squeeze(-1)
-
-    def evaluate(self, obs, merged_obs, action, num_agents, obs_shape):
-        h = self.get_features(obs)
-        logits = self.actor(h)
-        dist = Categorical(logits=logits)
-        log_prob = dist.log_prob(action)
-        entropy = dist.entropy()
-        
-        critic_feat = self.get_features(merged_obs)
-        value = self.critic(critic_feat).squeeze(-1)
-        return value, log_prob, entropy
-    
-    def get_deterministic_action(self, obs):
-        with torch.no_grad():
-            h = self.get_features(obs)
-            logits = self.actor(h)
-            return logits.argmax(dim=-1)
 
 
 def compute_gae(rewards, values, dones, last_value, gamma):
