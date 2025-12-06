@@ -21,24 +21,31 @@ CLIP_EPS = 0.15
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
-TOTAL_UPDATES = 1000
+TOTAL_UPDATES = 1500
 
 # Annealed hyperparameters
 LR_START = 2e-4
-LR_END = 5e-5
-ENT_COEF_START = 0.015
-ENT_COEF_END = 0.00005
+LR_END = 7e-5
+ENT_COEF_START = 0.01
+ENT_COEF_END = 0.002
 
 # Settings
-OPPONENT_POOL_SIZE = 5
-OPPONENT_UPDATE_FREQ = 20
+OPPONENT_POOL_SIZE = 100 
+OPPONENT_UPDATE_FREQ = 25 
 SHAPING_SCALE = 0.15
 EVAL_FREQ = 50
-EVAL_EPISODES = 20
+EVAL_EPISODES = 10
 
-# Opponent selection: 50% self-play, 10% each bot
-SELF_PLAY_PROB = 0.5
-OPPONENT_TEAMS = ['randomTeam', 'approxQTeam', 'AstarTeam', 'baselineTeam', 'heuristicTeam']
+# === CURRICULUM TEAMS ===
+# Phase 1 Teams (Easy/Basics)
+PHASE1_TEAMS = ['baselineTeam', 'randomTeam']
+
+# Phase 2 Teams (Medium/Pathfinding)
+PHASE2_TEAMS = ['AstarTeam', 'approxQTeam', 'randomTeam']
+
+# Phase 3 Mixed
+SANITY_TEAMS = ['AstarTeam', 'approxQTeam', 'randomTeam']
+HARD_TEAM = 'MCTSTeam'
 
 # Checkpoint
 LOAD_CHECKPOINT = None
@@ -70,7 +77,7 @@ class MAPPOAgent(nn.Module):
         super().__init__()
         self.obs_shape = obs_shape
         
-        C = 32
+        C = 32 #couldn't decide on 16 or 32, bleh
         
         self.network = nn.Sequential(
             nn.Conv2d(obs_shape[0], C, kernel_size=3, padding=1, stride=1),
@@ -86,7 +93,6 @@ class MAPPOAgent(nn.Module):
         with torch.no_grad():
             dummy = torch.zeros(1, *obs_shape)
             flat_dim = self.network(dummy).shape[1]
-            print(f"Observation shape: {obs_shape}, Flattened dim: {flat_dim}")
 
         hidden_dim = 512
 
@@ -254,16 +260,15 @@ def compute_gae(rewards, values, dones, last_value, gamma):
 
 
 def evaluate_vs_bots(agent, num_episodes=20):
-    """Evaluate agent against random selection of bot opponents."""
+    """Evaluate agent ONLY against MCTSTeam as requested."""
     agent.eval()
     returns = []
     wins = 0
     
-    learner_ids = [1, 3]
+    learner_ids = [1, 3] # Playing as Blue
+    opp_name = HARD_TEAM # MCTSTeam
     
     for _ in range(num_episodes):
-        # Random opponent each episode
-        opp_name = np.random.choice(OPPONENT_TEAMS)
         
         eval_env = gymPacMan_parallel_env(
             layout_file='layouts/bloxCapture.lay',
@@ -295,7 +300,8 @@ def evaluate_vs_bots(agent, num_episodes=20):
         
         returns.append(episode_return)
         final_score = eval_env.game.state.data.score
-        if final_score > 0:
+        # Blue wins if score < 0
+        if final_score < 0:
             wins += 1
     
     agent.train()
@@ -336,12 +342,15 @@ def train():
         state_dict = torch.load(LOAD_CHECKPOINT, map_location=device)
         agent.load_state_dict(state_dict)
     
+    # Pool for historical self-play
     opponent_pool = deque(maxlen=OPPONENT_POOL_SIZE)
+    # Initialize with current agent
     opponent_pool.append(copy.deepcopy(agent.state_dict()))
     
     log = {
         'update': [], 'reward': [], 'ep_return': [],
         'eval_return': [], 'eval_winrate': [],
+        'train_winrate': [], # Winrate against current opponent
         'entropy': [], 'clip_frac': [], 'pg_loss': [], 'v_loss': [],
         'lr': [], 'ent_coef': []
     }
@@ -355,24 +364,69 @@ def train():
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
         
-        # === OPPONENT SELECTION ===
-        if np.random.rand() < SELF_PLAY_PROB:
-            # Self-play: random side
-            use_bot_opponent = False
-            play_as_red = np.random.rand() > 0.5
-            opp_name = "Self"
-            env = env_selfplay
-            
-            opponent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
-            opponent.load_state_dict(opponent_pool[np.random.randint(len(opponent_pool))])
-            opponent.eval()
-        else:
-            # Bot opponent: always play as blue (bots control red)
+        # ==========================================
+        # === NEW OPPONENT SELECTION STRATEGY ===
+        # ==========================================
+        
+        if update <= 200:
+            # PHASE 1: BOOTSTRAPPING (100% Easy Bots)
+            # "baselineteam or randomteam"
             use_bot_opponent = True
             play_as_red = False
-            opp_name = np.random.choice(OPPONENT_TEAMS)
+            opp_name = np.random.choice(PHASE1_TEAMS)
             env = env_bot
             env.reset(enemieName=opp_name)
+            
+        elif update <= 400:
+            # PHASE 2: PATHFINDING (100% Medium Bots)
+            # "AstarTeam, approxQTeam, randomTeam"
+            use_bot_opponent = True
+            play_as_red = False
+            opp_name = np.random.choice(PHASE2_TEAMS)
+            env = env_bot
+            env.reset(enemieName=opp_name)
+            
+        else:
+            # PHASE 3: MIXED REGIME
+            rand_val = np.random.rand()
+            
+            if rand_val < 0.60:
+                # 60% Self-Play (Current Version)
+                use_bot_opponent = False
+                play_as_red = np.random.rand() > 0.5 
+                opp_name = "Self(Curr)"
+                env = env_selfplay
+                
+                opponent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
+                opponent.load_state_dict(agent.state_dict())
+                opponent.eval()
+                
+            elif rand_val < 0.80:
+                # 20% Self-Play (Old Version)
+                use_bot_opponent = False
+                play_as_red = np.random.rand() > 0.5
+                opp_name = "Self(Old)"
+                env = env_selfplay
+                
+                opponent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
+                opponent.load_state_dict(opponent_pool[np.random.randint(len(opponent_pool))])
+                opponent.eval()
+                
+            elif rand_val < 0.90:
+                # 10% Sanity Check
+                use_bot_opponent = True
+                play_as_red = False
+                opp_name = np.random.choice(SANITY_TEAMS)
+                env = env_bot
+                env.reset(enemieName=opp_name)
+                
+            else:
+                # 10% HARD (MCTS)
+                use_bot_opponent = True
+                play_as_red = False
+                opp_name = HARD_TEAM
+                env = env_bot
+                env.reset(enemieName=opp_name)
         
         if play_as_red:
             learner_ids = [0, 2]
@@ -381,6 +435,9 @@ def train():
             learner_ids = [1, 3]
             opponent_ids = [0, 2]
         
+        # Init win tracking for this update
+        batch_wins = []
+
         # Buffers
         obs_buf = torch.zeros(NUM_STEPS, num_agents, *obs_shape)
         merged_obs_buf = torch.zeros(NUM_STEPS, num_agents, *obs_shape)
@@ -429,9 +486,7 @@ def train():
                 env_actions[env.agents[aid]] = canonicalize_action(actions[i], play_as_red).item()
             
             if use_bot_opponent:
-                # Bot opponent: env handles their actions, but we need to provide something
-                # The env will override with bot actions when self_play=False
-                pass  # Don't add opponent actions, env controls them
+                pass 
             else:
                 # Self-play opponent
                 opp_obs_raw = [obs_dict[env.agents[i]].float() for i in opponent_ids]
@@ -468,6 +523,15 @@ def train():
             obs_dict = next_obs_dict
             
             if done:
+                # === WIN LOGIC ===
+                final_score = env.game.state.data.score
+                if play_as_red:
+                    is_win = 1 if final_score > 0 else 0
+                else:
+                    is_win = 1 if final_score < 0 else 0
+                batch_wins.append(is_win)
+                # =================
+
                 episode_returns.append(episode_return)
                 episode_return = 0
                 obs_dict, _ = env.reset()
@@ -531,11 +595,18 @@ def train():
                 ent_l.append(ent.mean().item())
                 clip_l.append(((ratio - 1).abs() > CLIP_EPS).float().mean().item())
 
-        # Update opponent pool
+        # Update opponent pool every 25 updates (as requested)
         if update % OPPONENT_UPDATE_FREQ == 0:
             opponent_pool.append(copy.deepcopy(agent.state_dict()))
         
-        # Evaluation
+        # Log Winrate
+        if len(batch_wins) > 0:
+            current_win_rate = np.mean(batch_wins)
+        else:
+            current_win_rate = log['train_winrate'][-1] if log['train_winrate'] else 0.0
+        log['train_winrate'].append(current_win_rate)
+
+        # Evaluation (MCTS Only)
         if update % EVAL_FREQ == 0:
             eval_ret, eval_std, eval_wr = evaluate_vs_bots(agent, EVAL_EPISODES)
             log['eval_return'].append(eval_ret)
@@ -559,8 +630,9 @@ def train():
         log['ent_coef'].append(ent_coef)
         
         side = "Red " if play_as_red else "Blue"
-        eval_str = f"| Eval: {log['eval_return'][-1]:6.1f} ({log['eval_winrate'][-1]*100:4.1f}%)" if update % EVAL_FREQ == 0 else ""
-        print(f"Upd {update:4d} [{side}|{opp_name:8s}] | "
+        eval_str = f"| Eval(MCTS): {log['eval_return'][-1]:6.1f} ({log['eval_winrate'][-1]*100:4.1f}%)" if update % EVAL_FREQ == 0 else ""
+        print(f"Upd {update:4d} [{side}|{opp_name:10s}] | "
+              f"Win: {current_win_rate*100:5.1f}% | "
               f"Rew: {mean_reward:7.1f} | "
               f"EpRet: {mean_ep_return:6.1f} | "
               f"Ent: {np.mean(ent_l):.3f} | "
@@ -580,12 +652,13 @@ def train():
     axes[0, 0].set_title('Rollout Reward')
     axes[0, 0].set_xlabel('Update')
     
-    axes[0, 1].plot(log['update'], log['ep_return'])
-    axes[0, 1].set_title('Episode Return (Training)')
+    axes[0, 1].plot(log['update'], log['train_winrate'], color='green', label='Train Win%')
+    axes[0, 1].set_title('Training Win Rate (vs Current Opp)')
+    axes[0, 1].set_ylabel('Win Rate (0-1)')
     axes[0, 1].set_xlabel('Update')
     
     axes[0, 2].plot(log['update'], log['eval_return'], label='Return')
-    axes[0, 2].set_title('Eval vs Random')
+    axes[0, 2].set_title('Eval vs MCTS')
     axes[0, 2].set_xlabel('Update')
     ax2 = axes[0, 2].twinx()
     ax2.plot(log['update'], [w*100 for w in log['eval_winrate']], 'r-', alpha=0.5, label='Win%')
@@ -622,7 +695,7 @@ def train():
     plt.close()
     
     print(f"\n{'='*60}")
-    print(f"Final eval: {log['eval_return'][-1]:.1f} return, {log['eval_winrate'][-1]*100:.1f}% winrate")
+    print(f"Final eval (MCTS): {log['eval_return'][-1]:.1f} return, {log['eval_winrate'][-1]*100:.1f}% winrate")
     print(f"{'='*60}")
 
 
