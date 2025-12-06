@@ -32,7 +32,7 @@ ENT_COEF_END = 0.002
 # Settings
 OPPONENT_POOL_SIZE = 100 
 OPPONENT_UPDATE_FREQ = 25 
-SHAPING_SCALE = 0.125
+SHAPING_SCALE = 0.15
 EVAL_FREQ = 50
 EVAL_EPISODES = 10
 
@@ -368,7 +368,7 @@ def train():
         # === NEW OPPONENT SELECTION STRATEGY ===
         # ==========================================
         
-        if update <= 200:
+        if update <= 250:
             # PHASE 1: BOOTSTRAPPING (100% Easy Bots)
             # "baselineteam or randomteam"
             use_bot_opponent = True
@@ -377,7 +377,7 @@ def train():
             env = env_bot
             env.reset(enemieName=opp_name)
             
-        elif update <= 400:
+        elif update <= 500:
             # PHASE 2: PATHFINDING (100% Medium Bots)
             # "AstarTeam, approxQTeam, randomTeam"
             use_bot_opponent = True
@@ -421,7 +421,7 @@ def train():
                 env.reset(enemieName=opp_name)
                 
             else:
-                # 10% HARD (MCTS)
+                # 10% hardest (MCTS)
                 use_bot_opponent = True
                 play_as_red = False
                 opp_name = HARD_TEAM
