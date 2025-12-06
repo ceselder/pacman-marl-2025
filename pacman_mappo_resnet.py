@@ -136,6 +136,7 @@ class MAPPOAgent(nn.Module):
             # If input is a list of tensors [Agent1, Agent2]
             merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
         else:
+            print("baa")
             # If input is already batched list (rare in rollout, common in logic)
             merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
         
