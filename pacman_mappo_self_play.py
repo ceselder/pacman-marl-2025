@@ -74,64 +74,40 @@ def compute_heuristic_shaping(obs_curr, obs_next):
     pos_next, carry_next = get_agent_state(obs_next)
     
     if pos_curr is None or pos_next is None:
+        print("erm")
+        return 0.0
+    
+    # Death detection (teleported)
+    dist_moved = abs(pos_curr[0] - pos_next[0]) + abs(pos_curr[1] - pos_next[1])
+    if dist_moved > 1.5:
+        return -0.5 - (0.25 * carry_curr)
+    
+    # Small anti-stopping nudge
+    if dist_moved < 0.1:
+        return -0.01
+    
+    # No shaping on eat/score - env handles these
+    if carry_next > carry_curr or (carry_curr > 0 and carry_next == 0):
         return 0.0
 
-    # 1. DETECT DEATH (Teleportation)
-    # If the agent moved more than 1 tile in one step, they died and respawned.
-    dist_moved = abs(pos_curr[0] - pos_next[0]) + abs(pos_curr[1] - pos_next[1])
-    
-    if dist_moved > 1.5: #if died
-        base_penalty = -1.0
-        
-        # dying with food even worse
-        cargo_penalty = -1.0 * carry_curr
-        
-        return base_penalty + cargo_penalty
-    
-    if dist_moved < 0.1:
-        # we stopped, this is not good, because local minima
-        return -0.025 #tiny nudge
-
-    # Get map info for standard navigation
-    width = obs_curr.shape[-1]
-    boundary_x = width // 2 
-
-    # 2. STATE: CARRYING FOOD (Goal: Run Home)
+    # Carrying: move toward home
     if carry_curr > 0:
         dist_curr = pos_curr[1]
         dist_next = pos_next[1]
-
-        # Check for Scoring (Carrying dropped to 0, but we didn't die)
-        if carry_next == 0:
-            if dist_next < boundary_x + 2:
-                # HUGE Reward for successfully capping. 
-                # Connects the dots between "moving left" and "score goes up".
-                return (dist_curr) * (2.0 + carry_curr)
-            else:
-                return 0.0
-
-        diff = dist_curr - dist_next 
-
-        multiplier = 1.0 + (carry_curr / 2) #want to get to base really badly depending on how much carrying
-        
-        return diff * multiplier
-
-    # 3. STATE: HUNTING (Goal: Find Food)
-    else:
-        food_ch = obs_curr[7] 
-        food_locs = (food_ch > 0).nonzero(as_tuple=False).float()
-        
-        if len(food_locs) == 0:
-            return 0.0
-            
-        curr_p = torch.tensor(pos_curr).float()
-        next_p = torch.tensor(pos_next).float()
-        
-        d_c = (food_locs - curr_p).abs().sum(dim=1).min().item()
-        d_n = (food_locs - next_p).abs().sum(dim=1).min().item()
-        
-        # Small reward for getting closer to food
-        return (d_c - d_n) * 0.5
+        return dist_curr - dist_next
+    
+    # Hunting: move toward food
+    food_ch = obs_curr[7]
+    food_locs = (food_ch > 0).nonzero(as_tuple=False).float()
+    if len(food_locs) == 0:
+        return 0.0
+    
+    curr_p = torch.tensor(pos_curr).float()
+    next_p = torch.tensor(pos_next).float()
+    d_curr = (food_locs - curr_p).abs().sum(dim=1).min().item()
+    d_next = (food_locs - next_p).abs().sum(dim=1).min().item()
+    
+    return d_curr - d_next
 
 
 def merge_obs_for_critic(obs_list):
@@ -316,6 +292,9 @@ def train():
     
     agent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
     optimizer = torch.optim.Adam(agent.parameters(), lr=LR, eps=1e-5)
+
+    state_dict = torch.load("mappo_800.pt", map_location=device)
+    agent.load_state_dict(state_dict)
     
     opponent_pool = deque(maxlen=OPPONENT_POOL_SIZE)
     opponent_pool.append(copy.deepcopy(agent.state_dict()))
