@@ -21,27 +21,34 @@ CLIP_EPS = 0.15
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
-TOTAL_UPDATES = 1000
+TOTAL_UPDATES = 1200
 
 # Annealed hyperparameters
 LR_START = 2e-4
 LR_END = 7e-5
-ENT_COEF_START = 0.08
+ENT_COEF_START = 0.01
 ENT_COEF_END = 0.002
 
 # Settings
-OPPONENT_POOL_SIZE = 100 # Increased to hold more history
-OPPONENT_UPDATE_FREQ = 25 # Spaced 25 apart as requested
+OPPONENT_POOL_SIZE = 100 
+OPPONENT_UPDATE_FREQ = 25 
 SHAPING_SCALE = 0.15
 EVAL_FREQ = 50
 EVAL_EPISODES = 10
 
-# Bot Groups
+# === CURRICULUM TEAMS ===
+# Phase 1 Teams (Easy/Basics)
+PHASE1_TEAMS = ['baselineTeam', 'randomTeam']
+
+# Phase 2 Teams (Medium/Pathfinding)
+PHASE2_TEAMS = ['AstarTeam', 'approxQTeam', 'randomTeam']
+
+# Phase 3 Mixed
 SANITY_TEAMS = ['AstarTeam', 'approxQTeam', 'randomTeam']
 HARD_TEAM = 'MCTSTeam'
 
 # Checkpoint
-LOAD_CHECKPOINT = "mappo_resnet_200.pt"
+LOAD_CHECKPOINT = None
 
 
 class ResidualBlock(nn.Module):
@@ -70,7 +77,7 @@ class MAPPOAgent(nn.Module):
         super().__init__()
         self.obs_shape = obs_shape
         
-        C = 24 #couldn't decide on 16 or 32, bleh
+        C = 32 #couldn't decide on 16 or 32, bleh
         
         self.network = nn.Sequential(
             nn.Conv2d(obs_shape[0], C, kernel_size=3, padding=1, stride=1),
@@ -357,49 +364,69 @@ def train():
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
         
-        # === OPPONENT SELECTION STRATEGY ===
-        # 55% Self (Current), 20% Self (Old), 10% Sanity Bots, 15% MCTS
-        rand_val = np.random.rand()
+        # ==========================================
+        # === NEW OPPONENT SELECTION STRATEGY ===
+        # ==========================================
         
-        if rand_val < 0.55:
-            # 55% Self-Play (Current Version)
-            use_bot_opponent = False
-            play_as_red = np.random.rand() > 0.5 # Randomize side in self-play
-            opp_name = "Self(Curr)"
-            env = env_selfplay
-            
-            opponent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
-            # Load current weights
-            opponent.load_state_dict(agent.state_dict())
-            opponent.eval()
-            
-        elif rand_val < 0.75:
-            # 20% Self-Play (Old Version)
-            use_bot_opponent = False
-            play_as_red = np.random.rand() > 0.5
-            opp_name = "Self(Old)"
-            env = env_selfplay
-            
-            opponent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
-            # Pick random from pool
-            opponent.load_state_dict(opponent_pool[np.random.randint(len(opponent_pool))])
-            opponent.eval()
-            
-        elif rand_val < 0.85:
-            # 10% Sanity Check (Astar, ApproxQ, Random) - NO Baseline
+        if update <= 200:
+            # PHASE 1: BOOTSTRAPPING (100% Easy Bots)
+            # "baselineteam or randomteam"
             use_bot_opponent = True
-            play_as_red = False # Usually bots are Red
-            opp_name = np.random.choice(SANITY_TEAMS)
+            play_as_red = False
+            opp_name = np.random.choice(PHASE1_TEAMS)
+            env = env_bot
+            env.reset(enemieName=opp_name)
+            
+        elif update <= 400:
+            # PHASE 2: PATHFINDING (100% Medium Bots)
+            # "AstarTeam, approxQTeam, randomTeam"
+            use_bot_opponent = True
+            play_as_red = False
+            opp_name = np.random.choice(PHASE2_TEAMS)
             env = env_bot
             env.reset(enemieName=opp_name)
             
         else:
-            # 15% MCTSTeam
-            use_bot_opponent = True
-            play_as_red = False
-            opp_name = HARD_TEAM
-            env = env_bot
-            env.reset(enemieName=opp_name)
+            # PHASE 3: MIXED REGIME
+            rand_val = np.random.rand()
+            
+            if rand_val < 0.60:
+                # 60% Self-Play (Current Version)
+                use_bot_opponent = False
+                play_as_red = np.random.rand() > 0.5 
+                opp_name = "Self(Curr)"
+                env = env_selfplay
+                
+                opponent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
+                opponent.load_state_dict(agent.state_dict())
+                opponent.eval()
+                
+            elif rand_val < 0.80:
+                # 20% Self-Play (Old Version)
+                use_bot_opponent = False
+                play_as_red = np.random.rand() > 0.5
+                opp_name = "Self(Old)"
+                env = env_selfplay
+                
+                opponent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
+                opponent.load_state_dict(opponent_pool[np.random.randint(len(opponent_pool))])
+                opponent.eval()
+                
+            elif rand_val < 0.90:
+                # 10% Sanity Check
+                use_bot_opponent = True
+                play_as_red = False
+                opp_name = np.random.choice(SANITY_TEAMS)
+                env = env_bot
+                env.reset(enemieName=opp_name)
+                
+            else:
+                # 10% HARD (MCTS)
+                use_bot_opponent = True
+                play_as_red = False
+                opp_name = HARD_TEAM
+                env = env_bot
+                env.reset(enemieName=opp_name)
         
         if play_as_red:
             learner_ids = [0, 2]
@@ -459,7 +486,6 @@ def train():
                 env_actions[env.agents[aid]] = canonicalize_action(actions[i], play_as_red).item()
             
             if use_bot_opponent:
-                # Bot opponent: env handles their actions, but we need to provide something
                 pass 
             else:
                 # Self-play opponent
@@ -626,7 +652,6 @@ def train():
     axes[0, 0].set_title('Rollout Reward')
     axes[0, 0].set_xlabel('Update')
     
-    # --- CHANGED: Added Training Winrate Plot ---
     axes[0, 1].plot(log['update'], log['train_winrate'], color='green', label='Train Win%')
     axes[0, 1].set_title('Training Win Rate (vs Current Opp)')
     axes[0, 1].set_ylabel('Win Rate (0-1)')
