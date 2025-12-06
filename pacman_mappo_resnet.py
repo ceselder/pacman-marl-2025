@@ -26,8 +26,8 @@ TOTAL_UPDATES = 1000
 # Annealed hyperparameters
 LR_START = 2e-4
 LR_END = 7e-5
-ENT_COEF_START = 0.015
-ENT_COEF_END = 0.001
+ENT_COEF_START = 0.08
+ENT_COEF_END = 0.002
 
 # Settings
 OPPONENT_POOL_SIZE = 100 # Increased to hold more history
