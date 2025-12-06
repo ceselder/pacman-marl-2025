@@ -17,11 +17,11 @@ LR = 1.5e-4                 # Reduced
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.13           # Reduced from 0.2 for stability
-ENT_COEF = 0.005           # Higher entropy for exploration
+ENT_COEF = 0.01           # Higher entropy for exploration
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
-TOTAL_UPDATES = 800
+TOTAL_UPDATES = 500
 
 # Settings
 OPPONENT_POOL_SIZE = 5
@@ -84,7 +84,7 @@ def compute_heuristic_shaping(obs_curr, obs_next):
     
     # Small anti-stopping nudge
     if dist_moved < 0.1:
-        return -0.01
+        return -0.05
     
     # No shaping on eat/score - env handles these
     if carry_next > carry_curr or (carry_curr > 0 and carry_next == 0):
@@ -293,7 +293,7 @@ def train():
     agent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
     optimizer = torch.optim.Adam(agent.parameters(), lr=LR, eps=1e-5)
 
-    state_dict = torch.load("mappo_800.pt", map_location=device)
+    state_dict = torch.load("mappo_checkpoint.pt", map_location=device) #continue old training run
     agent.load_state_dict(state_dict)
     
     opponent_pool = deque(maxlen=OPPONENT_POOL_SIZE)
