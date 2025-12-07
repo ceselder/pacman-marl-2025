@@ -26,7 +26,7 @@ TOTAL_UPDATES = 1600
 # Annealed hyperparameters
 LR_START = 2e-4 #original 2e4
 LR_END = 6e-5
-ENT_COEF_START = 0.015 #reduce back if its just for 
+ENT_COEF_START = 0.012 #reduce back if its just for 
 ENT_COEF_END = 0.0025
 
 # Settings
@@ -110,6 +110,7 @@ class MAPPOAgent(nn.Module):
         )
         
         flat_dim = DIM * H * W
+        print(flat_dim)
         self.actor = nn.Sequential(nn.Flatten(), nn.Linear(flat_dim, action_dim))
         self.critic = nn.Sequential(nn.Flatten(), nn.Linear(flat_dim, 1))
         
