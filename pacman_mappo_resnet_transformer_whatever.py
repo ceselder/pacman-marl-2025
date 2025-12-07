@@ -24,10 +24,10 @@ UPDATE_EPOCHS = 4
 TOTAL_UPDATES = 1600
 
 # Annealed hyperparameters
-LR_START = 1.5e-4 #original 2e4
+LR_START = 3e-4 #original 2e4
 LR_END = 6e-5
-ENT_COEF_START = 0.012 #reduce back if its just for 
-ENT_COEF_END = 0.003
+ENT_COEF_START = 0.015 #reduce back if its just for 
+ENT_COEF_END = 0.0025
 
 # Settings
 OPPONENT_POOL_SIZE = 100 
@@ -54,179 +54,123 @@ START_UPDATES = 0
 
 BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
 
-
-class CoordinateInjection(nn.Module):
-    def __init__(self):
-        super().__init__()
-        # 20x20 grid coordinates
-        x = torch.linspace(-1, 1, 20)
-        y = torch.linspace(-1, 1, 20)
-        grid_y, grid_x = torch.meshgrid(y, x, indexing='ij')
-        self.register_buffer('grid_x', grid_x.unsqueeze(0).unsqueeze(0)) 
-        self.register_buffer('grid_y', grid_y.unsqueeze(0).unsqueeze(0))
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        coords_x = self.grid_x.expand(B, -1, -1, -1)
-        coords_y = self.grid_y.expand(B, -1, -1, -1)
-        return torch.cat([x, coords_x, coords_y], dim=1)
-
 class ResBlock(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, dim, use_attn=False, h=None, w=None):
         super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.gn1 = nn.GroupNorm(4, channels) 
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.gn2 = nn.GroupNorm(4, channels)
+        self.use_attn = use_attn
+        
+        self.conv = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, padding=1), nn.GroupNorm(4, dim), nn.GELU(),
+            nn.Conv2d(dim, dim, 3, padding=1), nn.GroupNorm(4, dim)
+        )
+        
+        if use_attn:
+            self.pos_embed = nn.Parameter(torch.randn(1, h * w, dim) * 0.02)
+            self.attn_norm = nn.LayerNorm(dim)
+            self.attn = nn.MultiheadAttention(dim, num_heads=4, batch_first=True)
+            self.mlp = nn.Sequential(
+                nn.LayerNorm(dim), nn.Linear(dim, 4*dim), nn.GELU(), nn.Linear(4*dim, dim)
+            )
+
         self.act = nn.GELU()
 
     def forward(self, x):
-        residual = x
-        out = self.act(self.gn1(self.conv1(x)))
-        out = self.gn2(self.conv2(out))
-        out += residual
-        return self.act(out)
-
-class SpatialSelfAttention(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.norm = nn.LayerNorm(channels)
-        # 4 heads means each head has 32/4 = 8 dim. Good balance for this size.
-        self.attn = nn.MultiheadAttention(embed_dim=channels, num_heads=4, batch_first=True)
-        self.pos_embed = nn.Parameter(torch.zeros(1, 400, channels)) # 20x20=400
-        nn.init.normal_(self.pos_embed, std=0.02)
+        x = self.act(x + self.conv(x))
         
-        self.norm2 = nn.LayerNorm(channels)
-        self.mlp = nn.Sequential(
-            nn.Linear(channels, channels * 4),
-            nn.GELU(),
-            nn.Linear(channels * 4, channels)
-        )
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        # Flatten: (B, C, H, W) -> (B, H*W, C)
-        flat = x.flatten(2).transpose(1, 2)
-        
-        # Add position info (crucial since attention is permutation invariant)
-        x_in = self.norm(flat + self.pos_embed)
-        
-        # Attention with residual
-        attn_out, _ = self.attn(x_in, x_in, x_in)
-        x_attn = flat + attn_out
-        
-        # MLP with residual
-        x_mlp = self.mlp(self.norm2(x_attn))
-        out = x_attn + x_mlp
-        
-        # Reshape back to grid: (B, H*W, C) -> (B, C, H, W)
-        return out.transpose(1, 2).reshape(B, C, H, W)
+        if self.use_attn:
+            B, C, H, W = x.shape
+            flat = x.flatten(2).transpose(1, 2)
+            
+            resid = flat
+            flat = flat + self.pos_embed
+            qkv = self.attn_norm(flat)
+            attn_out, _ = self.attn(qkv, qkv, qkv)
+            flat = resid + attn_out
+            
+            flat = flat + self.mlp(flat)
+            x = flat.transpose(1, 2).reshape(B, C, H, W)
+            
+        return x
 
 class MAPPOAgent(nn.Module):
     def __init__(self, obs_shape, action_dim, num_agents=2):
         super().__init__()
-        self.obs_shape = obs_shape
+        C_in, H, W = obs_shape
+        DIM = 32
         
-        C_DIM = 32  # Kept small as requested
-        
-        # 1. Input Processing (Inject Coords so Conv knows where it is)
-        self.coord_inject = CoordinateInjection()
-        input_ch = obs_shape[0] + 2 # +2 for x,y
-        
-        # 2. Local Feature Extraction (CNN)
-        self.network = nn.Sequential(
-            nn.Conv2d(input_ch, C_DIM, kernel_size=3, padding=1),
-            nn.GELU(),
-            ResBlock(C_DIM),
-            ResBlock(C_DIM),
-            ResBlock(C_DIM),
+        self.input_net = nn.Sequential(
+            nn.Conv2d(C_in + 2, DIM, kernel_size=3, padding=1),
+            nn.GELU()
         )
         
-        # 3. Global Reasoning (Attention)
-        self.global_attn = nn.Sequential(
-            SpatialSelfAttention(C_DIM),
-            SpatialSelfAttention(C_DIM)
+        self.backbone = nn.Sequential(
+            ResBlock(DIM, use_attn=False),
+            ResBlock(DIM, use_attn=False),
+            ResBlock(DIM, use_attn=True, h=H, w=W) 
         )
         
-        # 4. Policy/Value Heads
-        flat_dim = C_DIM * 20 * 20 # 32 * 400 = 12,800
-        hidden_dim = 512
-
-        self.actor = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(flat_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, action_dim)
-        )
-
-        self.critic = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(flat_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1)
-        )
+        flat_dim = DIM * H * W
+        self.actor = nn.Sequential(nn.Flatten(), nn.Linear(flat_dim, action_dim))
+        self.critic = nn.Sequential(nn.Flatten(), nn.Linear(flat_dim, 1))
         
         self.apply(self._init_weights)
-        
-        # Standard Orthogonal Init
-        nn.init.orthogonal_(self.actor[-1].weight, gain=0.01)
-        nn.init.constant_(self.actor[-1].bias, 0.0)
-        nn.init.orthogonal_(self.critic[-1].weight, gain=1.0)
-        nn.init.constant_(self.critic[-1].bias, 0.0)
 
-    def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Conv2d)):
-            nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
-            if module.bias is not None:
-                module.bias.data.fill_(0.0)
-    
-    def _forward_features(self, obs):
-        x = self.coord_inject(obs)
-        x = self.network(x)      # Local
-        x = self.global_attn(x)  # Global
+    def _init_weights(self, m):
+        if isinstance(m, (nn.Linear, nn.Conv2d)):
+            nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+            if m.bias is not None: m.bias.data.fill_(0.0)
+        
+        # Zero-Init for residual branches to ensure stable start
+        if isinstance(m, ResBlock):
+            nn.init.constant_(m.conv[-1].weight, 0)
+            if m.use_attn:
+                nn.init.constant_(m.mlp[-1].weight, 0)
+
+    def _add_coords(self, x):
+        B, _, H, W = x.shape
+        y_grid = torch.linspace(-1, 1, H, device=x.device).view(1, 1, H, 1).expand(B, -1, -1, W)
+        x_grid = torch.linspace(-1, 1, W, device=x.device).view(1, 1, 1, W).expand(B, -1, H, -1)
+        return torch.cat([x, y_grid, x_grid], dim=1)
+
+    def forward_features(self, x):
+        x = self._add_coords(x)
+        x = self.input_net(x)
+        x = self.backbone(x)
         return x
 
     def get_action_and_value(self, obs, all_obs_list):
-        h = self._forward_features(obs)
+        h = self.forward_features(obs)
         logits = self.actor(h)
         dist = Categorical(logits=logits)
         action = dist.sample()
-        log_prob = dist.log_prob(action)
         
-        # Centralized Critic
-        merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
-        critic_feat = self._forward_features(merged.to(obs.device))
-        value = self.critic(critic_feat).squeeze(-1)
+        merged = all_obs_list[0].clone()
+        for o in all_obs_list[1:]: merged = torch.maximum(merged, o)
         
-        return action, log_prob, value, dist.entropy()
+        h_critic = self.forward_features(merged.unsqueeze(0) if merged.dim()==3 else merged)
+        value = self.critic(h_critic).squeeze(-1)
+        
+        return action, dist.log_prob(action), value, dist.entropy()
 
     def get_value(self, all_obs_list):
-        if all_obs_list[0].dim() == 4:
-            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
-        else:
-            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
-        
-        critic_feat = self._forward_features(merged.to(all_obs_list[0].device))
-        return self.critic(critic_feat).squeeze(-1)
+        merged = all_obs_list[0].clone()
+        for o in all_obs_list[1:]: merged = torch.maximum(merged, o)
+        h = self.forward_features(merged.unsqueeze(0) if merged.dim()==3 else merged)
+        return self.critic(h).squeeze(-1)
 
-    def evaluate(self, obs, merged_obs, action, num_agents, obs_shape):
-        h = self._forward_features(obs)
+    def evaluate(self, obs, merged_obs, action, *args):
+        h = self.forward_features(obs)
         logits = self.actor(h)
         dist = Categorical(logits=logits)
-        log_prob = dist.log_prob(action)
-        entropy = dist.entropy()
         
-        critic_feat = self._forward_features(merged_obs)
-        value = self.critic(critic_feat).squeeze(-1)
-        return value, log_prob, entropy
+        h_critic = self.forward_features(merged_obs)
+        value = self.critic(h_critic).squeeze(-1)
+        
+        return value, dist.log_prob(action), dist.entropy()
     
     def get_deterministic_action(self, obs):
         with torch.no_grad():
-            h = self._forward_features(obs)
-            logits = self.actor(h)
-            return logits.argmax(dim=-1)
+            return self.actor(self.forward_features(obs)).argmax(dim=-1)
 
 
 def canonicalize_obs(obs, is_red_agent):
