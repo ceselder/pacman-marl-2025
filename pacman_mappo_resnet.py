@@ -382,11 +382,11 @@ def train():
             env = env_bot
             env.reset(enemieName=opp_name)
             
-        elif update <= 400:
+        elif update <= 300:
 
             use_bot_opponent = True
             play_as_red = False
-            opp_name = np.random.choice(EASY_TEAMS + MEDIUM_TEAMS + (HARD_TEAMS * 3)) #overrepresent hard teams
+            opp_name = np.random.choice(EASY_TEAMS + MEDIUM_TEAMS + (HARD_TEAMS * 5)) #overrepresent hard teams
             env = env_bot
             env.reset(enemieName=opp_name)
             
