@@ -50,7 +50,7 @@ HARD_TEAMS = ['AstarTeam', 'approxQTeam']
 
 # Checkpoint
 LOAD_CHECKPOINT = "mappo_resnet_checkpoint.pt"
-START_UPDATES = 600
+START_UPDATES = 0
 
 BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
 
