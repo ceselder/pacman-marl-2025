@@ -409,7 +409,7 @@ def train():
             # PHASE 3: MIXED REGIME
             rand_val = np.random.rand()
             
-            if rand_val < 0.50:
+            if rand_val < 0.40:
                 # 40% Self-Play (Current Version)
                 use_bot_opponent = False
                 play_as_red = np.random.rand() > 0.5 
@@ -420,7 +420,7 @@ def train():
                 opponent.load_state_dict(agent.state_dict())
                 opponent.eval()
                 
-            elif rand_val < 0.70:
+            elif rand_val < 0.60:
                 # 20% Self-Play (Old Version)
                 use_bot_opponent = False
                 play_as_red = np.random.rand() > 0.5
