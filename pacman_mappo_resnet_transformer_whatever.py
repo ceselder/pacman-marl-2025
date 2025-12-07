@@ -21,12 +21,12 @@ CLIP_EPS = 0.15
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
-TOTAL_UPDATES = 800
+TOTAL_UPDATES = 1600
 
 # Annealed hyperparameters
 LR_START = 1.5e-4 #original 2e4
 LR_END = 7e-5
-ENT_COEF_START = 0.01 #reduce back if its just for 
+ENT_COEF_START = 0.012 #reduce back if its just for 
 ENT_COEF_END = 0.003
 
 # Settings
@@ -436,7 +436,7 @@ def train():
         # === NEW OPPONENT SELECTION STRATEGY ===
         # ==========================================
         
-        if update <= 0: #skip this part since checkpoint training run
+        if update <= 300: #skip this part since checkpoint training run
             # PHASE 1: BOOTSTRAPPING (100% Easy Bots)
             # "baselineteam or randomteam"
             use_bot_opponent = True
@@ -445,7 +445,7 @@ def train():
             env = env_bot
             env.reset(enemieName=opp_name)
             
-        elif update <= 400:
+        elif update <= 600:
 
             use_bot_opponent = True
             play_as_red = False
