@@ -27,29 +27,32 @@ TOTAL_UPDATES = 1500
 LR_START = 2e-4
 LR_END = 7e-5
 ENT_COEF_START = 0.015
-ENT_COEF_END = 0.002
+ENT_COEF_END = 0.003
 
 # Settings
 OPPONENT_POOL_SIZE = 100 
 OPPONENT_UPDATE_FREQ = 25 
-SHAPING_SCALE = 0.15
+SHAPING_SCALE = 0.1
 EVAL_FREQ = 50
 EVAL_EPISODES = 10
 
 # === CURRICULUM TEAMS ===
-# Phase 1 Teams (Easy/Basics)
-PHASE1_TEAMS = ['baselineTeam', 'randomTeam']
+# Phase 1 Teams (Easy/Basics), learn game on these
+EASY_TEAMS = ['baselineTeam', 'randomTeam']
 
-# Phase 2 Teams (Medium/Pathfinding)
-PHASE2_TEAMS = ['AstarTeam', 'approxQTeam', 'randomTeam']
+# === CURRICULUM TEAMS ===
+# Phase 2 Teams (Medium), train until beat all of them, then have them show up way less
+# just isolate MCTS because its expensive to train on
+MEDIUM_TEAMS = ['MCTSTeam']
 
-# Phase 3 Mixed
-SANITY_TEAMS = ['AstarTeam', 'approxQTeam', 'randomTeam']
-HARD_TEAM = 'MCTSTeam'
+# Phase 3 Teams (Hardest), hardest to beat, train on these + self play
+HARD_TEAMS = ['AstarTeam', 'approxQTeam']
 
 # Checkpoint
-LOAD_CHECKPOINT = None
+LOAD_CHECKPOINT = "mappo_resnet_checkpoint.pt"
+START_UPDATES = 600
 
+BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
 
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
@@ -202,24 +205,25 @@ def get_agent_state(obs_canon):
 def compute_heuristic_shaping(obs_curr, obs_next):
     pos_curr, carry_curr = get_agent_state(obs_curr)
     pos_next, carry_next = get_agent_state(obs_next)
+
+    living_punishment = -0.1 #if u just punish it for being alive this apparently leads to good things, lets try
+    #this ends up being 0.01 remember
     
-    if pos_curr is None or pos_next is None:
-        return 0.0
     
     if carry_next > carry_curr or (carry_curr > 0 and carry_next == 0):
-        return 0.0
+        return living_punishment + 0.0
 
     dist_moved = abs(pos_curr[0] - pos_next[0]) + abs(pos_curr[1] - pos_next[1])
     if dist_moved > 1.5:
-        return -0.5 - (0.25 * carry_curr)
+        return living_punishment - 0.5 - (0.25 * carry_curr)
     
     if dist_moved < 0.1:
-        return -0.05
+        return living_punishment - 0.075 
     
     if carry_curr > 0:
         dist_curr = pos_curr[1]
         dist_next = pos_next[1]
-        return (dist_curr - dist_next) * (1 + (0.1 * carry_curr)) 
+        return living_punishment - ((dist_curr - dist_next) * (0.8 + (0.1 * carry_curr)))
 
     food_ch = obs_curr[7]
     food_locs = (food_ch > 0).nonzero(as_tuple=False).float()
@@ -230,7 +234,7 @@ def compute_heuristic_shaping(obs_curr, obs_next):
     dist_curr = (food_locs - curr_p).abs().sum(dim=1).min().item()
     dist_next = (food_locs - next_p).abs().sum(dim=1).min().item()
 
-    return dist_curr - dist_next
+    return living_punishment - (dist_curr - dist_next)
 
 
 def merge_obs_for_critic(obs_list):
@@ -266,9 +270,10 @@ def evaluate_vs_bots(agent, num_episodes=20):
     wins = 0
     
     learner_ids = [1, 3] # Playing as Blue
-    opp_name = HARD_TEAM # MCTSTeam
     
     for _ in range(num_episodes):
+
+        opp_name = BENCH_TEAMS[num_episodes % len(BENCH_TEAMS)]
         
         eval_env = gymPacMan_parallel_env(
             layout_file='layouts/bloxCapture.lay',
@@ -355,7 +360,7 @@ def train():
         'lr': [], 'ent_coef': []
     }
     
-    for update in range(1, TOTAL_UPDATES + 1):
+    for update in range(START_UPDATES, TOTAL_UPDATES + 1):
         # === ANNEAL HYPERPARAMETERS ===
         progress = update / TOTAL_UPDATES
         lr = LR_START - (LR_START - LR_END) * progress
@@ -368,21 +373,20 @@ def train():
         # === NEW OPPONENT SELECTION STRATEGY ===
         # ==========================================
         
-        if update <= 250:
+        if update <= 0: #skip this part since checkpoint training run
             # PHASE 1: BOOTSTRAPPING (100% Easy Bots)
             # "baselineteam or randomteam"
             use_bot_opponent = True
             play_as_red = False
-            opp_name = np.random.choice(PHASE1_TEAMS)
+            opp_name = np.random.choice(EASY_TEAMS)
             env = env_bot
             env.reset(enemieName=opp_name)
             
         elif update <= 500:
-            # PHASE 2: PATHFINDING (100% Medium Bots)
-            # "AstarTeam, approxQTeam, randomTeam"
+
             use_bot_opponent = True
             play_as_red = False
-            opp_name = np.random.choice(PHASE2_TEAMS)
+            opp_name = np.random.choice(EASY_TEAMS + MEDIUM_TEAMS + (HARD_TEAMS * 5)) #overrepresent hard teams for now, just for training
             env = env_bot
             env.reset(enemieName=opp_name)
             
@@ -390,8 +394,8 @@ def train():
             # PHASE 3: MIXED REGIME
             rand_val = np.random.rand()
             
-            if rand_val < 0.60:
-                # 60% Self-Play (Current Version)
+            if rand_val < 0.50:
+                # 40% Self-Play (Current Version)
                 use_bot_opponent = False
                 play_as_red = np.random.rand() > 0.5 
                 opp_name = "Self(Curr)"
@@ -401,7 +405,7 @@ def train():
                 opponent.load_state_dict(agent.state_dict())
                 opponent.eval()
                 
-            elif rand_val < 0.80:
+            elif rand_val < 70:
                 # 20% Self-Play (Old Version)
                 use_bot_opponent = False
                 play_as_red = np.random.rand() > 0.5
@@ -412,19 +416,12 @@ def train():
                 opponent.load_state_dict(opponent_pool[np.random.randint(len(opponent_pool))])
                 opponent.eval()
                 
-            elif rand_val < 0.90:
-                # 10% Sanity Check
-                use_bot_opponent = True
-                play_as_red = False
-                opp_name = np.random.choice(SANITY_TEAMS)
-                env = env_bot
-                env.reset(enemieName=opp_name)
-                
             else:
-                # 10% hardest (MCTS)
+                # 30% face against a hard team weighted towards hard team
                 use_bot_opponent = True
                 play_as_red = False
-                opp_name = HARD_TEAM
+                #make hard teams very overrepresented
+                opp_name = np.random.choice((HARD_TEAMS * 5) + MEDIUM_TEAMS + EASY_TEAMS)
                 env = env_bot
                 env.reset(enemieName=opp_name)
         
