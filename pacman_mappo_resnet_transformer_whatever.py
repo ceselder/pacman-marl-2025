@@ -634,7 +634,7 @@ def train():
         log['ent_coef'].append(ent_coef)
         
         side = "Red " if play_as_red else "Blue"
-        eval_str = f"| Eval(MCTS): {log['eval_return'][-1]:6.1f} ({log['eval_winrate'][-1]*100:4.1f}%)" if update % EVAL_FREQ == 0 else ""
+        eval_str = f"| Eval: {log['eval_return'][-1]:6.1f} ({log['eval_winrate'][-1]*100:4.1f}%)" if update % EVAL_FREQ == 0 else ""
         print(f"Upd {update:4d} [{side}|{opp_name:10s}] | "
               f"Win: {current_win_rate*100:5.1f}% | "
               f"Rew: {mean_reward:7.1f} | "
