@@ -175,12 +175,11 @@ class gymPacMan_parallel_env:
 
         # Win/lose bonus - only on game end!
         if any(terminations.values()):
-            print(f"end score {self.game.state.data.score}")
             final_score = self.game.state.data.score
             if final_score < 0:
-                blue_reward += 15.0 + (1/10) * abs(final_score)
+                blue_reward += 15.0 + (1/20) * abs(final_score)
             elif final_score > 0:
-                red_reward += 15.0 + (1/10) * abs(final_score)
+                red_reward += 15.0 + (1/20) * abs(final_score)
 
         for agentIndex in range(len(self.agents)):
             if agentIndex in [0,2]:
