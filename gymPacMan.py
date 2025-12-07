@@ -175,6 +175,7 @@ class gymPacMan_parallel_env:
 
         # Win/lose bonus - only on game end!
         if any(terminations.values()):
+            print(f"end score {self.game.state.data.score}")
             final_score = self.game.state.data.score
             if final_score > 0:
                 blue_reward += 10.0 + (1/10) * abs(final_score)
