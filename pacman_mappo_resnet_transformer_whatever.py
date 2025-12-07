@@ -24,14 +24,14 @@ UPDATE_EPOCHS = 4
 TOTAL_UPDATES = 1600
 
 # Annealed hyperparameters
-LR_START = 3e-4 #original 2e4
+LR_START = 2e-4 #original 2e4
 LR_END = 6e-5
 ENT_COEF_START = 0.015 #reduce back if its just for 
 ENT_COEF_END = 0.0025
 
 # Settings
 OPPONENT_POOL_SIZE = 100 
-OPPONENT_UPDATE_FREQ = 10 
+OPPONENT_UPDATE_FREQ = 15 
 SHAPING_SCALE = 0.1
 EVAL_FREQ = 50
 EVAL_EPISODES = 10
@@ -271,7 +271,6 @@ def compute_gae(rewards, values, dones, last_value, gamma):
 
 
 def evaluate_vs_bots(agent, num_episodes=20):
-    """Evaluate agent ONLY against MCTSTeam as requested."""
     agent.eval()
     returns = []
     wins = 0
@@ -610,8 +609,7 @@ def train():
             current_win_rate = log['train_winrate'][-1] if log['train_winrate'] else 0.0
         log['train_winrate'].append(current_win_rate)
 
-        # Evaluation (MCTS Only)
-        if update % EVAL_FREQ == 0:
+        if update > 10 and update % EVAL_FREQ == 0:
             eval_ret, eval_std, eval_wr = evaluate_vs_bots(agent, EVAL_EPISODES)
             log['eval_return'].append(eval_ret)
             log['eval_winrate'].append(eval_wr)
@@ -699,7 +697,7 @@ def train():
     plt.close()
     
     print(f"\n{'='*60}")
-    print(f"Final eval (MCTS): {log['eval_return'][-1]:.1f} return, {log['eval_winrate'][-1]*100:.1f}% winrate")
+    print(f"Final eval : {log['eval_return'][-1]:.1f} return, {log['eval_winrate'][-1]*100:.1f}% winrate")
     print(f"{'='*60}")
 
 
