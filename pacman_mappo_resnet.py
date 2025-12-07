@@ -49,7 +49,7 @@ MEDIUM_TEAMS = ['MCTSTeam']
 HARD_TEAMS = ['AstarTeam', 'approxQTeam']
 
 # Checkpoint
-LOAD_CHECKPOINT = "mappo_resnet_checkpoint.pt"
+LOAD_CHECKPOINT = "mappo_resnet_final.pt"
 START_UPDATES = 0
 
 BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
