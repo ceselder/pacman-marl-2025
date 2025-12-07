@@ -25,7 +25,7 @@ TOTAL_UPDATES = 1600
 
 # Annealed hyperparameters
 LR_START = 1.5e-4 #original 2e4
-LR_END = 7e-5
+LR_END = 6e-5
 ENT_COEF_START = 0.012 #reduce back if its just for 
 ENT_COEF_END = 0.003
 
