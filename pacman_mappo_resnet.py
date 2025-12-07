@@ -21,17 +21,17 @@ CLIP_EPS = 0.15
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
-TOTAL_UPDATES = 1500
+TOTAL_UPDATES = 800
 
 # Annealed hyperparameters
-LR_START = 2e-4
+LR_START = 1.5e-4 #original 2e4
 LR_END = 7e-5
-ENT_COEF_START = 0.015
+ENT_COEF_START = 0.01 #reduce back if its just for 
 ENT_COEF_END = 0.003
 
 # Settings
 OPPONENT_POOL_SIZE = 100 
-OPPONENT_UPDATE_FREQ = 25 
+OPPONENT_UPDATE_FREQ = 20 
 SHAPING_SCALE = 0.1
 EVAL_FREQ = 50
 EVAL_EPISODES = 10
@@ -382,11 +382,11 @@ def train():
             env = env_bot
             env.reset(enemieName=opp_name)
             
-        elif update <= 500:
+        elif update <= 400:
 
             use_bot_opponent = True
             play_as_red = False
-            opp_name = np.random.choice(EASY_TEAMS + MEDIUM_TEAMS + (HARD_TEAMS * 5)) #overrepresent hard teams for now, just for training
+            opp_name = np.random.choice(EASY_TEAMS + MEDIUM_TEAMS + (HARD_TEAMS * 3)) #overrepresent hard teams
             env = env_bot
             env.reset(enemieName=opp_name)
             
@@ -405,7 +405,7 @@ def train():
                 opponent.load_state_dict(agent.state_dict())
                 opponent.eval()
                 
-            elif rand_val < 70:
+            elif rand_val < 0.70:
                 # 20% Self-Play (Old Version)
                 use_bot_opponent = False
                 play_as_red = np.random.rand() > 0.5
