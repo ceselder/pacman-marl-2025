@@ -271,9 +271,9 @@ def evaluate_vs_bots(agent, num_episodes=20):
     
     learner_ids = [1, 3] # Playing as Blue
     
-    for _ in range(num_episodes):
+    for i in range(num_episodes):
 
-        opp_name = BENCH_TEAMS[num_episodes % len(BENCH_TEAMS)]
+        opp_name = BENCH_TEAMS[i % len(BENCH_TEAMS)]
         
         eval_env = gymPacMan_parallel_env(
             layout_file='layouts/bloxCapture.lay',
