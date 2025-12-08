@@ -40,10 +40,10 @@ EVAL_EPISODES = 10
 EASY_TEAMS = ['randomTeam']
 
 # Isolating this one because it takes ages to train on
-MEDIUM_TEAMS = ['MCTSTeam']
+MEDIUM_TEAMS = ['MCTSTeam', 'heuristicTeam']
 
 # Phase 3 Teams (Hardest), hardest to beat, train on these + self play
-HARD_TEAMS = ['AstarTeam', 'approxQTeam']
+HARD_TEAMS = ['baselineTeam', 'AstarTeam', 'approxQTeam']
 
 # Checkpoint
 LOAD_CHECKPOINT = None
@@ -376,7 +376,7 @@ def train():
             env = env_bot
             env.reset(enemieName=opp_name)
             
-        elif update <= 1200:
+        elif update <= 1000:
 
             use_bot_opponent = True
             play_as_red = False
