@@ -21,13 +21,13 @@ CLIP_EPS = 0.15
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
-TOTAL_UPDATES = 800
+TOTAL_UPDATES = 2500
 
 # Annealed hyperparameters
-LR_START = 1.5e-4 #original 2e4
+LR_START = 2e-4 #original 2e4
 LR_END = 7e-5
-ENT_COEF_START = 0.01 #reduce back if its just for 
-ENT_COEF_END = 0.003
+ENT_COEF_START = 0.012 #reduce back if its just for 
+ENT_COEF_END = 0.002
 
 # Settings
 OPPONENT_POOL_SIZE = 100 
@@ -36,13 +36,10 @@ SHAPING_SCALE = 0.1
 EVAL_FREQ = 50
 EVAL_EPISODES = 10
 
-# === CURRICULUM TEAMS ===
-# Phase 1 Teams (Easy/Basics), learn game on these
-EASY_TEAMS = ['baselineTeam', 'randomTeam']
+# Phase 1, just learn against randoms, learn to get actual reward.
+EASY_TEAMS = ['randomTeam']
 
-# === CURRICULUM TEAMS ===
-# Phase 2 Teams (Medium), train until beat all of them, then have them show up way less
-# just isolate MCTS because its expensive to train on
+# Isolating this one because it takes ages to train on
 MEDIUM_TEAMS = ['MCTSTeam']
 
 # Phase 3 Teams (Hardest), hardest to beat, train on these + self play
@@ -209,32 +206,34 @@ def compute_heuristic_shaping(obs_curr, obs_next):
     living_punishment = -0.1 #if u just punish it for being alive this apparently leads to good things, lets try
     #this ends up being 0.01 remember
     
-    
-    if carry_next > carry_curr or (carry_curr > 0 and carry_next == 0):
-        return living_punishment + 0.0
+    #if carry_next > carry_curr or (carry_curr > 0 and carry_next == 0):
+    #    return living_punishment + 0.0
 
+    # dying is generally bad, especially if carrying stuff
     dist_moved = abs(pos_curr[0] - pos_next[0]) + abs(pos_curr[1] - pos_next[1])
     if dist_moved > 1.5:
         return living_punishment - 0.5 - (0.25 * carry_curr)
     
-    if dist_moved < 0.1:
+    if dist_moved < 0.1: #standing still is generally bad
         return living_punishment - 0.075 
+
+    return living_punishment
     
-    if carry_curr > 0:
-        dist_curr = pos_curr[1]
-        dist_next = pos_next[1]
-        return living_punishment - ((dist_curr - dist_next) * (0.8 + (0.1 * carry_curr)))
+    # if carry_curr > 0:
+    #     dist_curr = pos_curr[1]
+    #     dist_next = pos_next[1]
+    #     return living_punishment - ((dist_curr - dist_next) * (0.8 + (0.1 * carry_curr)))
 
-    food_ch = obs_curr[7]
-    food_locs = (food_ch > 0).nonzero(as_tuple=False).float()
-    if len(food_locs) == 0:
-        return 0.0
-    curr_p = torch.tensor(pos_curr).float()
-    next_p = torch.tensor(pos_next).float()
-    dist_curr = (food_locs - curr_p).abs().sum(dim=1).min().item()
-    dist_next = (food_locs - next_p).abs().sum(dim=1).min().item()
+    # food_ch = obs_curr[7]
+    # food_locs = (food_ch > 0).nonzero(as_tuple=False).float()
+    # if len(food_locs) == 0:
+    #     return 0.0
+    # curr_p = torch.tensor(pos_curr).float()
+    # next_p = torch.tensor(pos_next).float()
+    # dist_curr = (food_locs - curr_p).abs().sum(dim=1).min().item()
+    # dist_next = (food_locs - next_p).abs().sum(dim=1).min().item()
 
-    return living_punishment - (dist_curr - dist_next)
+    # return living_punishment - (dist_curr - dist_next)
 
 
 def merge_obs_for_critic(obs_list):
@@ -369,11 +368,7 @@ def train():
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
         
-        # ==========================================
-        # === NEW OPPONENT SELECTION STRATEGY ===
-        # ==========================================
-        
-        if update <= 0: #skip this part since checkpoint training run
+        if update <= 400: #skip this part since checkpoint training run
             # PHASE 1: BOOTSTRAPPING (100% Easy Bots)
             # "baselineteam or randomteam"
             use_bot_opponent = True
@@ -382,7 +377,7 @@ def train():
             env = env_bot
             env.reset(enemieName=opp_name)
             
-        elif update <= 300:
+        elif update <= 1000:
 
             use_bot_opponent = True
             play_as_red = False
@@ -637,7 +632,7 @@ def train():
               f"LR: {lr:.2e} "
               f"{eval_str}")
         
-        if update % 200 == 0:
+        if update % 250 == 0:
             torch.save(agent.state_dict(), f"mappo_resnet_{update}.pt")
 
     torch.save(agent.state_dict(), "mappo_resnet_final.pt")
