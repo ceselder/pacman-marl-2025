@@ -368,9 +368,8 @@ def train():
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
         
-        if update <= 400: #skip this part since checkpoint training run
-            # PHASE 1: BOOTSTRAPPING (100% Easy Bots)
-            # "baselineteam or randomteam"
+        if update <= 200: #skip this part since checkpoint training run
+            # teach it the game
             use_bot_opponent = True
             play_as_red = False
             opp_name = np.random.choice(EASY_TEAMS)
