@@ -46,7 +46,7 @@ MEDIUM_TEAMS = ['MCTSTeam']
 HARD_TEAMS = ['AstarTeam', 'approxQTeam']
 
 # Checkpoint
-LOAD_CHECKPOINT = "mappo_resnet_final.pt"
+LOAD_CHECKPOINT = None
 START_UPDATES = 0
 
 BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
@@ -599,7 +599,7 @@ def train():
         log['train_winrate'].append(current_win_rate)
 
         # Evaluation (MCTS Only)
-        if update % EVAL_FREQ == 0:
+        if update > 0 and update % EVAL_FREQ == 0:
             eval_ret, eval_std, eval_wr = evaluate_vs_bots(agent, EVAL_EPISODES)
             log['eval_return'].append(eval_ret)
             log['eval_winrate'].append(eval_wr)
