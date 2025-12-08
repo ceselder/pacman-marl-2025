@@ -126,10 +126,10 @@ class MAPPOAgent(nn.Module):
             actor_flat_dim = self.actor_backbone(dummy).shape[1]
 
         self.actor_head = nn.Sequential(
-            nn.Linear(actor_flat_dim, 512),
-            nn.LayerNorm(512),
+            nn.Linear(actor_flat_dim, 1024),
+            nn.LayerNorm(1024),
             nn.GELU(),
-            nn.Linear(512, action_dim)
+            nn.Linear(1024, action_dim)
         )
 
         self.d_model = 128
@@ -425,7 +425,7 @@ def train():
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
         
-        if update <= 0: #skip this part since checkpoint training run
+        if update <= 200: #skip this part since checkpoint training run
             # teach it the game
             use_bot_opponent = True
             play_as_red = False
@@ -433,7 +433,7 @@ def train():
             env = env_bot
             env.reset(enemieName=opp_name)
             
-        elif update <= 0:
+        elif update <= 500:
 
             use_bot_opponent = True
             play_as_red = False
