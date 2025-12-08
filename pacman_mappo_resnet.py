@@ -77,33 +77,39 @@ class MAPPOAgent(nn.Module):
         super().__init__()
         self.obs_shape = obs_shape
         
-        C = 32 #couldn't decide on 16 or 32, bleh
+        C = 32
         
-        self.network = nn.Sequential(
-            nn.Conv2d(obs_shape[0], C, kernel_size=3, padding=1, stride=1),
-            nn.GELU(),
-            
-            ResidualBlock(C),
-            ResidualBlock(C),
-            ResidualBlock(C),
-            
-            nn.Flatten()
-        )
+        # --- DEFINING THE BLOCKS ---
+        def make_backbone():
+            return nn.Sequential(
+                nn.Conv2d(obs_shape[0], C, kernel_size=3, padding=1, stride=1),
+                nn.GELU(),
+                ResidualBlock(C),
+                ResidualBlock(C),
+                ResidualBlock(C),
+                nn.Flatten()
+            )
+
+        # --- SEPARATE BACKBONES ---
+        self.actor_backbone = make_backbone()
+        self.critic_backbone = make_backbone()
         
+        # Calculate flat dim once
         with torch.no_grad():
             dummy = torch.zeros(1, *obs_shape)
-            flat_dim = self.network(dummy).shape[1]
+            flat_dim = self.actor_backbone(dummy).shape[1]
 
         hidden_dim = 512
 
-        self.actor = nn.Sequential(
+        # --- HEADS ---
+        self.actor_head = nn.Sequential(
             nn.Linear(flat_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, action_dim)
         )
 
-        self.critic = nn.Sequential(
+        self.critic_head = nn.Sequential(
             nn.Linear(flat_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
@@ -112,10 +118,11 @@ class MAPPOAgent(nn.Module):
         
         self.apply(self._init_weights)
         
-        nn.init.orthogonal_(self.actor[-1].weight, gain=0.01)
-        nn.init.constant_(self.actor[-1].bias, 0.0)
-        nn.init.orthogonal_(self.critic[-1].weight, gain=1.0)
-        nn.init.constant_(self.critic[-1].bias, 0.0)
+        # Orthogonal init for the final layers specifically
+        nn.init.orthogonal_(self.actor_head[-1].weight, gain=0.01)
+        nn.init.constant_(self.actor_head[-1].bias, 0.0)
+        nn.init.orthogonal_(self.critic_head[-1].weight, gain=1.0)
+        nn.init.constant_(self.critic_head[-1].bias, 0.0)
 
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Conv2d)):
@@ -124,15 +131,23 @@ class MAPPOAgent(nn.Module):
                 module.bias.data.fill_(0.0)
 
     def get_action_and_value(self, obs, all_obs_list):
-        h = self.network(obs)
-        logits = self.actor(h)
+        # 1. Actor path (uses actor_backbone)
+        h_actor = self.actor_backbone(obs)
+        logits = self.actor_head(h_actor)
         dist = Categorical(logits=logits)
         action = dist.sample()
         log_prob = dist.log_prob(action)
         
-        merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
-        critic_feat = self.network(merged.to(obs.device))
-        value = self.critic(critic_feat).squeeze(-1)
+        # 2. Critic path (uses critic_backbone)
+        # Prepare merged obs
+        if all_obs_list[0].dim() == 4:
+            # If input is already batched (e.g. [1, C, H, W])
+            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
+        else:
+            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
+            
+        h_critic = self.critic_backbone(merged.to(obs.device))
+        value = self.critic_head(h_critic).squeeze(-1)
         
         return action, log_prob, value, dist.entropy()
 
@@ -142,24 +157,28 @@ class MAPPOAgent(nn.Module):
         else:
             merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
         
-        critic_feat = self.network(merged.to(all_obs_list[0].device))
-        return self.critic(critic_feat).squeeze(-1)
+        # CRITIC BACKBONE ONLY
+        h_critic = self.critic_backbone(merged.to(all_obs_list[0].device))
+        return self.critic_head(h_critic).squeeze(-1)
 
     def evaluate(self, obs, merged_obs, action, num_agents, obs_shape):
-        h = self.network(obs)
-        logits = self.actor(h)
+        # Actor Path
+        h_actor = self.actor_backbone(obs)
+        logits = self.actor_head(h_actor)
         dist = Categorical(logits=logits)
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
         
-        critic_feat = self.network(merged_obs)
-        value = self.critic(critic_feat).squeeze(-1)
+        # Critic Path
+        h_critic = self.critic_backbone(merged_obs)
+        value = self.critic_head(h_critic).squeeze(-1)
+        
         return value, log_prob, entropy
     
     def get_deterministic_action(self, obs):
         with torch.no_grad():
-            h = self.network(obs)
-            logits = self.actor(h)
+            h = self.actor_backbone(obs)
+            logits = self.actor_head(h)
             return logits.argmax(dim=-1)
 
 
