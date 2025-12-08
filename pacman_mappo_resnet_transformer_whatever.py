@@ -1,4 +1,5 @@
 import numpy as np
+import math
 import torch
 import torch.nn as nn
 from torch.distributions import Categorical
@@ -21,29 +22,26 @@ CLIP_EPS = 0.15
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
-TOTAL_UPDATES = 1200
+TOTAL_UPDATES = 2000
 
 # Annealed hyperparameters
 LR_START = 2e-4 #original 2e4
-LR_END = 6e-5
-ENT_COEF_START = 0.02 #reduce back if its just for 
+LR_END = 7e-5
+ENT_COEF_START = 0.0175 #reduce back if its just for 
 ENT_COEF_END = 0.0025
 
 # Settings
 OPPONENT_POOL_SIZE = 100 
-OPPONENT_UPDATE_FREQ = 15 
+OPPONENT_UPDATE_FREQ = 10 
 SHAPING_SCALE = 0.1
 EVAL_FREQ = 50
 EVAL_EPISODES = 10
 
-# === CURRICULUM TEAMS ===
-# Phase 1 Teams (Easy/Basics), learn game on these
-EASY_TEAMS = ['heuristicTeam', 'randomTeam']
+# Phase 1, just learn against randoms, learn to get actual reward.
+EASY_TEAMS = ['randomTeam']
 
-# === CURRICULUM TEAMS ===
-# Phase 2 Teams (Medium), train until beat all of them, then have them show up way less
-# just isolate MCTS because its expensive to train on
-MEDIUM_TEAMS = ['MCTSTeam']
+# Isolating this one because it takes ages to train on
+MEDIUM_TEAMS = ['MCTSTeam', 'heuristicTeam']
 
 # Phase 3 Teams (Hardest), hardest to beat, train on these + self play
 HARD_TEAMS = ['baselineTeam', 'AstarTeam', 'approxQTeam']
@@ -53,134 +51,182 @@ LOAD_CHECKPOINT = None
 START_UPDATES = 0
 
 BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
-class ResidualBlock(nn.Module):
-    def __init__(self, channels, use_attention=False, num_heads=4):
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.gn1 = nn.GroupNorm(4, channels)
-        self.act = nn.GELU()
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.gn2 = nn.GroupNorm(4, channels)
-        
-        self.use_attention = use_attention
-        if use_attention:
-            self.attn_norm = nn.GroupNorm(4, channels)
-            self.num_heads = num_heads
-            self.head_dim = channels // num_heads
-            assert channels % num_heads == 0
-            self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1)
-            self.proj = nn.Conv2d(channels, channels, kernel_size=1)
-            self.scale = self.head_dim ** -0.5
-    
-    def forward(self, x):
-        residual = x
-        out = self.act(self.gn1(self.conv1(x)))
-        out = self.gn2(self.conv2(out))
-        out = self.act(out + residual)
-        
-        if self.use_attention:
-            out = self._attention(out)
-        return out
-    
-    def _attention(self, x):
-        B, C, H, W = x.shape
-        qkv = self.qkv(x).reshape(B, 3, self.num_heads, self.head_dim, H * W)
-        qkv = qkv.permute(1, 0, 2, 4, 3)  # 3, B, heads, HW, head_dim
-        q, k, v = qkv.unbind(0)
-        
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        
-        out = (attn @ v).transpose(2, 3).reshape(B, C, H, W)
-        return self.attn_norm(x + self.proj(out))
 
+class PositionalEncoding2D(nn.Module):
+    """Adds (x, y) sine-wave embeddings to the feature map."""
+    def __init__(self, d_model, max_h=50, max_w=50):
+        super().__init__()
+        d_model_half = d_model // 2
+        
+        y_pos = torch.arange(max_h).unsqueeze(1)
+        y_den = torch.exp(torch.arange(0, d_model_half, 2) * -(math.log(10000.0) / d_model_half))
+        y_enc = torch.zeros(max_h, d_model_half)
+        y_enc[:, 0::2] = torch.sin(y_pos * y_den)
+        y_enc[:, 1::2] = torch.cos(y_pos * y_den)
+        
+        x_pos = torch.arange(max_w).unsqueeze(1)
+        x_den = torch.exp(torch.arange(0, d_model_half, 2) * -(math.log(10000.0) / d_model_half))
+        x_enc = torch.zeros(max_w, d_model_half)
+        x_enc[:, 0::2] = torch.sin(x_pos * x_den)
+        x_enc[:, 1::2] = torch.cos(x_pos * x_den)
+        
+        self.register_buffer('y_enc', y_enc)
+        self.register_buffer('x_enc', x_enc)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        # Slice encodings to current map size
+        y_emb = self.y_enc[:H, :].unsqueeze(1).repeat(1, W, 1)
+        x_emb = self.x_enc[:W, :].unsqueeze(0).repeat(H, 1, 1)
+        
+        # Concat to get [B, C, H, W]
+        pos = torch.cat([y_emb, x_emb], dim=2).permute(2, 0, 1).unsqueeze(0).repeat(B, 1, 1, 1)
+        return x + pos
+
+
+class DETRBlock(nn.Module):
+    """
+    The 'Brain' Block.
+    Input: Image [Batch, Channels, H, W]
+    Output: Vector [Batch, d_model]
+    
+    Operations: CNN Projector -> Pos Encoding -> Transformer -> Global Pool
+    """
+    def __init__(self, input_channels, d_model=64, nhead=4, num_layers=2, dim_ff=256):
+        super().__init__()
+        
+        # 1. Cheap CNN Projector (Reduce channels, keep spatial)
+        self.projector = nn.Sequential(
+            nn.Conv2d(input_channels, 32, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(32, d_model, kernel_size=1)
+        )
+        
+        # 2. Positional Encoding
+        self.pos_encoder = PositionalEncoding2D(d_model)
+        
+        # 3. Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, 
+            dim_feedforward=dim_ff, dropout=0.0, batch_first=False
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+    def forward(self, x):
+        # [B, C, H, W] -> Project & Add Pos
+        x = self.projector(x)
+        x = self.pos_encoder(x)
+        
+        # Flatten for Transformer: [B, C, H, W] -> [Seq, B, d_model]
+        x = x.flatten(2).permute(2, 0, 1)
+        
+        # Attend
+        x = self.transformer(x)
+        
+        # Global Average Pool over the sequence (H*W)
+        x = x.mean(dim=0)
+        return x
+
+
+# ==========================================
+# 2. THE AGENT
+# ==========================================
 
 class MAPPOAgent(nn.Module):
     def __init__(self, obs_shape, action_dim, num_agents=2):
         super().__init__()
         self.obs_shape = obs_shape
-        C = 32
         
-        self.network = nn.Sequential(
-            nn.Conv2d(obs_shape[0], C, kernel_size=3, padding=1),
+        # Config (Fast/Light settings for Double Transformer)
+        d_model = 64
+        nhead = 4
+        num_layers = 2
+        dim_ff = 256
+        
+        # --- 1. INSTANTIATE TWO SEPARATE BRAINS ---
+        # Same architecture, different weights
+        
+        # The Actor sees "Local View"
+        self.actor_backbone = DETRBlock(obs_shape[0], d_model, nhead, num_layers, dim_ff)
+        
+        # The Critic sees "Global Merged View"
+        self.critic_backbone = DETRBlock(obs_shape[0], d_model, nhead, num_layers, dim_ff)
+
+        # --- 2. HEADS ---
+        
+        self.actor_head = nn.Sequential(
+            nn.Linear(d_model, 256),
+            nn.LayerNorm(256),
             nn.GELU(),
-            ResidualBlock(C, use_attention=False),
-            ResidualBlock(C, use_attention=False),
-            ResidualBlock(C, use_attention=True, num_heads=4),
-            nn.Flatten()
+            nn.Linear(256, action_dim)
         )
-        
-        with torch.no_grad():
-            dummy = torch.zeros(1, *obs_shape)
-            flat_dim = self.network(dummy).shape[1]
-        
-        hidden_dim = 1024
-        
-        self.actor = nn.Sequential(
-            nn.Linear(flat_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+
+        self.critic_head = nn.Sequential(
+            nn.Linear(d_model, 256),
             nn.GELU(),
-            nn.Linear(hidden_dim, action_dim)
-        )
-        
-        self.critic = nn.Sequential(
-            nn.Linear(flat_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(256, 1)
         )
         
         self.apply(self._init_weights)
-        nn.init.orthogonal_(self.actor[-1].weight, gain=0.01)
-        nn.init.constant_(self.actor[-1].bias, 0.0)
-        nn.init.orthogonal_(self.critic[-1].weight, gain=1.0)
-        nn.init.constant_(self.critic[-1].bias, 0.0)
-    
+        nn.init.orthogonal_(self.actor_head[-1].weight, gain=0.01)
+        nn.init.orthogonal_(self.critic_head[-1].weight, gain=1.0)
+
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Conv2d)):
             nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
             if module.bias is not None:
                 module.bias.data.fill_(0.0)
-    
+
     def get_action_and_value(self, obs, all_obs_list):
-        h = self.network(obs)
-        logits = self.actor(h)
+        # --- ACTOR ---
+        # obs is local/canonical [B, C, H, W]
+        act_feat = self.actor_backbone(obs)
+        logits = self.actor_head(act_feat)
+        
         dist = Categorical(logits=logits)
         action = dist.sample()
         log_prob = dist.log_prob(action)
         
-        merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
-        critic_feat = self.network(merged.to(obs.device))
-        value = self.critic(critic_feat).squeeze(-1)
+        # --- CRITIC ---
+        # Merged is global/absolute [B, C, H, W]
+        if all_obs_list[0].dim() == 4:
+            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
+        else:
+            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
+            
+        crit_feat = self.critic_backbone(merged.to(obs.device))
+        value = self.critic_head(crit_feat).squeeze(-1)
         
         return action, log_prob, value, dist.entropy()
-    
+
     def get_value(self, all_obs_list):
         if all_obs_list[0].dim() == 4:
             merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
         else:
             merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
-        critic_feat = self.network(merged.to(all_obs_list[0].device))
-        return self.critic(critic_feat).squeeze(-1)
-    
+        
+        crit_feat = self.critic_backbone(merged.to(all_obs_list[0].device))
+        return self.critic_head(crit_feat).squeeze(-1)
+
     def evaluate(self, obs, merged_obs, action, num_agents, obs_shape):
-        h = self.network(obs)
-        logits = self.actor(h)
+        # Actor
+        act_feat = self.actor_backbone(obs)
+        logits = self.actor_head(act_feat)
         dist = Categorical(logits=logits)
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
         
-        critic_feat = self.network(merged_obs)
-        value = self.critic(critic_feat).squeeze(-1)
+        # Critic
+        crit_feat = self.critic_backbone(merged_obs)
+        value = self.critic_head(crit_feat).squeeze(-1)
         
         return value, log_prob, entropy
     
     def get_deterministic_action(self, obs):
         with torch.no_grad():
-            h = self.network(obs)
-            logits = self.actor(h)
+            act_feat = self.actor_backbone(obs)
+            logits = self.actor_head(act_feat)
             return logits.argmax(dim=-1)
-
 
 def canonicalize_obs(obs, is_red_agent):
     if not is_red_agent:
@@ -225,32 +271,34 @@ def compute_heuristic_shaping(obs_curr, obs_next):
     living_punishment = -0.1 #if u just punish it for being alive this apparently leads to good things, lets try
     #this ends up being 0.01 remember
     
-    
-    if carry_next > carry_curr or (carry_curr > 0 and carry_next == 0):
-        return living_punishment + 0.0
+    #if carry_next > carry_curr or (carry_curr > 0 and carry_next == 0):
+    #    return living_punishment + 0.0
 
+    # dying is generally bad, especially if carrying stuff
     dist_moved = abs(pos_curr[0] - pos_next[0]) + abs(pos_curr[1] - pos_next[1])
     if dist_moved > 1.5:
         return living_punishment - 0.5 - (0.25 * carry_curr)
     
-    if dist_moved < 0.1:
+    if dist_moved < 0.1: #standing still is generally bad
         return living_punishment - 0.075 
+
+    return living_punishment
     
-    if carry_curr > 0:
-        dist_curr = pos_curr[1]
-        dist_next = pos_next[1]
-        return living_punishment - ((dist_curr - dist_next) * (0.8 + (0.1 * carry_curr)))
+    # if carry_curr > 0:
+    #     dist_curr = pos_curr[1]
+    #     dist_next = pos_next[1]
+    #     return living_punishment - ((dist_curr - dist_next) * (0.8 + (0.1 * carry_curr)))
 
-    food_ch = obs_curr[7]
-    food_locs = (food_ch > 0).nonzero(as_tuple=False).float()
-    if len(food_locs) == 0:
-        return 0.0
-    curr_p = torch.tensor(pos_curr).float()
-    next_p = torch.tensor(pos_next).float()
-    dist_curr = (food_locs - curr_p).abs().sum(dim=1).min().item()
-    dist_next = (food_locs - next_p).abs().sum(dim=1).min().item()
+    # food_ch = obs_curr[7]
+    # food_locs = (food_ch > 0).nonzero(as_tuple=False).float()
+    # if len(food_locs) == 0:
+    #     return 0.0
+    # curr_p = torch.tensor(pos_curr).float()
+    # next_p = torch.tensor(pos_next).float()
+    # dist_curr = (food_locs - curr_p).abs().sum(dim=1).min().item()
+    # dist_next = (food_locs - next_p).abs().sum(dim=1).min().item()
 
-    return living_punishment - (dist_curr - dist_next)
+    # return living_punishment - (dist_curr - dist_next)
 
 
 def merge_obs_for_critic(obs_list):
@@ -280,6 +328,7 @@ def compute_gae(rewards, values, dones, last_value, gamma):
 
 
 def evaluate_vs_bots(agent, num_episodes=20):
+    """Evaluate agent ONLY against MCTSTeam as requested."""
     agent.eval()
     returns = []
     wins = 0
@@ -384,24 +433,19 @@ def train():
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
         
-        # ==========================================
-        # === NEW OPPONENT SELECTION STRATEGY ===
-        # ==========================================
-        
-        if update <= 300: #skip this part since checkpoint training run
-            # PHASE 1: BOOTSTRAPPING (100% Easy Bots)
-            # "baselineteam or randomteam"
+        if update <= 200: #skip this part since checkpoint training run
+            # teach it the game
             use_bot_opponent = True
             play_as_red = False
             opp_name = np.random.choice(EASY_TEAMS)
             env = env_bot
             env.reset(enemieName=opp_name)
             
-        elif update <= 600:
+        elif update <= 1000:
 
             use_bot_opponent = True
             play_as_red = False
-            opp_name = np.random.choice(EASY_TEAMS + MEDIUM_TEAMS + (HARD_TEAMS * 3)) #overrepresent hard teams
+            opp_name = np.random.choice(EASY_TEAMS + MEDIUM_TEAMS + (HARD_TEAMS * 5)) #overrepresent hard teams
             env = env_bot
             env.reset(enemieName=opp_name)
             
@@ -409,7 +453,7 @@ def train():
             # PHASE 3: MIXED REGIME
             rand_val = np.random.rand()
             
-            if rand_val < 0.40:
+            if rand_val < 0.50:
                 # 40% Self-Play (Current Version)
                 use_bot_opponent = False
                 play_as_red = np.random.rand() > 0.5 
@@ -420,7 +464,7 @@ def train():
                 opponent.load_state_dict(agent.state_dict())
                 opponent.eval()
                 
-            elif rand_val < 0.60:
+            elif rand_val < 0.70:
                 # 20% Self-Play (Old Version)
                 use_bot_opponent = False
                 play_as_red = np.random.rand() > 0.5
@@ -618,7 +662,8 @@ def train():
             current_win_rate = log['train_winrate'][-1] if log['train_winrate'] else 0.0
         log['train_winrate'].append(current_win_rate)
 
-        if update > 10 and update % EVAL_FREQ == 0:
+        # Evaluation (MCTS Only)
+        if update > 0 and update % EVAL_FREQ == 0:
             eval_ret, eval_std, eval_wr = evaluate_vs_bots(agent, EVAL_EPISODES)
             log['eval_return'].append(eval_ret)
             log['eval_winrate'].append(eval_wr)
@@ -641,7 +686,7 @@ def train():
         log['ent_coef'].append(ent_coef)
         
         side = "Red " if play_as_red else "Blue"
-        eval_str = f"| Eval: {log['eval_return'][-1]:6.1f} ({log['eval_winrate'][-1]*100:4.1f}%)" if update % EVAL_FREQ == 0 else ""
+        eval_str = f"| Eval(MCTS): {log['eval_return'][-1]:6.1f} ({log['eval_winrate'][-1]*100:4.1f}%)" if update % EVAL_FREQ == 0 else ""
         print(f"Upd {update:4d} [{side}|{opp_name:10s}] | "
               f"Win: {current_win_rate*100:5.1f}% | "
               f"Rew: {mean_reward:7.1f} | "
@@ -651,10 +696,10 @@ def train():
               f"LR: {lr:.2e} "
               f"{eval_str}")
         
-        if update % 200 == 0:
-            torch.save(agent.state_dict(), f"mappo_resnet)attention_{update}.pt")
+        if update % 250 == 0:
+            torch.save(agent.state_dict(), f"mappo_resnet_both_transformer_{update}.pt")
 
-    torch.save(agent.state_dict(), "mappo_resnet_attention_final.pt")
+    torch.save(agent.state_dict(), "mappo_resnet_final.pt")
     
     # Plotting
     fig, axes = plt.subplots(3, 3, figsize=(15, 12))
@@ -702,11 +747,11 @@ def train():
     axes[2, 2].set_xlabel('Update')
     
     plt.tight_layout()
-    plt.savefig("mappo_resnet_training.png", dpi=150)
+    plt.savefig("mappo_resnet_oth_transformer_training.png", dpi=150)
     plt.close()
     
     print(f"\n{'='*60}")
-    print(f"Final eval : {log['eval_return'][-1]:.1f} return, {log['eval_winrate'][-1]*100:.1f}% winrate")
+    print(f"Final eval (MCTS): {log['eval_return'][-1]:.1f} return, {log['eval_winrate'][-1]*100:.1f}% winrate")
     print(f"{'='*60}")
 
 
