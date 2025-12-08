@@ -47,13 +47,33 @@ MEDIUM_TEAMS = ['MCTSTeam', 'heuristicTeam']
 HARD_TEAMS = ['baselineTeam', 'AstarTeam', 'approxQTeam']
 
 # Checkpoint
-LOAD_CHECKPOINT = None
+LOAD_CHECKPOINT = "mappo_resnet_250.pt"
 START_UPDATES = 0
 
 BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
 
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, stride=1)
+        self.gn1 = nn.GroupNorm(4, channels) 
+        self.act = nn.GELU()
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, stride=1)
+        self.gn2 = nn.GroupNorm(4, channels)
+        
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.gn1(out)
+        out = self.act(out)
+        out = self.conv2(out)
+        out = self.gn2(out)
+        out += residual
+        out = self.act(out)
+        return out
+
 class PositionalEncoding2D(nn.Module):
-    """Adds (x, y) sine-wave embeddings to the feature map."""
     def __init__(self, d_model, max_h=50, max_w=50):
         super().__init__()
         d_model_half = d_model // 2
@@ -75,96 +95,65 @@ class PositionalEncoding2D(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-        # Slice encodings to current map size
         y_emb = self.y_enc[:H, :].unsqueeze(1).repeat(1, W, 1)
         x_emb = self.x_enc[:W, :].unsqueeze(0).repeat(H, 1, 1)
-        
-        # Concat to get [B, C, H, W]
-        pos = torch.cat([y_emb, x_emb], dim=2).permute(2, 0, 1).unsqueeze(0).repeat(B, 1, 1, 1)
+        pos = torch.cat([y_emb, x_emb], dim=2)
+        pos = pos.permute(2, 0, 1).unsqueeze(0).repeat(B, 1, 1, 1)
         return x + pos
 
-
-class DETRBlock(nn.Module):
-    """
-    The 'Brain' Block.
-    Input: Image [Batch, Channels, H, W]
-    Output: Vector [Batch, d_model]
-    
-    Operations: CNN Projector -> Pos Encoding -> Transformer -> Global Pool
-    """
-    def __init__(self, input_channels, d_model=64, nhead=4, num_layers=2, dim_ff=256):
-        super().__init__()
-        
-        # 1. Cheap CNN Projector (Reduce channels, keep spatial)
-        self.projector = nn.Sequential(
-            nn.Conv2d(input_channels, 32, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(32, d_model, kernel_size=1)
-        )
-        
-        # 2. Positional Encoding
-        self.pos_encoder = PositionalEncoding2D(d_model)
-        
-        # 3. Transformer Encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, 
-            dim_feedforward=dim_ff, dropout=0.0, batch_first=False
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-    def forward(self, x):
-        # [B, C, H, W] -> Project & Add Pos
-        x = self.projector(x)
-        x = self.pos_encoder(x)
-        
-        # Flatten for Transformer: [B, C, H, W] -> [Seq, B, d_model]
-        x = x.flatten(2).permute(2, 0, 1)
-        
-        # Attend
-        x = self.transformer(x)
-        
-        # Global Average Pool over the sequence (H*W)
-        x = x.mean(dim=0)
-        return x
-
-
-# ==========================================
-# 2. THE AGENT
-# ==========================================
-
+# deeply deeply cursed but I had resnets for both actor and critic
+# but started messing around with transformers for the critic 
+# and yeah its working really well so now I am left with the ugliest
+# solution you have ever seen
 class MAPPOAgent(nn.Module):
     def __init__(self, obs_shape, action_dim, num_agents=2):
         super().__init__()
         self.obs_shape = obs_shape
         
-        # Config (Fast/Light settings for Double Transformer)
-        d_model = 64
-        nhead = 4
-        num_layers = 2
-        dim_ff = 256
-        
-        # --- 1. INSTANTIATE TWO SEPARATE BRAINS ---
-        # Same architecture, different weights
-        
-        # The Actor sees "Local View"
-        self.actor_backbone = DETRBlock(obs_shape[0], d_model, nhead, num_layers, dim_ff)
-        
-        # The Critic sees "Global Merged View"
-        self.critic_backbone = DETRBlock(obs_shape[0], d_model, nhead, num_layers, dim_ff)
-
-        # --- 2. HEADS ---
-        
-        self.actor_head = nn.Sequential(
-            nn.Linear(d_model, 256),
-            nn.LayerNorm(256),
+        # --- ACTOR (CNN) ---
+        C_actor = 32
+        self.actor_backbone = nn.Sequential(
+            nn.Conv2d(obs_shape[0], C_actor, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Linear(256, action_dim)
+            ResidualBlock(C_actor),
+            ResidualBlock(C_actor),
+            ResidualBlock(C_actor),
+            nn.Flatten()
+        )
+        
+        with torch.no_grad():
+            dummy = torch.zeros(1, *obs_shape)
+            actor_flat_dim = self.actor_backbone(dummy).shape[1]
+
+        self.actor_head = nn.Sequential(
+            nn.Linear(actor_flat_dim, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Linear(512, action_dim)
         )
 
-        self.critic_head = nn.Sequential(
-            nn.Linear(d_model, 256),
+        self.d_model = 128
+        nhead = 4
+        num_layers = 2
+        dim_ff = 512
+        
+        self.critic_projector = nn.Sequential(
+            nn.Conv2d(obs_shape[0], 32, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Linear(256, 1)
+            nn.Conv2d(32, self.d_model, kernel_size=1)
+        )
+        
+        self.pos_encoder = PositionalEncoding2D(self.d_model)
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model, nhead=nhead, dim_feedforward=dim_ff, dropout=0.0, batch_first=False
+        )
+        self.critic_transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        self.critic_head = nn.Sequential(
+            nn.Linear(self.d_model, 512),
+            nn.GELU(),
+            nn.Linear(512, 1)
         )
         
         self.apply(self._init_weights)
@@ -177,25 +166,31 @@ class MAPPOAgent(nn.Module):
             if module.bias is not None:
                 module.bias.data.fill_(0.0)
 
-    def get_action_and_value(self, obs, all_obs_list):
-        # --- ACTOR ---
-        # obs is local/canonical [B, C, H, W]
-        act_feat = self.actor_backbone(obs)
-        logits = self.actor_head(act_feat)
+    def _forward_critic(self, obs):
+        x = self.critic_projector(obs)
+        x = self.pos_encoder(x)
         
+        # Reshape for transformer: [Sequence, Batch, Dim]
+        x = x.flatten(2).permute(2, 0, 1)
+        
+        x = self.critic_transformer(x)
+        x = x.mean(dim=0) # Global Average Pooling
+        
+        return self.critic_head(x)
+
+    def get_action_and_value(self, obs, all_obs_list):
+        h_actor = self.actor_backbone(obs)
+        logits = self.actor_head(h_actor)
         dist = Categorical(logits=logits)
         action = dist.sample()
         log_prob = dist.log_prob(action)
         
-        # --- CRITIC ---
-        # Merged is global/absolute [B, C, H, W]
         if all_obs_list[0].dim() == 4:
             merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
         else:
             merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
             
-        crit_feat = self.critic_backbone(merged.to(obs.device))
-        value = self.critic_head(crit_feat).squeeze(-1)
+        value = self._forward_critic(merged.to(obs.device)).squeeze(-1)
         
         return action, log_prob, value, dist.entropy()
 
@@ -205,28 +200,25 @@ class MAPPOAgent(nn.Module):
         else:
             merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
         
-        crit_feat = self.critic_backbone(merged.to(all_obs_list[0].device))
-        return self.critic_head(crit_feat).squeeze(-1)
+        return self._forward_critic(merged.to(all_obs_list[0].device)).squeeze(-1)
 
     def evaluate(self, obs, merged_obs, action, num_agents, obs_shape):
-        # Actor
-        act_feat = self.actor_backbone(obs)
-        logits = self.actor_head(act_feat)
+        h_actor = self.actor_backbone(obs)
+        logits = self.actor_head(h_actor)
         dist = Categorical(logits=logits)
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
         
-        # Critic
-        crit_feat = self.critic_backbone(merged_obs)
-        value = self.critic_head(crit_feat).squeeze(-1)
+        value = self._forward_critic(merged_obs).squeeze(-1)
         
         return value, log_prob, entropy
     
     def get_deterministic_action(self, obs):
         with torch.no_grad():
-            act_feat = self.actor_backbone(obs)
-            logits = self.actor_head(act_feat)
+            h = self.actor_backbone(obs)
+            logits = self.actor_head(h)
             return logits.argmax(dim=-1)
+
 
 def canonicalize_obs(obs, is_red_agent):
     if not is_red_agent:
@@ -433,7 +425,7 @@ def train():
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
         
-        if update <= 200: #skip this part since checkpoint training run
+        if update <= 0: #skip this part since checkpoint training run
             # teach it the game
             use_bot_opponent = True
             play_as_red = False
@@ -441,7 +433,7 @@ def train():
             env = env_bot
             env.reset(enemieName=opp_name)
             
-        elif update <= 1000:
+        elif update <= 0:
 
             use_bot_opponent = True
             play_as_red = False
@@ -697,7 +689,7 @@ def train():
               f"{eval_str}")
         
         if update % 250 == 0:
-            torch.save(agent.state_dict(), f"mappo_resnet_both_transformer_{update}.pt")
+            torch.save(agent.state_dict(), f"mappo_resnet_{update}.pt")
 
     torch.save(agent.state_dict(), "mappo_resnet_final.pt")
     
@@ -747,7 +739,7 @@ def train():
     axes[2, 2].set_xlabel('Update')
     
     plt.tight_layout()
-    plt.savefig("mappo_resnet_oth_transformer_training.png", dpi=150)
+    plt.savefig("mappo_resnet_training.png", dpi=150)
     plt.close()
     
     print(f"\n{'='*60}")
