@@ -21,7 +21,7 @@ CLIP_EPS = 0.15
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
-TOTAL_UPDATES = 2500
+TOTAL_UPDATES = 2200
 
 # Annealed hyperparameters
 LR_START = 2e-4 #original 2e4
@@ -376,7 +376,7 @@ def train():
             env = env_bot
             env.reset(enemieName=opp_name)
             
-        elif update <= 1000:
+        elif update <= 1200:
 
             use_bot_opponent = True
             play_as_red = False
