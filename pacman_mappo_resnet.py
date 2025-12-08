@@ -21,7 +21,7 @@ CLIP_EPS = 0.15
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
-TOTAL_UPDATES = 2200
+TOTAL_UPDATES = 2000
 
 # Annealed hyperparameters
 LR_START = 2e-4 #original 2e4
