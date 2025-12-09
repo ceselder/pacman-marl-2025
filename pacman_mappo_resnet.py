@@ -52,6 +52,7 @@ START_UPDATES = 0
 
 BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
 
+
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -85,7 +86,7 @@ def make_backbone(in_channels, hidden_dim=256):
 
 
 class MAPPOAgent(nn.Module):
-    def __init__(self, obs_shape, action_dim, num_agents=2, hidden_dim=256):
+    def __init__(self, obs_shape, action_dim, hidden_dim=256):
         super().__init__()
         c, h, w = obs_shape
 
@@ -160,7 +161,7 @@ def compute_heuristic_shaping(obs_curr, obs_next):
     pos_curr, carry_curr = get_agent_state(obs_curr)
     pos_next, carry_next = get_agent_state(obs_next)
 
-    living_punishment = -0.15 #if u just punish it for being alive this apparently leads to good things, lets try
+    living_punishment = -0.1 #if u just punish it for being alive this apparently leads to good things, lets try
     #this ends up being 0.01 remember
     
     #if carry_next > carry_curr or (carry_curr > 0 and carry_next == 0):
@@ -333,7 +334,7 @@ def train():
             env = env_bot
             env.reset(enemieName=opp_name)
             
-        elif update <= 750:
+        elif update <= 600:
 
             use_bot_opponent = True
             play_as_red = False
@@ -345,7 +346,7 @@ def train():
             # PHASE 3: MIXED REGIME
             rand_val = np.random.rand()
             
-            if rand_val < 0.45:
+            if rand_val < 0.40:
                 # 40% Self-Play (Current Version)
                 use_bot_opponent = False
                 play_as_red = np.random.rand() > 0.5 
@@ -356,7 +357,7 @@ def train():
                 opponent.load_state_dict(agent.state_dict())
                 opponent.eval()
                 
-            elif rand_val < 0.70:
+            elif rand_val < 0.60:
                 # 20% Self-Play (Old Version)
                 use_bot_opponent = False
                 play_as_red = np.random.rand() > 0.5
@@ -411,12 +412,19 @@ def train():
             merged_obs_buf[step] = merged_obs_batch
             
             with torch.no_grad():
-                merged = merged_obs.unsqueeze(0).to(device)  # (1, C, H, W)
+                all_obs_list = [learner_obs[i:i+1].to(device) for i in range(num_agents)]
                 actions, log_probs, values = [], [], []
                 for i in range(num_agents):
                     act, lp, val, _ = agent.get_action_and_value(
-                        learner_obs[i:i+1].to(device), merged
+                        learner_obs[i:i+1].to(device), all_obs_list
                     )
+                    actions.append(act)
+                    log_probs.append(lp)
+                    values.append(val)
+                actions = torch.cat(actions)
+                log_probs = torch.cat(log_probs)
+                values = torch.cat(values)
+            
             action_buf[step] = actions.cpu()
             logprob_buf[step] = log_probs.cpu()
             value_buf[step] = values.cpu()
