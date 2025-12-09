@@ -51,50 +51,30 @@ START_UPDATES = 0
 
 BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
 
-class ResidualBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, stride=1)
-        self.gn1 = nn.GroupNorm(4, channels) 
-        self.act = nn.GELU()
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, stride=1)
-        self.gn2 = nn.GroupNorm(4, channels)
-        
-    def forward(self, x):
-        residual = x
-        out = self.conv1(x)
-        out = self.gn1(out)
-        out = self.act(out)
-        out = self.conv2(out)
-        out = self.gn2(out)
-        out += residual
-        out = self.act(out)
-        return out
-
-
 class MAPPOAgent(nn.Module):
     def __init__(self, obs_shape, action_dim, num_agents=2):
         super().__init__()
         self.obs_shape = obs_shape
         
-        C = 32
-        
-        # --- DEFINING THE BLOCKS ---
+        # --- BUILDER FOR SIMPLE CNN BACKBONE ---
+        # Structure: Input -> 16 -> 16 -> 32 -> Flatten
         def make_backbone():
             return nn.Sequential(
-                nn.Conv2d(obs_shape[0], C, kernel_size=3, padding=1, stride=1),
+                nn.Conv2d(obs_shape[0], 16, kernel_size=3, stride=1, padding=1),
                 nn.GELU(),
-                ResidualBlock(C),
-                ResidualBlock(C),
-                ResidualBlock(C),
+                
+                nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
+                nn.GELU(),
+                
                 nn.Flatten()
             )
 
         # --- SEPARATE BACKBONES ---
+        # We instantiate two completely independent CNNs.
         self.actor_backbone = make_backbone()
         self.critic_backbone = make_backbone()
         
-        # Calculate flat dim once
+        # Calculate the flat dimension size dynamically
         with torch.no_grad():
             dummy = torch.zeros(1, *obs_shape)
             flat_dim = self.actor_backbone(dummy).shape[1]
@@ -102,6 +82,7 @@ class MAPPOAgent(nn.Module):
         hidden_dim = 1024
 
         # --- HEADS ---
+        # Actor Head: 1024 -> Action Probabilities
         self.actor_head = nn.Sequential(
             nn.Linear(flat_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -109,6 +90,7 @@ class MAPPOAgent(nn.Module):
             nn.Linear(hidden_dim, action_dim)
         )
 
+        # Critic Head: 1024 -> Value Scalar
         self.critic_head = nn.Sequential(
             nn.Linear(flat_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -118,7 +100,7 @@ class MAPPOAgent(nn.Module):
         
         self.apply(self._init_weights)
         
-        # Orthogonal init for the final layers specifically
+        # Orthogonal Initialization for stability
         nn.init.orthogonal_(self.actor_head[-1].weight, gain=0.01)
         nn.init.constant_(self.actor_head[-1].bias, 0.0)
         nn.init.orthogonal_(self.critic_head[-1].weight, gain=1.0)
@@ -131,17 +113,19 @@ class MAPPOAgent(nn.Module):
                 module.bias.data.fill_(0.0)
 
     def get_action_and_value(self, obs, all_obs_list):
-        # 1. Actor path (uses actor_backbone)
+        # 1. ACTOR PATH
+        # Uses its own private CNN to look for tactics
         h_actor = self.actor_backbone(obs)
         logits = self.actor_head(h_actor)
+        
         dist = Categorical(logits=logits)
         action = dist.sample()
         log_prob = dist.log_prob(action)
         
-        # 2. Critic path (uses critic_backbone)
-        # Prepare merged obs
+        # 2. CRITIC PATH
+        # Uses its own private CNN to look for strategy
+        # Must merge observations first
         if all_obs_list[0].dim() == 4:
-            # If input is already batched (e.g. [1, C, H, W])
             merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
         else:
             merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
@@ -157,19 +141,18 @@ class MAPPOAgent(nn.Module):
         else:
             merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
         
-        # CRITIC BACKBONE ONLY
         h_critic = self.critic_backbone(merged.to(all_obs_list[0].device))
         return self.critic_head(h_critic).squeeze(-1)
 
     def evaluate(self, obs, merged_obs, action, num_agents, obs_shape):
-        # Actor Path
+        # Re-evaluate actor actions
         h_actor = self.actor_backbone(obs)
         logits = self.actor_head(h_actor)
         dist = Categorical(logits=logits)
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
         
-        # Critic Path
+        # Re-evaluate critic values
         h_critic = self.critic_backbone(merged_obs)
         value = self.critic_head(h_critic).squeeze(-1)
         
