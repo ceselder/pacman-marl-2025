@@ -488,9 +488,11 @@ def train():
                         learner_obs[i:i+1].to(device), 
                         global_state  # <--- Pass the Tensor, not the List
                     )
-                    actions.append(act)
-                    log_probs.append(lp)
-                    values.append(val)
+                                   # === ADD THESE LINES ===
+                    actions = torch.cat(actions)
+                    log_probs = torch.cat(log_probs)
+                    values = torch.cat(values)
+                # =======================
             
             action_buf[step] = actions.cpu()
             logprob_buf[step] = log_probs.cpu()
