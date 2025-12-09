@@ -12,7 +12,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # ============================================
-# HYPERPARAMETERS - resnet OF ALL RUNS
+# HYPERPARAMETERS
 # ============================================
 NUM_STEPS = 2048
 BATCH_SIZE = 256
@@ -25,9 +25,9 @@ UPDATE_EPOCHS = 4
 TOTAL_UPDATES = 2000
 
 # Annealed hyperparameters
-LR_START = 2e-4 #original 2e4
+LR_START = 2e-4
 LR_END = 5e-5
-ENT_COEF_START = 0.015 #reduce back if its just for 
+ENT_COEF_START = 0.015
 ENT_COEF_END = 0.0025
 
 # Settings
@@ -37,20 +37,15 @@ SHAPING_SCALE = 0.1
 EVAL_FREQ = 50
 EVAL_EPISODES = 10
 
-# Phase 1, just learn against randoms, learn to get actual reward.
+# Teams
 EASY_TEAMS = ['randomTeam']
-
-# Isolating this one because it takes ages to train on
 MEDIUM_TEAMS = ['MCTSTeam', 'heuristicTeam']
-
-# Phase 3 Teams (Hardest), hardest to beat, train on these + self play
 HARD_TEAMS = ['baselineTeam', 'AstarTeam', 'approxQTeam']
+BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
 
 # Checkpoint
 LOAD_CHECKPOINT = None
 START_UPDATES = 0
-
-BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     """Helper to initialize layers for RL stability."""
@@ -65,9 +60,6 @@ class ViTBody(nn.Module):
         self.num_patches = h * w
         
         # 1. The "Hybrid" Stem (CNN)
-        # We keep the 3x3 Conv. In Pacman, knowing if a wall is *immediately* 
-        # next to you is critical. A pure linear patch projection struggles 
-        # to see "connected" walls.
         self.feature_extractor = nn.Sequential(
             layer_init(nn.Conv2d(c, 32, kernel_size=3, padding=1)),
             nn.GELU(),
@@ -75,9 +67,7 @@ class ViTBody(nn.Module):
             nn.GELU(),
         )
         
-        # 2. Learned Position Embeddings (Simpler than Meshgrid)
-        # We learn a vector for every pixel.
-        # Shape: (1, Num_Pixels, d_model)
+        # 2. Learned Position Embeddings
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, d_model))
         
         # 3. Transformer Encoder
@@ -102,19 +92,15 @@ class ViTBody(nn.Module):
         x = self.feature_extractor(x) # (B, d_model, H, W)
         
         # 2. Flatten spatial dims
-        # (B, d_model, H*W) -> (B, H*W, d_model)
         x = x.flatten(2).transpose(1, 2)
         
         # 3. Add Position Embeddings
-        # "I am the pixel at index 5" info is added here
         x = x + self.pos_embed
         
         # 4. Transformer (Global Mixing)
         x = self.transformer(x)
         
         # 5. Global Average Pooling
-        # In RL, averaging is usually safer than [CLS] because 
-        # every part of the map gets a "vote".
         x = x.mean(dim=1)
         
         return x
@@ -133,15 +119,22 @@ class MAPPOAgent(nn.Module):
         self.critic_body = ViTBody(obs_shape, d_model, nhead, num_layers)
         self.critic_head = layer_init(nn.Linear(d_model, 1), std=1.0)
 
-
     def get_value(self, state):
         hidden = self.critic_body(state)
         return self.critic_head(hidden).squeeze(-1)
 
-    def get_action_and_value(self, x, state=None, action=None):
+    # === CHANGED: Added action_mask argument ===
+    def get_action_and_value(self, x, state=None, action=None, action_mask=None):
         # 1. Actor
         actor_hidden = self.actor_body(x)
         logits = self.actor_head(actor_hidden)
+        
+        # --- MASKING LOGIC ---
+        if action_mask is not None:
+            # Set illegal actions to negative infinity
+            logits = logits.masked_fill(action_mask == 0, -1e9)
+        # ---------------------
+
         probs = Categorical(logits=logits)
         
         if action is None:
@@ -151,7 +144,6 @@ class MAPPOAgent(nn.Module):
         if state is None: state = x
         value = self.get_value(state)
         
-        # value is now (Batch,), log_prob is (Batch,), entropy is (Batch,)
         return action, probs.log_prob(action), value, probs.entropy()
 
     def get_deterministic_action(self, x):
@@ -159,18 +151,24 @@ class MAPPOAgent(nn.Module):
         logits = self.actor_head(hidden)
         return torch.argmax(logits, dim=1)
 
-    def evaluate(self, b_obs, b_merged_obs, b_action, num_agents, obs_shape):
+    # === CHANGED: Added b_masks argument ===
+    def evaluate(self, b_obs, b_merged_obs, b_action, num_agents, obs_shape, b_masks=None):
         """Called during PPO update step"""
         # Actor pass
         actor_hidden = self.actor_body(b_obs)
         logits = self.actor_head(actor_hidden)
+        
+        # --- MASKING LOGIC ---
+        if b_masks is not None:
+            logits = logits.masked_fill(b_masks == 0, -1e9)
+        # ---------------------
+        
         probs = Categorical(logits=logits)
         log_probs = probs.log_prob(b_action)
         entropy = probs.entropy()
         
         # Critic pass
         critic_hidden = self.critic_body(b_merged_obs)
-        # FIX: Squeeze here as well (was already correct in previous snippet, but kept for consistency)
         values = self.critic_head(critic_hidden).squeeze(-1)
         
         return values, log_probs, entropy
@@ -179,17 +177,12 @@ class MAPPOAgent(nn.Module):
 def canonicalize_obs(obs, is_red_agent):
     if not is_red_agent:
         return obs
-    
     is_batched = obs.dim() == 4
-    if not is_batched:
-        obs = obs.unsqueeze(0)
-    
+    if not is_batched: obs = obs.unsqueeze(0)
     canon = torch.flip(obs.clone(), dims=[-1])
     canon[:, [2, 3], :, :] = canon[:, [3, 2], :, :]
     canon[:, [6, 7], :, :] = canon[:, [7, 6], :, :]
-    
-    if not is_batched:
-        canon = canon.squeeze(0)
+    if not is_batched: canon = canon.squeeze(0)
     return canon
 
 
@@ -215,38 +208,13 @@ def get_agent_state(obs_canon):
 def compute_heuristic_shaping(obs_curr, obs_next):
     pos_curr, carry_curr = get_agent_state(obs_curr)
     pos_next, carry_next = get_agent_state(obs_next)
-
-    living_punishment = -0.15 #if u just punish it for being alive this apparently leads to good things, lets try
-    #this ends up being 0.01 remember
-    
-    #if carry_next > carry_curr or (carry_curr > 0 and carry_next == 0):
-    #    return living_punishment + 0.0
-
-    # dying is generally bad, especially if carrying stuff
+    living_punishment = -0.15 
     dist_moved = abs(pos_curr[0] - pos_next[0]) + abs(pos_curr[1] - pos_next[1])
     if dist_moved > 1.5:
         return living_punishment - 0.5 - (0.25 * carry_curr)
-    
-    if dist_moved < 0.1: #standing still is generally bad
+    if dist_moved < 0.1:
         return living_punishment - 0.075 
-
     return living_punishment
-    
-    # if carry_curr > 0:
-    #     dist_curr = pos_curr[1]
-    #     dist_next = pos_next[1]
-    #     return living_punishment - ((dist_curr - dist_next) * (0.8 + (0.1 * carry_curr)))
-
-    # food_ch = obs_curr[7]
-    # food_locs = (food_ch > 0).nonzero(as_tuple=False).float()
-    # if len(food_locs) == 0:
-    #     return 0.0
-    # curr_p = torch.tensor(pos_curr).float()
-    # next_p = torch.tensor(pos_next).float()
-    # dist_curr = (food_locs - curr_p).abs().sum(dim=1).min().item()
-    # dist_next = (food_locs - next_p).abs().sum(dim=1).min().item()
-
-    # return living_punishment - (dist_curr - dist_next)
 
 
 def merge_obs_for_critic(obs_list):
@@ -276,17 +244,13 @@ def compute_gae(rewards, values, dones, last_value, gamma):
 
 
 def evaluate_vs_bots(agent, num_episodes=20):
-    """Evaluate agent ONLY against MCTSTeam as requested."""
     agent.eval()
     returns = []
     wins = 0
-    
-    learner_ids = [1, 3] # Playing as Blue
+    learner_ids = [1, 3]
     
     for i in range(num_episodes):
-
         opp_name = BENCH_TEAMS[i % len(BENCH_TEAMS)]
-        
         eval_env = gymPacMan_parallel_env(
             layout_file='layouts/bloxCapture.lay',
             display=False,
@@ -296,57 +260,30 @@ def evaluate_vs_bots(agent, num_episodes=20):
             enemieName=opp_name,
             self_play=False
         )
-        
         obs_dict, info = eval_env.reset()
         episode_return = 0
         done = False
-        
         while not done:
             learner_obs = torch.stack([obs_dict[eval_env.agents[i]].float() for i in learner_ids])
-            
             with torch.no_grad():
                 actions = agent.get_deterministic_action(learner_obs.to(device)).cpu()
-            
             env_actions = {}
             for i, aid in enumerate(learner_ids):
                 env_actions[eval_env.agents[aid]] = actions[i].item()
-            
             obs_dict, rewards, dones, info = eval_env.step(env_actions)
             episode_return += sum(rewards[eval_env.agents[i]] for i in learner_ids)
             done = any(dones.values())
-        
         returns.append(episode_return)
         final_score = eval_env.game.state.data.score
-        # Blue wins if score < 0
-        if final_score < 0:
-            wins += 1
+        if final_score < 0: wins += 1
     
     agent.train()
     return np.mean(returns), np.std(returns), wins / num_episodes
 
 
 def train():
-    # Self-play env
-    env_selfplay = gymPacMan_parallel_env(
-        layout_file='layouts/bloxCapture.lay',
-        display=False,
-        reward_forLegalAction=True,
-        defenceReward=True,
-        length=300,
-        enemieName='randomTeam',
-        self_play=True
-    )
-    
-    # Bot opponent env (we play as blue, bots are red)
-    env_bot = gymPacMan_parallel_env(
-        layout_file='layouts/bloxCapture.lay',
-        display=False,
-        reward_forLegalAction=True,
-        defenceReward=True,
-        length=300,
-        enemieName='randomTeam',
-        self_play=False
-    )
+    env_selfplay = gymPacMan_parallel_env(layout_file='layouts/bloxCapture.lay', display=False, reward_forLegalAction=True, defenceReward=True, length=300, enemieName='randomTeam', self_play=True)
+    env_bot = gymPacMan_parallel_env(layout_file='layouts/bloxCapture.lay', display=False, reward_forLegalAction=True, defenceReward=True, length=300, enemieName='randomTeam', self_play=False)
     
     obs_shape = env_selfplay.get_Observation(0).shape
     num_agents = 2
@@ -356,78 +293,56 @@ def train():
     
     if LOAD_CHECKPOINT is not None:
         print(f"Loading checkpoint: {LOAD_CHECKPOINT}")
-        state_dict = torch.load(LOAD_CHECKPOINT, map_location=device)
-        agent.load_state_dict(state_dict)
+        agent.load_state_dict(torch.load(LOAD_CHECKPOINT, map_location=device))
     
-    # Pool for historical self-play
     opponent_pool = deque(maxlen=OPPONENT_POOL_SIZE)
-    # Initialize with current agent
     opponent_pool.append(copy.deepcopy(agent.state_dict()))
     
     log = {
-        'update': [], 'reward': [], 'ep_return': [],
-        'eval_return': [], 'eval_winrate': [],
-        'train_winrate': [], # Winrate against current opponent
-        'entropy': [], 'clip_frac': [], 'pg_loss': [], 'v_loss': [],
+        'update': [], 'reward': [], 'ep_return': [], 'eval_return': [], 'eval_winrate': [],
+        'train_winrate': [], 'entropy': [], 'clip_frac': [], 'pg_loss': [], 'v_loss': [],
         'lr': [], 'ent_coef': []
     }
     
     for update in range(START_UPDATES, TOTAL_UPDATES + 1):
-        # === ANNEAL HYPERPARAMETERS ===
         progress = update / TOTAL_UPDATES
         lr = LR_START - (LR_START - LR_END) * progress
         ent_coef = ENT_COEF_START - (ENT_COEF_START - ENT_COEF_END) * progress
+        for param_group in optimizer.param_groups: param_group['lr'] = lr
         
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-        
-        if update <= 200: #skip this part since checkpoint training run
-            # teach it the game
+        if update <= 200:
             use_bot_opponent = True
             play_as_red = False
             opp_name = np.random.choice(EASY_TEAMS)
             env = env_bot
             env.reset(enemieName=opp_name)
-            
         elif update <= 1000:
-
             use_bot_opponent = True
             play_as_red = False
-            opp_name = np.random.choice(EASY_TEAMS + MEDIUM_TEAMS + (HARD_TEAMS * 5)) #overrepresent hard teams
+            opp_name = np.random.choice(EASY_TEAMS + MEDIUM_TEAMS + (HARD_TEAMS * 5))
             env = env_bot
             env.reset(enemieName=opp_name)
-            
         else:
-            # PHASE 3: MIXED REGIME
             rand_val = np.random.rand()
-            
             if rand_val < 0.50:
-                # 40% Self-Play (Current Version)
                 use_bot_opponent = False
                 play_as_red = np.random.rand() > 0.5 
                 opp_name = "Self(Curr)"
                 env = env_selfplay
-                
                 opponent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
                 opponent.load_state_dict(agent.state_dict())
                 opponent.eval()
-                
             elif rand_val < 0.70:
-                # 20% Self-Play (Old Version)
                 use_bot_opponent = False
                 play_as_red = np.random.rand() > 0.5
                 opp_name = "Self(Old)"
                 env = env_selfplay
-                
                 opponent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
                 opponent.load_state_dict(opponent_pool[np.random.randint(len(opponent_pool))])
                 opponent.eval()
-                
             else:
-                # 30% face against a hard team weighted towards hard team
                 use_bot_opponent = True
                 play_as_red = False
-                #make hard teams very overrepresented
                 opp_name = np.random.choice((HARD_TEAMS * 5) + MEDIUM_TEAMS + EASY_TEAMS)
                 env = env_bot
                 env.reset(enemieName=opp_name)
@@ -439,10 +354,8 @@ def train():
             learner_ids = [1, 3]
             opponent_ids = [0, 2]
         
-        # Init win tracking for this update
         batch_wins = []
 
-        # Buffers
         obs_buf = torch.zeros(NUM_STEPS, num_agents, *obs_shape)
         merged_obs_buf = torch.zeros(NUM_STEPS, num_agents, *obs_shape)
         action_buf = torch.zeros(NUM_STEPS, num_agents, dtype=torch.long)
@@ -450,8 +363,10 @@ def train():
         reward_buf = torch.zeros(NUM_STEPS, num_agents)
         done_buf = torch.zeros(NUM_STEPS, num_agents)
         value_buf = torch.zeros(NUM_STEPS, num_agents)
+        # === CHANGED: Added mask buffer ===
+        mask_buf = torch.zeros(NUM_STEPS, num_agents, 5) 
         
-        obs_dict, _ = env.reset()
+        obs_dict, info = env.reset()
         episode_return = 0
         episode_returns = []
         
@@ -463,28 +378,40 @@ def train():
             merged_obs = merge_obs_for_critic(learner_obs_canon)
             merged_obs_batch = merged_obs.unsqueeze(0).expand(num_agents, -1, -1, -1)
 
-            # Store in buffer
             obs_buf[step] = learner_obs
             merged_obs_buf[step] = merged_obs_batch
+
+            # === CHANGED: Mask Extraction Logic ===
+            current_masks = torch.zeros(num_agents, 5).to(device)
+            # info contains 'legal_actions' for the *current* state (from reset or step)
+            if 'legal_actions' in info:
+                for idx, agent_idx in enumerate(learner_ids):
+                    agent_obj = env.agents[agent_idx]
+                    legal_moves = info['legal_actions'][agent_obj]
+                    current_masks[idx, legal_moves] = 1.0
+            else:
+                current_masks.fill_(1.0)
+            
+            mask_buf[step] = current_masks.cpu()
+            # ======================================
 
             with torch.no_grad():
                 actions, log_probs, values = [], [], []
                 for i in range(num_agents):
-                    # 1. Prepare inputs
-                    # learner_obs is (Num_Agents, C, H, W), slice to get (1, C, H, W)
                     local_obs = learner_obs[i:i+1].to(device)
-                    # merged_obs_batch is (Num_Agents, C, H, W), slice to get (1, C, H, W)
                     global_obs = merged_obs_batch[i].unsqueeze(0).to(device)
+                    # === CHANGED: Pass local mask ===
+                    local_mask = current_masks[i:i+1]
                     
-                    # 2. Get action from agent
-                    act, lp, val, _ = agent.get_action_and_value(local_obs, global_obs)
-                    
-                    # 3. Append to lists (CRITICAL STEP)
+                    act, lp, val, _ = agent.get_action_and_value(
+                        local_obs, 
+                        global_obs,
+                        action_mask=local_mask 
+                    )
                     actions.append(act)
                     log_probs.append(lp)
                     values.append(val)
                 
-                # 4. Concatenate lists into tensors (MUST BE DONE AFTER LOOP)
                 actions = torch.cat(actions)
                 log_probs = torch.cat(log_probs)
                 values = torch.cat(values)
@@ -493,34 +420,29 @@ def train():
             logprob_buf[step] = log_probs.cpu()
             value_buf[step] = values.cpu()
             
-            # === BUILD ENV ACTIONS ===
             env_actions = {}
             for i, aid in enumerate(learner_ids):
                 env_actions[env.agents[aid]] = canonicalize_action(actions[i], play_as_red).item()
             
-            if use_bot_opponent:
-                pass 
-            else:
-                # Self-play opponent
-                
+            if not use_bot_opponent:
                 opp_obs_raw = [obs_dict[env.agents[i]].float() for i in opponent_ids]
                 opp_obs_canon = [canonicalize_obs(o, not play_as_red) for o in opp_obs_raw]
                 opp_obs = torch.stack(opp_obs_canon)
-                
                 with torch.no_grad():
                     opp_list = [opp_obs[i:i+1].to(device) for i in range(num_agents)]
                     opp_actions = []
                     for i in range(num_agents):
+                        # Note: Opponent masking is complex because we need their legal moves, 
+                        # but standard eval usually ignores opponent masking or assumes valid returns.
+                        # For simplicity/speed we let opponent run unmasked or random-valid if it hits wall.
                         a, _, _, _ = opponent.get_action_and_value(opp_obs[i:i+1].to(device), opp_list)
                         opp_actions.append(a)
                     opp_actions = torch.cat(opp_actions)
-                
                 for i, aid in enumerate(opponent_ids):
                     env_actions[env.agents[aid]] = canonicalize_action(opp_actions[i], not play_as_red).item()
             
-            next_obs_dict, rewards, dones, _ = env.step(env_actions)
+            next_obs_dict, rewards, dones, info = env.step(env_actions)
             
-            # Shaping
             next_obs_raw = [next_obs_dict[env.agents[i]].float() for i in learner_ids]
             next_obs_canon = [canonicalize_obs(o, play_as_red) for o in next_obs_raw]
             shaping = [compute_heuristic_shaping(learner_obs_canon[i], next_obs_canon[i]) 
@@ -537,29 +459,19 @@ def train():
             obs_dict = next_obs_dict
             
             if done:
-                # === WIN LOGIC ===
                 final_score = env.game.state.data.score
-                if play_as_red:
-                    is_win = 1 if final_score > 0 else 0
-                else:
-                    is_win = 1 if final_score < 0 else 0
+                if play_as_red: is_win = 1 if final_score > 0 else 0
+                else: is_win = 1 if final_score < 0 else 0
                 batch_wins.append(is_win)
-                # =================
-
                 episode_returns.append(episode_return)
                 episode_return = 0
-                obs_dict, _ = env.reset()
+                obs_dict, info = env.reset()
 
-        
-        # GAE Setup
         learner_obs_raw = [obs_dict[env.agents[i]].float() for i in learner_ids]
         learner_obs_canon = [canonicalize_obs(o, play_as_red) for o in learner_obs_raw]
-        
-        # FIX: Manually merge the final observation for the critic
         final_merged_obs = merge_obs_for_critic(learner_obs_canon).unsqueeze(0).to(device)
         
         with torch.no_grad():
-            # Pass the single merged tensor
             last_value = agent.get_value(final_merged_obs).cpu().item()
 
         advantages = torch.zeros_like(reward_buf)
@@ -569,13 +481,14 @@ def train():
             advantages[:, i] = adv
             returns[:, i] = ret
             
-        # PPO Update
         b_obs = obs_buf.reshape(-1, *obs_shape)
         b_merged = merged_obs_buf.reshape(-1, *obs_shape)
         b_act = action_buf.reshape(-1)
         b_logp = logprob_buf.reshape(-1)
         b_adv = advantages.reshape(-1)
         b_ret = returns.reshape(-1)
+        # === CHANGED: Flatten masks ===
+        b_masks = mask_buf.reshape(-1, 5)
         
         inds = np.arange(NUM_STEPS * num_agents)
         pg_l, v_l, ent_l, clip_l = [], [], [], []
@@ -589,7 +502,8 @@ def train():
                     b_obs[mb].to(device), 
                     b_merged[mb].to(device), 
                     b_act[mb].to(device),
-                    num_agents, obs_shape
+                    num_agents, obs_shape,
+                    b_masks=b_masks[mb].to(device) # === CHANGED: Pass masks ===
                 )
                 
                 norm_adv = (b_adv[mb] - b_adv[mb].mean()) / (b_adv[mb].std() + 1e-8)
@@ -612,18 +526,13 @@ def train():
                 ent_l.append(ent.mean().item())
                 clip_l.append(((ratio - 1).abs() > CLIP_EPS).float().mean().item())
 
-        # Update opponent pool every 25 updates (as requested)
         if update % OPPONENT_UPDATE_FREQ == 0:
             opponent_pool.append(copy.deepcopy(agent.state_dict()))
         
-        # Log Winrate
-        if len(batch_wins) > 0:
-            current_win_rate = np.mean(batch_wins)
-        else:
-            current_win_rate = log['train_winrate'][-1] if log['train_winrate'] else 0.0
+        if len(batch_wins) > 0: current_win_rate = np.mean(batch_wins)
+        else: current_win_rate = log['train_winrate'][-1] if log['train_winrate'] else 0.0
         log['train_winrate'].append(current_win_rate)
 
-        # Evaluation (MCTS Only)
         if update > 0 and update % EVAL_FREQ == 0:
             eval_ret, eval_std, eval_wr = evaluate_vs_bots(agent, EVAL_EPISODES)
             log['eval_return'].append(eval_ret)
@@ -632,7 +541,6 @@ def train():
             log['eval_return'].append(log['eval_return'][-1] if log['eval_return'] else 0)
             log['eval_winrate'].append(log['eval_winrate'][-1] if log['eval_winrate'] else 0)
         
-        # Logging
         mean_reward = reward_buf.sum().item() / num_agents
         mean_ep_return = np.mean(episode_returns) if episode_returns else 0
         
@@ -662,59 +570,20 @@ def train():
 
     torch.save(agent.state_dict(), "mappo_resnet_final.pt")
     
-    # Plotting
     fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+    axes[0, 0].plot(log['update'], log['reward']); axes[0, 0].set_title('Rollout Reward'); axes[0, 0].set_xlabel('Update')
+    axes[0, 1].plot(log['update'], log['train_winrate'], color='green'); axes[0, 1].set_title('Training Win Rate'); axes[0, 1].set_ylabel('Win Rate (0-1)'); axes[0, 1].set_xlabel('Update')
+    axes[0, 2].plot(log['update'], log['eval_return']); axes[0, 2].set_title('Eval vs MCTS'); axes[0, 2].set_xlabel('Update')
+    ax2 = axes[0, 2].twinx(); ax2.plot(log['update'], [w*100 for w in log['eval_winrate']], 'r-', alpha=0.5); ax2.set_ylabel('Win Rate %', color='r')
+    axes[1, 0].plot(log['update'], log['entropy']); axes[1, 0].set_title('Entropy'); axes[1, 0].axhline(y=0.5, color='r', linestyle='--', alpha=0.5); axes[1, 0].set_xlabel('Update')
+    axes[1, 1].plot(log['update'], log['clip_frac']); axes[1, 1].set_title('Clip Fraction'); axes[1, 1].axhline(y=0.2, color='r', linestyle='--', alpha=0.5); axes[1, 1].set_xlabel('Update')
+    axes[1, 2].plot(log['update'], log['v_loss']); axes[1, 2].set_title('Value Loss'); axes[1, 2].set_xlabel('Update')
+    axes[2, 0].plot(log['update'], log['lr']); axes[2, 0].set_title('Learning Rate'); axes[2, 0].set_xlabel('Update')
+    axes[2, 1].plot(log['update'], log['ent_coef']); axes[2, 1].set_title('Entropy Coef'); axes[2, 1].set_xlabel('Update')
+    axes[2, 2].plot(log['update'], log['pg_loss']); axes[2, 2].set_title('Policy Loss'); axes[2, 2].set_xlabel('Update')
+    plt.tight_layout(); plt.savefig("mappo_resnet_training.png", dpi=150); plt.close()
     
-    axes[0, 0].plot(log['update'], log['reward'])
-    axes[0, 0].set_title('Rollout Reward')
-    axes[0, 0].set_xlabel('Update')
-    
-    axes[0, 1].plot(log['update'], log['train_winrate'], color='green', label='Train Win%')
-    axes[0, 1].set_title('Training Win Rate (vs Current Opp)')
-    axes[0, 1].set_ylabel('Win Rate (0-1)')
-    axes[0, 1].set_xlabel('Update')
-    
-    axes[0, 2].plot(log['update'], log['eval_return'], label='Return')
-    axes[0, 2].set_title('Eval vs MCTS')
-    axes[0, 2].set_xlabel('Update')
-    ax2 = axes[0, 2].twinx()
-    ax2.plot(log['update'], [w*100 for w in log['eval_winrate']], 'r-', alpha=0.5, label='Win%')
-    ax2.set_ylabel('Win Rate %', color='r')
-    
-    axes[1, 0].plot(log['update'], log['entropy'])
-    axes[1, 0].set_title('Entropy')
-    axes[1, 0].axhline(y=0.5, color='r', linestyle='--', alpha=0.5)
-    axes[1, 0].set_xlabel('Update')
-    
-    axes[1, 1].plot(log['update'], log['clip_frac'])
-    axes[1, 1].set_title('Clip Fraction')
-    axes[1, 1].axhline(y=0.2, color='r', linestyle='--', alpha=0.5)
-    axes[1, 1].set_xlabel('Update')
-    
-    axes[1, 2].plot(log['update'], log['v_loss'])
-    axes[1, 2].set_title('Value Loss')
-    axes[1, 2].set_xlabel('Update')
-    
-    axes[2, 0].plot(log['update'], log['lr'])
-    axes[2, 0].set_title('Learning Rate (annealed)')
-    axes[2, 0].set_xlabel('Update')
-    
-    axes[2, 1].plot(log['update'], log['ent_coef'])
-    axes[2, 1].set_title('Entropy Coef (annealed)')
-    axes[2, 1].set_xlabel('Update')
-    
-    axes[2, 2].plot(log['update'], log['pg_loss'])
-    axes[2, 2].set_title('Policy Loss')
-    axes[2, 2].set_xlabel('Update')
-    
-    plt.tight_layout()
-    plt.savefig("mappo_resnet_training.png", dpi=150)
-    plt.close()
-    
-    print(f"\n{'='*60}")
-    print(f"Final eval (MCTS): {log['eval_return'][-1]:.1f} return, {log['eval_winrate'][-1]*100:.1f}% winrate")
-    print(f"{'='*60}")
-
+    print(f"\n{'='*60}\nFinal eval (MCTS): {log['eval_return'][-1]:.1f} return, {log['eval_winrate'][-1]*100:.1f}% winrate\n{'='*60}")
 
 if __name__ == "__main__":
     train()
