@@ -58,79 +58,66 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
-class ViTBody(nn.Module):
-    def __init__(self, obs_shape, d_model=64, nhead=4, num_layers=2, patch_size=1):
+class HybridViTBody(nn.Module):
+    def __init__(self, obs_shape, d_model=64, nhead=4, num_layers=2):
         super().__init__()
         c, h, w = obs_shape
+        self.num_patches = h * w
         
-        # 1. Patch Embedding (The "Linear Projection" from the paper)
-        # For Pacman, we treat every 1x1 pixel as a patch to keep precision.
-        # This is mathematically equivalent to a Linear layer on every pixel.
-        self.patch_embed = nn.Conv2d(c, d_model, kernel_size=patch_size, stride=patch_size)
+        # 1. The "Hybrid" Stem (CNN)
+        # We keep the 3x3 Conv. In Pacman, knowing if a wall is *immediately* 
+        # next to you is critical. A pure linear patch projection struggles 
+        # to see "connected" walls.
+        self.feature_extractor = nn.Sequential(
+            layer_init(nn.Conv2d(c, 32, kernel_size=3, padding=1)),
+            nn.GELU(),
+            layer_init(nn.Conv2d(32, d_model, kernel_size=3, padding=1)),
+            nn.GELU(),
+        )
         
-        # Calculate sequence length (Number of patches)
-        self.num_patches = (h // patch_size) * (w // patch_size)
+        # 2. Learned Position Embeddings (Simpler than Meshgrid)
+        # We learn a vector for every pixel.
+        # Shape: (1, Num_Pixels, d_model)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, d_model))
         
-        # 2. Learnable Class Token (The [CLASS] token from BERT/ViT)
-        # Shape: (1, 1, d_model)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
-        
-        # 3. Learnable Position Embeddings (Standard ViT)
-        # We add 1 to num_patches to account for the cls_token
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, d_model))
-        
-        # 4. Transformer Encoder
+        # 3. Transformer Encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, 
             nhead=nhead, 
             dim_feedforward=d_model * 4, 
             dropout=0.0, 
-            activation="gelu", # Paper uses GELU
+            activation="gelu",
             batch_first=True,
             norm_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # Initialize parameters (Truncated Normal is standard for ViT)
+        # Init position embeds
         nn.init.normal_(self.pos_embed, std=0.02)
-        nn.init.normal_(self.cls_token, std=0.02)
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.Conv2d):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out')
 
     def forward(self, x):
         B, C, H, W = x.shape
         
-        # 1. Patch Partition & Linear Projection
-        # x: (B, C, H, W) -> (B, d_model, H, W)
-        x = self.patch_embed(x)
+        # 1. Extract Local Features (CNN)
+        x = self.feature_extractor(x) # (B, d_model, H, W)
         
-        # 2. Flatten to Sequence
-        # (B, d_model, H, W) -> (B, d_model, Num_Patches) -> (B, Num_Patches, d_model)
+        # 2. Flatten spatial dims
+        # (B, d_model, H*W) -> (B, H*W, d_model)
         x = x.flatten(2).transpose(1, 2)
         
-        # 3. Append CLS Token
-        # Expand cls_token to match batch size: (B, 1, d_model)
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        # Cat: (B, Num_Patches + 1, d_model)
-        x = torch.cat((cls_tokens, x), dim=1)
-        
-        # 4. Add Position Embeddings
-        # ViT adds position info *after* flattening and concatenation
+        # 3. Add Position Embeddings
+        # "I am the pixel at index 5" info is added here
         x = x + self.pos_embed
         
-        # 5. Transformer
+        # 4. Transformer (Global Mixing)
         x = self.transformer(x)
         
-        # 6. Output: Only take the CLS token (index 0)
-        # The paper says this token contains the "classification" embedding
-        return x[:, 0]
+        # 5. Global Average Pooling
+        # In RL, averaging is usually safer than [CLS] because 
+        # every part of the map gets a "vote".
+        x = x.mean(dim=1)
+        
+        return x
 
 class MAPPOAgent(nn.Module):
     def __init__(self, obs_shape, action_dim, num_agents):
