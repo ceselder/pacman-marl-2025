@@ -25,9 +25,9 @@ UPDATE_EPOCHS = 4
 TOTAL_UPDATES = 2000
 
 # Annealed hyperparameters
-LR_START = 2e-4 #original 2e4
-LR_END = 7e-5
-ENT_COEF_START = 0.0175 #reduce back if its just for 
+LR_START = 1e-4 #original 2e4
+LR_END = 4e-5
+ENT_COEF_START = 0.025 #reduce back if its just for 
 ENT_COEF_END = 0.0025
 
 # Settings
@@ -89,7 +89,7 @@ class TransformerBody(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, 
             nhead=nhead, 
-            dim_feedforward=d_model * 2, 
+            dim_feedforward=d_model * 4, 
             dropout=0.0, 
             batch_first=True,
             norm_first=True # Pre-LN is more stable for RL
