@@ -12,7 +12,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # ============================================
-# HYPERPARAMETERS - resnet OF ALL RUNS
+# HYPERPARAMETERS
 # ============================================
 NUM_STEPS = 2048
 BATCH_SIZE = 256
@@ -24,29 +24,21 @@ MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
 TOTAL_UPDATES = 2000
 
-# Annealed hyperparameters
-LR_START = 2e-4 #original 2e4
+LR_START = 2e-4
 LR_END = 7e-5
-ENT_COEF_START = 0.0175 #reduce back if its just for 
+ENT_COEF_START = 0.0175
 ENT_COEF_END = 0.0025
 
-# Settings
 OPPONENT_POOL_SIZE = 100 
 OPPONENT_UPDATE_FREQ = 10 
 SHAPING_SCALE = 0.1
 EVAL_FREQ = 50
 EVAL_EPISODES = 10
 
-# Phase 1, just learn against randoms, learn to get actual reward.
 EASY_TEAMS = ['randomTeam']
-
-# Isolating this one because it takes ages to train on
 MEDIUM_TEAMS = ['MCTSTeam', 'heuristicTeam']
-
-# Phase 3 Teams (Hardest), hardest to beat, train on these + self play
 HARD_TEAMS = ['baselineTeam', 'AstarTeam', 'approxQTeam']
 
-# Checkpoint
 LOAD_CHECKPOINT = None
 START_UPDATES = 0
 
@@ -74,10 +66,10 @@ def make_backbone(in_channels, hidden_dim=256):
         nn.Conv2d(in_channels, 64, 3, padding=1),
         nn.GELU(),
         ResidualBlock(64),
-        nn.Conv2d(64, 128, 3, stride=2, padding=1),   # 20→10
+        nn.Conv2d(64, 128, 3, stride=2, padding=1),
         nn.GELU(),
         ResidualBlock(128),
-        nn.Conv2d(128, hidden_dim, 3, stride=2, padding=1),  # 10→5
+        nn.Conv2d(128, hidden_dim, 3, stride=2, padding=1),
         nn.GELU(),
         ResidualBlock(hidden_dim),
         nn.AdaptiveAvgPool2d(1),
@@ -96,7 +88,6 @@ class MAPPOAgent(nn.Module):
         self.critic_backbone = make_backbone(c, hidden_dim)
         self.critic_head = nn.Linear(hidden_dim, 1)
 
-        # PPO-style init
         nn.init.orthogonal_(self.actor_head.weight, gain=0.01)
         nn.init.orthogonal_(self.critic_head.weight, gain=1.0)
 
@@ -161,37 +152,16 @@ def compute_heuristic_shaping(obs_curr, obs_next):
     pos_curr, carry_curr = get_agent_state(obs_curr)
     pos_next, carry_next = get_agent_state(obs_next)
 
-    living_punishment = -0.1 #if u just punish it for being alive this apparently leads to good things, lets try
-    #this ends up being 0.01 remember
+    living_punishment = -0.1
     
-    #if carry_next > carry_curr or (carry_curr > 0 and carry_next == 0):
-    #    return living_punishment + 0.0
-
-    # dying is generally bad, especially if carrying stuff
     dist_moved = abs(pos_curr[0] - pos_next[0]) + abs(pos_curr[1] - pos_next[1])
     if dist_moved > 1.5:
         return living_punishment - 0.5 - (0.25 * carry_curr)
     
-    if dist_moved < 0.1: #standing still is generally bad
+    if dist_moved < 0.1:
         return living_punishment - 0.075 
 
     return living_punishment
-    
-    # if carry_curr > 0:
-    #     dist_curr = pos_curr[1]
-    #     dist_next = pos_next[1]
-    #     return living_punishment - ((dist_curr - dist_next) * (0.8 + (0.1 * carry_curr)))
-
-    # food_ch = obs_curr[7]
-    # food_locs = (food_ch > 0).nonzero(as_tuple=False).float()
-    # if len(food_locs) == 0:
-    #     return 0.0
-    # curr_p = torch.tensor(pos_curr).float()
-    # next_p = torch.tensor(pos_next).float()
-    # dist_curr = (food_locs - curr_p).abs().sum(dim=1).min().item()
-    # dist_next = (food_locs - next_p).abs().sum(dim=1).min().item()
-
-    # return living_punishment - (dist_curr - dist_next)
 
 
 def merge_obs_for_critic(obs_list):
@@ -221,15 +191,13 @@ def compute_gae(rewards, values, dones, last_value, gamma):
 
 
 def evaluate_vs_bots(agent, num_episodes=20):
-    """Evaluate agent ONLY against MCTSTeam as requested."""
     agent.eval()
     returns = []
     wins = 0
     
-    learner_ids = [1, 3] # Playing as Blue
+    learner_ids = [1, 3]
     
     for i in range(num_episodes):
-
         opp_name = BENCH_TEAMS[i % len(BENCH_TEAMS)]
         
         eval_env = gymPacMan_parallel_env(
@@ -262,7 +230,6 @@ def evaluate_vs_bots(agent, num_episodes=20):
         
         returns.append(episode_return)
         final_score = eval_env.game.state.data.score
-        # Blue wins if score < 0
         if final_score < 0:
             wins += 1
     
@@ -271,7 +238,6 @@ def evaluate_vs_bots(agent, num_episodes=20):
 
 
 def train():
-    # Self-play env
     env_selfplay = gymPacMan_parallel_env(
         layout_file='layouts/bloxCapture.lay',
         display=False,
@@ -282,7 +248,6 @@ def train():
         self_play=True
     )
     
-    # Bot opponent env (we play as blue, bots are red)
     env_bot = gymPacMan_parallel_env(
         layout_file='layouts/bloxCapture.lay',
         display=False,
@@ -304,21 +269,18 @@ def train():
         state_dict = torch.load(LOAD_CHECKPOINT, map_location=device)
         agent.load_state_dict(state_dict)
     
-    # Pool for historical self-play
     opponent_pool = deque(maxlen=OPPONENT_POOL_SIZE)
-    # Initialize with current agent
     opponent_pool.append(copy.deepcopy(agent.state_dict()))
     
     log = {
         'update': [], 'reward': [], 'ep_return': [],
         'eval_return': [], 'eval_winrate': [],
-        'train_winrate': [], # Winrate against current opponent
+        'train_winrate': [],
         'entropy': [], 'clip_frac': [], 'pg_loss': [], 'v_loss': [],
         'lr': [], 'ent_coef': []
     }
     
     for update in range(START_UPDATES, TOTAL_UPDATES + 1):
-        # === ANNEAL HYPERPARAMETERS ===
         progress = update / TOTAL_UPDATES
         lr = LR_START - (LR_START - LR_END) * progress
         ent_coef = ENT_COEF_START - (ENT_COEF_START - ENT_COEF_END) * progress
@@ -326,8 +288,7 @@ def train():
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
         
-        if update <= 200: #skip this part since checkpoint training run
-            # teach it the game
+        if update <= 200:
             use_bot_opponent = True
             play_as_red = False
             opp_name = np.random.choice(EASY_TEAMS)
@@ -335,19 +296,16 @@ def train():
             env.reset(enemieName=opp_name)
             
         elif update <= 600:
-
             use_bot_opponent = True
             play_as_red = False
-            opp_name = np.random.choice(EASY_TEAMS + MEDIUM_TEAMS + (HARD_TEAMS * 5)) #overrepresent hard teams
+            opp_name = np.random.choice(EASY_TEAMS + MEDIUM_TEAMS + (HARD_TEAMS * 5))
             env = env_bot
             env.reset(enemieName=opp_name)
             
         else:
-            # PHASE 3: MIXED REGIME
             rand_val = np.random.rand()
             
             if rand_val < 0.40:
-                # 40% Self-Play (Current Version)
                 use_bot_opponent = False
                 play_as_red = np.random.rand() > 0.5 
                 opp_name = "Self(Curr)"
@@ -358,7 +316,6 @@ def train():
                 opponent.eval()
                 
             elif rand_val < 0.60:
-                # 20% Self-Play (Old Version)
                 use_bot_opponent = False
                 play_as_red = np.random.rand() > 0.5
                 opp_name = "Self(Old)"
@@ -369,10 +326,8 @@ def train():
                 opponent.eval()
                 
             else:
-                # 30% face against a hard team weighted towards hard team
                 use_bot_opponent = True
                 play_as_red = False
-                #make hard teams very overrepresented
                 opp_name = np.random.choice((HARD_TEAMS * 5) + MEDIUM_TEAMS + EASY_TEAMS)
                 env = env_bot
                 env.reset(enemieName=opp_name)
@@ -384,12 +339,10 @@ def train():
             learner_ids = [1, 3]
             opponent_ids = [0, 2]
         
-        # Init win tracking for this update
         batch_wins = []
 
-        # Buffers
         obs_buf = torch.zeros(NUM_STEPS, num_agents, *obs_shape)
-        merged_obs_buf = torch.zeros(NUM_STEPS, num_agents, *obs_shape)
+        merged_obs_buf = torch.zeros(NUM_STEPS, *obs_shape)
         action_buf = torch.zeros(NUM_STEPS, num_agents, dtype=torch.long)
         logprob_buf = torch.zeros(NUM_STEPS, num_agents)
         reward_buf = torch.zeros(NUM_STEPS, num_agents)
@@ -406,13 +359,12 @@ def train():
             learner_obs = torch.stack(learner_obs_canon)
             
             merged_obs = merge_obs_for_critic(learner_obs_canon)
-            merged_obs_batch = merged_obs.unsqueeze(0).expand(num_agents, -1, -1, -1)
             
             obs_buf[step] = learner_obs
-            merged_obs_buf[step] = merged_obs_batch
+            merged_obs_buf[step] = merged_obs
             
             with torch.no_grad():
-                merged = merged_obs.unsqueeze(0).to(device)  # (1, C, H, W)
+                merged = merged_obs.unsqueeze(0).to(device)
                 actions, log_probs, values = [], [], []
                 for i in range(num_agents):
                     act, lp, val, _ = agent.get_action_and_value(
@@ -429,24 +381,22 @@ def train():
             logprob_buf[step] = log_probs.cpu()
             value_buf[step] = values.cpu()
             
-            # === BUILD ENV ACTIONS ===
             env_actions = {}
             for i, aid in enumerate(learner_ids):
                 env_actions[env.agents[aid]] = canonicalize_action(actions[i], play_as_red).item()
             
-            if use_bot_opponent:
-                pass 
-            else:
-                # Self-play opponent
+            if not use_bot_opponent:
                 opp_obs_raw = [obs_dict[env.agents[i]].float() for i in opponent_ids]
                 opp_obs_canon = [canonicalize_obs(o, not play_as_red) for o in opp_obs_raw]
                 opp_obs = torch.stack(opp_obs_canon)
+                opp_merged = merge_obs_for_critic(opp_obs_canon).unsqueeze(0).to(device)
                 
                 with torch.no_grad():
-                    opp_list = [opp_obs[i:i+1].to(device) for i in range(num_agents)]
                     opp_actions = []
                     for i in range(num_agents):
-                        a, _, _, _ = opponent.get_action_and_value(opp_obs[i:i+1].to(device), opp_list)
+                        a, _, _, _ = opponent.get_action_and_value(
+                            opp_obs[i:i+1].to(device), opp_merged
+                        )
                         opp_actions.append(a)
                     opp_actions = torch.cat(opp_actions)
                 
@@ -455,7 +405,6 @@ def train():
             
             next_obs_dict, rewards, dones, _ = env.step(env_actions)
             
-            # Shaping
             next_obs_raw = [next_obs_dict[env.agents[i]].float() for i in learner_ids]
             next_obs_canon = [canonicalize_obs(o, play_as_red) for o in next_obs_raw]
             shaping = [compute_heuristic_shaping(learner_obs_canon[i], next_obs_canon[i]) 
@@ -472,14 +421,12 @@ def train():
             obs_dict = next_obs_dict
             
             if done:
-                # === WIN LOGIC ===
                 final_score = env.game.state.data.score
                 if play_as_red:
                     is_win = 1 if final_score > 0 else 0
                 else:
                     is_win = 1 if final_score < 0 else 0
                 batch_wins.append(is_win)
-                # =================
 
                 episode_returns.append(episode_return)
                 episode_return = 0
@@ -488,11 +435,10 @@ def train():
         # GAE
         learner_obs_raw = [obs_dict[env.agents[i]].float() for i in learner_ids]
         learner_obs_canon = [canonicalize_obs(o, play_as_red) for o in learner_obs_raw]
-        learner_obs = torch.stack(learner_obs_canon)
+        merged_obs = merge_obs_for_critic(learner_obs_canon).unsqueeze(0).to(device)
         
         with torch.no_grad():
-            all_list = [learner_obs[i:i+1].to(device) for i in range(num_agents)]
-            last_value = agent.get_value(all_list).cpu().item()
+            last_value = agent.get_value(merged_obs).cpu().item()
 
         advantages = torch.zeros_like(reward_buf)
         returns = torch.zeros_like(reward_buf)
@@ -503,7 +449,7 @@ def train():
             
         # PPO Update
         b_obs = obs_buf.reshape(-1, *obs_shape)
-        b_merged = merged_obs_buf.reshape(-1, *obs_shape)
+        b_merged = merged_obs_buf.unsqueeze(1).expand(-1, num_agents, -1, -1, -1).reshape(-1, *obs_shape)
         b_act = action_buf.reshape(-1)
         b_logp = logprob_buf.reshape(-1)
         b_adv = advantages.reshape(-1)
@@ -521,7 +467,6 @@ def train():
                     b_obs[mb].to(device), 
                     b_merged[mb].to(device), 
                     b_act[mb].to(device),
-                    num_agents, obs_shape
                 )
                 
                 norm_adv = (b_adv[mb] - b_adv[mb].mean()) / (b_adv[mb].std() + 1e-8)
@@ -544,18 +489,15 @@ def train():
                 ent_l.append(ent.mean().item())
                 clip_l.append(((ratio - 1).abs() > CLIP_EPS).float().mean().item())
 
-        # Update opponent pool every 25 updates (as requested)
         if update % OPPONENT_UPDATE_FREQ == 0:
             opponent_pool.append(copy.deepcopy(agent.state_dict()))
         
-        # Log Winrate
         if len(batch_wins) > 0:
             current_win_rate = np.mean(batch_wins)
         else:
             current_win_rate = log['train_winrate'][-1] if log['train_winrate'] else 0.0
         log['train_winrate'].append(current_win_rate)
 
-        # Evaluation (MCTS Only)
         if update > 0 and update % EVAL_FREQ == 0:
             eval_ret, eval_std, eval_wr = evaluate_vs_bots(agent, EVAL_EPISODES)
             log['eval_return'].append(eval_ret)
@@ -564,7 +506,6 @@ def train():
             log['eval_return'].append(log['eval_return'][-1] if log['eval_return'] else 0)
             log['eval_winrate'].append(log['eval_winrate'][-1] if log['eval_winrate'] else 0)
         
-        # Logging
         mean_reward = reward_buf.sum().item() / num_agents
         mean_ep_return = np.mean(episode_returns) if episode_returns else 0
         
@@ -594,7 +535,6 @@ def train():
 
     torch.save(agent.state_dict(), "mappo_resnet_final.pt")
     
-    # Plotting
     fig, axes = plt.subplots(3, 3, figsize=(15, 12))
     
     axes[0, 0].plot(log['update'], log['reward'])
