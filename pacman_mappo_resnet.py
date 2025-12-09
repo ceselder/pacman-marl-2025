@@ -86,10 +86,10 @@ class MAPPOAgent(nn.Module):
         self.obs_shape = obs_shape
         
         # --- HYPERPARAMETERS ---
-        self.d_model = 256     # Increased from 128
+        self.d_model = 64     # Increased from 128
         nhead = 4
         num_layers = 2
-        dim_ff = 1024          # Increased from 512
+        dim_ff = 256          # Increased from 512
         
         # Shared Positional Encoder
         self.pos_encoder = PositionalEncoding2D(self.d_model)
