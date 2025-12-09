@@ -52,6 +52,7 @@ START_UPDATES = 0
 
 BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
 
+
 class PositionalEncoding2D(nn.Module):
     """Sinusoidal positional encoding for 2D grids."""
     def __init__(self, d_model, max_h=50, max_w=50):
@@ -201,13 +202,17 @@ class MAPPOTransformerAgent(nn.Module):
         features = self.critic(merged_obs)
         return self.critic_head(features)
 
-    def get_action_and_value(self, obs, all_obs_list, merge_fn):
+    def get_action_and_value(self, obs, all_obs_list, merge_fn=None):
         """
         Args:
             obs: Single agent's observation [B, C, H, W] or [C, H, W]
             all_obs_list: List of all agents' observations
-            merge_fn: Function to merge observations for critic
+            merge_fn: Function to merge observations (optional, uses merge_obs_for_critic if not provided)
         """
+        from pacman_mappo_resnet import merge_obs_for_critic
+        if merge_fn is None:
+            merge_fn = merge_obs_for_critic
+            
         # Handle batched vs unbatched input
         if obs.dim() == 3:
             obs = obs.unsqueeze(0)
@@ -227,7 +232,11 @@ class MAPPOTransformerAgent(nn.Module):
         
         return action, log_prob, value, dist.entropy()
 
-    def get_value(self, all_obs_list, merge_fn):
+    def get_value(self, all_obs_list, merge_fn=None):
+        from pacman_mappo_resnet import merge_obs_for_critic
+        if merge_fn is None:
+            merge_fn = merge_obs_for_critic
+            
         if all_obs_list[0].dim() == 4:
             merged = merge_fn([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
         else:
@@ -296,7 +305,7 @@ def compute_heuristic_shaping(obs_curr, obs_next):
     pos_curr, carry_curr = get_agent_state(obs_curr)
     pos_next, carry_next = get_agent_state(obs_next)
 
-    living_punishment = -0.1 #if u just punish it for being alive this apparently leads to good things, lets try
+    living_punishment = -0.15 #if u just punish it for being alive this apparently leads to good things, lets try
     #this ends up being 0.01 remember
     
     #if carry_next > carry_curr or (carry_curr > 0 and carry_next == 0):
