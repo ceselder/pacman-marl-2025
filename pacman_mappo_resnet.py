@@ -22,10 +22,10 @@ CLIP_EPS = 0.15
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 4
-TOTAL_UPDATES = 2000
+TOTAL_UPDATES = 1800
 
-LR_START = 2e-4
-LR_END = 7e-5
+LR_START = 1.5e-4
+LR_END = 5e-5
 ENT_COEF_START = 0.0175
 ENT_COEF_END = 0.0025
 
@@ -50,10 +50,10 @@ class ResidualBlock(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1),
-            nn.GroupNorm(4, channels),
+            nn.GroupNorm(8, channels),
             nn.GELU(),
             nn.Conv2d(channels, channels, 3, padding=1),
-            nn.GroupNorm(4, channels),
+            nn.GroupNorm(8, channels),
         )
         self.act = nn.GELU()
 
@@ -61,31 +61,56 @@ class ResidualBlock(nn.Module):
         return self.act(x + self.net(x))
 
 
-def make_backbone(in_channels, hidden_dim=512):
+def make_backbone(in_channels):
     return nn.Sequential(
-        nn.Conv2d(in_channels, hidden_dim, 3, padding=1),
+        # 8 → 64, full res
+        nn.Conv2d(in_channels, 64, 3, padding=1),
         nn.GELU(),
-        ResidualBlock(hidden_dim),
-        ResidualBlock(hidden_dim),
-        nn.Conv2d(hidden_dim, hidden_dim, 3, stride=2, padding=1),  # 20→10
+        ResidualBlock(64),
+        ResidualBlock(64),
+        
+        # 64 → 128, full res
+        nn.Conv2d(64, 128, 3, padding=1),
         nn.GELU(),
-        ResidualBlock(hidden_dim),
+        ResidualBlock(128),
+        ResidualBlock(128),
+        
+        # 128 → 256, downsample 20→10
+        nn.Conv2d(128, 256, 3, stride=2, padding=1),
+        nn.GELU(),
+        ResidualBlock(256),
+        
+        # pool and flatten
         nn.AdaptiveAvgPool2d(1),
-        nn.Flatten(),
+        nn.Flatten(),  # → 256
     )
 
 
 class MAPPOAgent(nn.Module):
-    def __init__(self, obs_shape, action_dim, num_agents=2, hidden_dim=256):
+    def __init__(self, obs_shape, action_dim, num_agents=2):
         super().__init__()
         c, h, w = obs_shape
 
-        self.actor_backbone = make_backbone(c, hidden_dim)
-        self.actor_head = nn.Linear(hidden_dim, action_dim)
+        self.actor_backbone = make_backbone(c)
+        self.actor_head = nn.Linear(256, action_dim)
 
-        self.critic_backbone = make_backbone(c, hidden_dim)
-        self.critic_head = nn.Linear(hidden_dim, 1)
+        self.critic_backbone = make_backbone(c)
+        self.critic_head = nn.Linear(256, 1)
 
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
+        # PPO-specific: small init for policy, normal for value
         nn.init.orthogonal_(self.actor_head.weight, gain=0.01)
         nn.init.orthogonal_(self.critic_head.weight, gain=1.0)
 
@@ -293,7 +318,7 @@ def train():
             env = env_bot
             env.reset(enemieName=opp_name)
             
-        elif update <= 600:
+        elif update <= 800:
             use_bot_opponent = True
             play_as_red = False
             opp_name = np.random.choice(EASY_TEAMS + MEDIUM_TEAMS + (HARD_TEAMS * 5))
@@ -313,7 +338,7 @@ def train():
                 opponent.load_state_dict(agent.state_dict())
                 opponent.eval()
                 
-            elif rand_val < 0.60:
+            elif rand_val < 0.65:
                 use_bot_opponent = False
                 play_as_red = np.random.rand() > 0.5
                 opp_name = "Self(Old)"
