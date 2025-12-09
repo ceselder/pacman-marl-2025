@@ -52,169 +52,208 @@ START_UPDATES = 0
 
 BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
 
-
-class ResidualBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, stride=1)
-        self.gn1 = nn.GroupNorm(4, channels) 
-        self.act = nn.GELU()
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, stride=1)
-        self.gn2 = nn.GroupNorm(4, channels)
-        
-    def forward(self, x):
-        residual = x
-        out = self.conv1(x)
-        out = self.gn1(out)
-        out = self.act(out)
-        out = self.conv2(out)
-        out = self.gn2(out)
-        out += residual
-        out = self.act(out)
-        return out
-
 class PositionalEncoding2D(nn.Module):
+    """Sinusoidal positional encoding for 2D grids."""
     def __init__(self, d_model, max_h=50, max_w=50):
         super().__init__()
-        d_model_half = d_model // 2
+        d_half = d_model // 2
         
+        # Y (height) encoding
         y_pos = torch.arange(max_h).unsqueeze(1)
-        y_den = torch.exp(torch.arange(0, d_model_half, 2) * -(math.log(10000.0) / d_model_half))
-        y_enc = torch.zeros(max_h, d_model_half)
-        y_enc[:, 0::2] = torch.sin(y_pos * y_den)
-        y_enc[:, 1::2] = torch.cos(y_pos * y_den)
+        y_div = torch.exp(torch.arange(0, d_half, 2) * -(math.log(10000.0) / d_half))
+        y_enc = torch.zeros(max_h, d_half)
+        y_enc[:, 0::2] = torch.sin(y_pos * y_div)
+        y_enc[:, 1::2] = torch.cos(y_pos * y_div)
         
+        # X (width) encoding
         x_pos = torch.arange(max_w).unsqueeze(1)
-        x_den = torch.exp(torch.arange(0, d_model_half, 2) * -(math.log(10000.0) / d_model_half))
-        x_enc = torch.zeros(max_w, d_model_half)
-        x_enc[:, 0::2] = torch.sin(x_pos * x_den)
-        x_enc[:, 1::2] = torch.cos(x_pos * x_den)
+        x_div = torch.exp(torch.arange(0, d_half, 2) * -(math.log(10000.0) / d_half))
+        x_enc = torch.zeros(max_w, d_half)
+        x_enc[:, 0::2] = torch.sin(x_pos * x_div)
+        x_enc[:, 1::2] = torch.cos(x_pos * x_div)
         
         self.register_buffer('y_enc', y_enc)
         self.register_buffer('x_enc', x_enc)
 
     def forward(self, x):
         B, C, H, W = x.shape
-        y_emb = self.y_enc[:H, :].unsqueeze(1).repeat(1, W, 1)
-        x_emb = self.x_enc[:W, :].unsqueeze(0).repeat(H, 1, 1)
-        pos = torch.cat([y_emb, x_emb], dim=2)
-        pos = pos.permute(2, 0, 1).unsqueeze(0).repeat(B, 1, 1, 1)
+        y_emb = self.y_enc[:H].unsqueeze(1).expand(-1, W, -1)
+        x_emb = self.x_enc[:W].unsqueeze(0).expand(H, -1, -1)
+        pos = torch.cat([y_emb, x_emb], dim=2)  # [H, W, C]
+        pos = pos.permute(2, 0, 1).unsqueeze(0).expand(B, -1, -1, -1)
         return x + pos
 
-class MAPPOAgent(nn.Module):
-    def __init__(self, obs_shape, action_dim, num_agents=2):
+
+class TransformerBackbone(nn.Module):
+    """Shared transformer architecture for both actor and critic."""
+    def __init__(self, in_channels, d_model=256, nhead=8, num_layers=3, dim_ff=1024, dropout=0.0):
         super().__init__()
-        self.obs_shape = obs_shape
+        self.d_model = d_model
         
-        # --- ACTOR (CNN) ---
-        C_actor = 32
-        self.actor_backbone = nn.Sequential(
-            nn.Conv2d(obs_shape[0], C_actor, kernel_size=3, padding=1),
+        # Project input channels to d_model with a small conv stem
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=3, padding=1),
             nn.GELU(),
-            ResidualBlock(C_actor),
-            ResidualBlock(C_actor),
-            ResidualBlock(C_actor),
-            nn.Flatten()
+            nn.Conv2d(64, d_model, kernel_size=1),
         )
         
-        with torch.no_grad():
-            dummy = torch.zeros(1, *obs_shape)
-            actor_flat_dim = self.actor_backbone(dummy).shape[1]
-
-        self.actor_head = nn.Sequential(
-            nn.Linear(actor_flat_dim, 512),
-            nn.LayerNorm(512),
-            nn.GELU(),
-            nn.Linear(512, action_dim)
-        )
-
-        # --- CRITIC (DETR / Transformer) ---
-        self.d_model = 128
-        nhead = 4
-        num_layers = 2
-        dim_ff = 512
+        self.pos_encoder = PositionalEncoding2D(d_model)
         
-        self.critic_projector = nn.Sequential(
-            nn.Conv2d(obs_shape[0], 32, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(32, self.d_model, kernel_size=1)
-        )
-        
-        self.pos_encoder = PositionalEncoding2D(self.d_model)
+        # Learnable [CLS] token for pooling
+        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.d_model, nhead=nhead, dim_feedforward=dim_ff, dropout=0.0, batch_first=False
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_ff,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,  # More intuitive: [B, S, D]
+            norm_first=True,   # Pre-norm for stability
         )
-        self.critic_transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-        self.critic_head = nn.Sequential(
-            nn.Linear(self.d_model, 512),
-            nn.GELU(),
-            nn.Linear(512, 1)
-        )
-        
-        self.apply(self._init_weights)
-        nn.init.orthogonal_(self.actor_head[-1].weight, gain=0.01)
-        nn.init.orthogonal_(self.critic_head[-1].weight, gain=1.0)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(d_model)
 
-    def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Conv2d)):
-            nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
-            if module.bias is not None:
-                module.bias.data.fill_(0.0)
-
-    def _forward_critic(self, obs):
-        x = self.critic_projector(obs)
+    def forward(self, x):
+        B = x.shape[0]
+        
+        # Stem + positional encoding
+        x = self.stem(x)
         x = self.pos_encoder(x)
         
-        # Reshape for transformer: [Sequence, Batch, Dim]
-        x = x.flatten(2).permute(2, 0, 1)
+        # Flatten spatial dims: [B, D, H, W] -> [B, H*W, D]
+        x = x.flatten(2).permute(0, 2, 1)
         
-        x = self.critic_transformer(x)
-        x = x.mean(dim=0) # Global Average Pooling
+        # Prepend CLS token
+        cls = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls, x], dim=1)
         
-        return self.critic_head(x)
+        # Transformer
+        x = self.transformer(x)
+        x = self.norm(x)
+        
+        # Return CLS token output
+        return x[:, 0]
 
-    def get_action_and_value(self, obs, all_obs_list):
-        h_actor = self.actor_backbone(obs)
-        logits = self.actor_head(h_actor)
+
+class MAPPOTransformerAgent(nn.Module):
+    """
+    MAPPO agent with transformer backbones for both actor and critic.
+    
+    Architecture choices (overkill-ish for 20x20, but should learn well):
+    - d_model=256: Rich per-token representation
+    - nhead=8: Fine-grained attention patterns
+    - num_layers=3: Enough depth for multi-hop reasoning
+    - dim_ff=1024: Standard 4x expansion
+    - CLS token pooling: Cleaner than mean pooling, lets model learn what to aggregate
+    """
+    def __init__(self, obs_shape, action_dim, num_agents=2, 
+                 d_model=256, nhead=8, num_layers=3, dim_ff=1024):
+        super().__init__()
+        self.obs_shape = obs_shape
+        self.num_agents = num_agents
+        
+        # Actor: processes single agent observation
+        self.actor = TransformerBackbone(
+            in_channels=obs_shape[0],
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            dim_ff=dim_ff,
+        )
+        self.actor_head = nn.Sequential(
+            nn.Linear(d_model, 512),
+            nn.GELU(),
+            nn.Linear(512, action_dim),
+        )
+        
+        # Critic: processes merged observations from all agents
+        # Input channels = obs_shape[0] * num_agents (assuming channel-wise concat)
+        self.critic = TransformerBackbone(
+            in_channels=obs_shape[0] * num_agents,  # Adjust if merge_obs_for_critic works differently
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            dim_ff=dim_ff,
+        )
+        self.critic_head = nn.Sequential(
+            nn.Linear(d_model, 512),
+            nn.GELU(),
+            nn.Linear(512, 1),
+        )
+        
+        self._init_weights()
+
+    def _init_weights(self):
+        # Policy head: small init for initial uniform-ish policy
+        nn.init.orthogonal_(self.actor_head[-1].weight, gain=0.01)
+        nn.init.zeros_(self.actor_head[-1].bias)
+        
+        # Value head: standard init
+        nn.init.orthogonal_(self.critic_head[-1].weight, gain=1.0)
+        nn.init.zeros_(self.critic_head[-1].bias)
+
+    def _forward_actor(self, obs):
+        features = self.actor(obs)
+        return self.actor_head(features)
+
+    def _forward_critic(self, merged_obs):
+        features = self.critic(merged_obs)
+        return self.critic_head(features)
+
+    def get_action_and_value(self, obs, all_obs_list, merge_fn):
+        """
+        Args:
+            obs: Single agent's observation [B, C, H, W] or [C, H, W]
+            all_obs_list: List of all agents' observations
+            merge_fn: Function to merge observations for critic
+        """
+        # Handle batched vs unbatched input
+        if obs.dim() == 3:
+            obs = obs.unsqueeze(0)
+        
+        logits = self._forward_actor(obs)
         dist = Categorical(logits=logits)
         action = dist.sample()
         log_prob = dist.log_prob(action)
         
+        # Merge observations for centralized critic
         if all_obs_list[0].dim() == 4:
-            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
+            merged = merge_fn([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
         else:
-            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
-            
+            merged = merge_fn(all_obs_list).unsqueeze(0)
+        
         value = self._forward_critic(merged.to(obs.device)).squeeze(-1)
         
         return action, log_prob, value, dist.entropy()
 
-    def get_value(self, all_obs_list):
+    def get_value(self, all_obs_list, merge_fn):
         if all_obs_list[0].dim() == 4:
-            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
+            merged = merge_fn([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
         else:
-            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
+            merged = merge_fn(all_obs_list).unsqueeze(0)
         
         return self._forward_critic(merged.to(all_obs_list[0].device)).squeeze(-1)
 
-    def evaluate(self, obs, merged_obs, action, num_agents, obs_shape):
-        h_actor = self.actor_backbone(obs)
-        logits = self.actor_head(h_actor)
+    def evaluate(self, obs, merged_obs, action):
+        """For PPO update step with pre-merged observations."""
+        logits = self._forward_actor(obs)
         dist = Categorical(logits=logits)
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
-        
         value = self._forward_critic(merged_obs).squeeze(-1)
-        
         return value, log_prob, entropy
-    
+
     def get_deterministic_action(self, obs):
         with torch.no_grad():
-            h = self.actor_backbone(obs)
-            logits = self.actor_head(h)
+            if obs.dim() == 3:
+                obs = obs.unsqueeze(0)
+            logits = self._forward_actor(obs)
             return logits.argmax(dim=-1)
+
+
+# For backward compatibility / easy swap-in
+MAPPOAgent = MAPPOTransformerAgent
 
 
 def canonicalize_obs(obs, is_red_agent):
