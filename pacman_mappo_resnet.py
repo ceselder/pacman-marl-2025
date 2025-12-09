@@ -86,7 +86,7 @@ def make_backbone(in_channels, hidden_dim=256):
 
 
 class MAPPOAgent(nn.Module):
-    def __init__(self, obs_shape, action_dim, hidden_dim=256):
+    def __init__(self, obs_shape, action_dim, num_agents=2, hidden_dim=256):
         super().__init__()
         c, h, w = obs_shape
 
