@@ -58,7 +58,7 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
-class HybridViTBody(nn.Module):
+class ViTBody(nn.Module):
     def __init__(self, obs_shape, d_model=64, nhead=4, num_layers=2):
         super().__init__()
         c, h, w = obs_shape
