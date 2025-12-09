@@ -53,7 +53,7 @@ START_UPDATES = 0
 BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
 
 class PositionalEncoding2D(nn.Module):
-    def __init__(self, d_model, max_h=128, max_w=128):
+    def __init__(self, d_model, max_h=50, max_w=50):
         super().__init__()
         d_model_half = d_model // 2
         
@@ -73,11 +73,10 @@ class PositionalEncoding2D(nn.Module):
         self.register_buffer('x_enc', x_enc)
 
     def forward(self, x):
-        # x: [B, d_model, H, W]
         B, C, H, W = x.shape
         y_emb = self.y_enc[:H, :].unsqueeze(1).repeat(1, W, 1)
         x_emb = self.x_enc[:W, :].unsqueeze(0).repeat(H, 1, 1)
-        pos = torch.cat([y_emb, x_emb], dim=2) 
+        pos = torch.cat([y_emb, x_emb], dim=2)
         pos = pos.permute(2, 0, 1).unsqueeze(0).repeat(B, 1, 1, 1)
         return x + pos
 
@@ -86,67 +85,57 @@ class MAPPOAgent(nn.Module):
         super().__init__()
         self.obs_shape = obs_shape
         
-        # --- CONFIGURATION ---
-        HIDDEN_DIM = 1024       # Massive hidden layer
-        TRANSFORMER_DIM = 128   # Embedding size
-        HEADS = 4
-        LAYERS = 2
+        # --- HYPERPARAMETERS ---
+        self.d_model = 256     # Increased from 128
+        nhead = 4
+        num_layers = 2
+        dim_ff = 1024          # Increased from 512
         
+        # Shared Positional Encoder
+        self.pos_encoder = PositionalEncoding2D(self.d_model)
+
         # =====================================================================
-        # 1. SIMPLE CNN ACTOR (Fast)
+        # ACTOR (Transformer)
         # =====================================================================
-        self.actor_backbone = nn.Sequential(
+        self.actor_projector = nn.Sequential(
             nn.Conv2d(obs_shape[0], 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Flatten()
+            nn.GELU(),
+            nn.Conv2d(32, self.d_model, kernel_size=1)
         )
         
-        # Calculate flat dim
-        with torch.no_grad():
-            dummy = torch.zeros(1, *obs_shape)
-            actor_flat_dim = self.actor_backbone(dummy).shape[1]
-
+        actor_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model, nhead=nhead, dim_feedforward=dim_ff, 
+            dropout=0.0, batch_first=False, norm_first=True
+        )
+        self.actor_transformer = nn.TransformerEncoder(actor_layer, num_layers=num_layers)
+        
         self.actor_head = nn.Sequential(
-            nn.Linear(actor_flat_dim, HIDDEN_DIM),
-            nn.LayerNorm(HIDDEN_DIM),
-            nn.ReLU(),
-            nn.Linear(HIDDEN_DIM, action_dim)
+            nn.Linear(self.d_model, 1024),
+            nn.LayerNorm(1024),
+            nn.GELU(),
+            nn.Linear(1024, action_dim)
         )
 
         # =====================================================================
-        # 2. TRANSFORMER CRITIC (Smart)
+        # CRITIC (Transformer)
         # =====================================================================
-        # NOTE: If merge_obs_for_critic stacks agents, channels = obs_shape[0] * num_agents
-        # If it just averages them or something else, change this back to obs_shape[0]
-        critic_channels = obs_shape[0] * num_agents 
-
+        # Note: We use obs_shape[0] assuming channels are consistent or handled via merging
         self.critic_projector = nn.Sequential(
-            nn.Conv2d(critic_channels, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, TRANSFORMER_DIM, kernel_size=1) 
+            nn.Conv2d(obs_shape[0], 32, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(32, self.d_model, kernel_size=1)
         )
         
-        self.pos_encoder = PositionalEncoding2D(TRANSFORMER_DIM)
-        
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=TRANSFORMER_DIM, 
-            nhead=HEADS, 
-            dim_feedforward=512, 
-            dropout=0.0, 
-            batch_first=True, # Keeps batch at index 0
-            norm_first=True   # Better for RL gradients
+        critic_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model, nhead=nhead, dim_feedforward=dim_ff, 
+            dropout=0.0, batch_first=False, norm_first=True
         )
-        self.critic_transformer = nn.TransformerEncoder(encoder_layer, num_layers=LAYERS)
+        self.critic_transformer = nn.TransformerEncoder(critic_layer, num_layers=num_layers)
         
         self.critic_head = nn.Sequential(
-            nn.Linear(TRANSFORMER_DIM, HIDDEN_DIM),
-            nn.LayerNorm(HIDDEN_DIM),
-            nn.ReLU(),
-            nn.Linear(HIDDEN_DIM, 1)
+            nn.Linear(self.d_model, 1024),
+            nn.GELU(),
+            nn.Linear(1024, 1)
         )
         
         self.apply(self._init_weights)
@@ -159,72 +148,71 @@ class MAPPOAgent(nn.Module):
             if module.bias is not None:
                 module.bias.data.fill_(0.0)
 
-    def _forward_critic(self, obs):
-        # 1. Project CNN [B, C, H, W] -> [B, 128, H, W]
-        x = self.critic_projector(obs)
+    def _forward_transformer(self, obs, projector, transformer):
+        # 1. Project to d_model
+        x = projector(obs)
         
         # 2. Add Positional Encoding
         x = self.pos_encoder(x)
         
-        # 3. Flatten and Permute for Transformer
-        # From: [Batch, Dim, H, W] 
-        # To:   [Batch, Sequence(H*W), Dim]
-        x = x.flatten(2).transpose(1, 2)
+        # 3. Reshape: [Batch, Dim, H, W] -> [Sequence, Batch, Dim]
+        # (batch_first=False in encoder layer, so Sequence is dim 0)
+        x = x.flatten(2).permute(2, 0, 1)
         
-        # 4. Transformer Magic
-        x = self.critic_transformer(x)
+        # 4. Transformer
+        x = transformer(x)
         
-        # 5. Global Average Pooling (Squash sequence to 1 vector)
-        x = x.mean(dim=1) 
-        
-        return self.critic_head(x)
+        # 5. Global Average Pooling (over sequence dimension 0)
+        x = x.mean(dim=0)
+        return x
 
     def get_action_and_value(self, obs, all_obs_list):
         # --- ACTOR ---
-        h_actor = self.actor_backbone(obs)
+        h_actor = self._forward_transformer(obs, self.actor_projector, self.actor_transformer)
         logits = self.actor_head(h_actor)
         dist = Categorical(logits=logits)
         action = dist.sample()
         log_prob = dist.log_prob(action)
         
-        # --- CRITIC (Your Custom Logic) ---
+        # --- CRITIC ---
         if all_obs_list[0].dim() == 4:
             merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
         else:
             merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
             
-        value = self._forward_critic(merged.to(obs.device)).squeeze(-1)
+        h_critic = self._forward_transformer(merged.to(obs.device), self.critic_projector, self.critic_transformer)
+        value = self.critic_head(h_critic).squeeze(-1)
         
         return action, log_prob, value, dist.entropy()
 
     def get_value(self, all_obs_list):
-        # --- CRITIC (Your Custom Logic) ---
         if all_obs_list[0].dim() == 4:
             merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
         else:
             merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
         
-        return self._forward_critic(merged.to(all_obs_list[0].device)).squeeze(-1)
+        h_critic = self._forward_transformer(merged.to(all_obs_list[0].device), self.critic_projector, self.critic_transformer)
+        return self.critic_head(h_critic).squeeze(-1)
 
     def evaluate(self, obs, merged_obs, action, num_agents, obs_shape):
         # Actor
-        h_actor = self.actor_backbone(obs)
+        h_actor = self._forward_transformer(obs, self.actor_projector, self.actor_transformer)
         logits = self.actor_head(h_actor)
         dist = Categorical(logits=logits)
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
         
         # Critic
-        value = self._forward_critic(merged_obs).squeeze(-1)
+        h_critic = self._forward_transformer(merged_obs, self.critic_projector, self.critic_transformer)
+        value = self.critic_head(h_critic).squeeze(-1)
         
         return value, log_prob, entropy
     
     def get_deterministic_action(self, obs):
         with torch.no_grad():
-            h = self.actor_backbone(obs)
-            logits = self.actor_head(h)
+            h_actor = self._forward_transformer(obs, self.actor_projector, self.actor_transformer)
+            logits = self.actor_head(h_actor)
             return logits.argmax(dim=-1)
-
 
 def canonicalize_obs(obs, is_red_agent):
     if not is_red_agent:
