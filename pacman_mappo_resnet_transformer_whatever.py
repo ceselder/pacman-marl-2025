@@ -51,118 +51,183 @@ START_UPDATES = 0
 
 BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
 
-class MAPPOAgent(nn.Module):
-    def __init__(self, obs_shape, action_dim, num_agents=2):
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    torch.nn.init.orthogonal_(layer.weight, std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+class TransformerBody(nn.Module):
+    def __init__(self, obs_shape, d_model=128, nhead=4, num_layers=2):
         super().__init__()
-        self.obs_shape = obs_shape
+        c, h, w = obs_shape
         
-        # --- BUILDER FOR SIMPLE CNN BACKBONE ---
-        # Structure: Input -> 16 -> 16 -> 32 -> Flatten
-        def make_backbone():
-            return nn.Sequential(
-                nn.Conv2d(obs_shape[0], 16, kernel_size=3, stride=1, padding=1),
-                nn.GELU(),
-                
-                nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
-                nn.GELU(),
-                
-                nn.Flatten()
-            )
-
-        # --- SEPARATE BACKBONES ---
-        # We instantiate two completely independent CNNs.
-        self.actor_backbone = make_backbone()
-        self.critic_backbone = make_backbone()
-        
-        # Calculate the flat dimension size dynamically
-        with torch.no_grad():
-            dummy = torch.zeros(1, *obs_shape)
-            flat_dim = self.actor_backbone(dummy).shape[1]
-
-        hidden_dim = 1024
-
-        # --- HEADS ---
-        # Actor Head: 1024 -> Action Probabilities
-        self.actor_head = nn.Sequential(
-            nn.Linear(flat_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, action_dim)
-        )
-
-        # Critic Head: 1024 -> Value Scalar
-        self.critic_head = nn.Sequential(
-            nn.Linear(flat_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1)
+        # 1. Patch/Feature Embedding (CNN)
+        # We preserve spatial resolution initially to allow the transformer 
+        # to reason about specific grid locations.
+        self.encoder = nn.Sequential(
+            layer_init(nn.Conv2d(c, 32, kernel_size=3, padding=1)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(32, d_model, kernel_size=3, padding=1)),
+            nn.ReLU()
         )
         
-        self.apply(self._init_weights)
+        # 2. Learnable Positional Encodings
+        # Shape: (1, d_model, H, W). We use a max size to be safe, 
+        # though Pacman maps are usually fixed or small.
+        self.pos_embedding = nn.Parameter(torch.randn(1, d_model, h, w) * 0.02)
         
-        # Orthogonal Initialization for stability
-        nn.init.orthogonal_(self.actor_head[-1].weight, gain=0.01)
-        nn.init.constant_(self.actor_head[-1].bias, 0.0)
-        nn.init.orthogonal_(self.critic_head[-1].weight, gain=1.0)
-        nn.init.constant_(self.critic_head[-1].bias, 0.0)
+        # 3. Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, 
+            nhead=nhead, 
+            dim_feedforward=d_model*2, 
+            dropout=0.0,
+            batch_first=True,
+            norm_first=True # Pre-Norm usually stabilizes RL training
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # 4. Output projection
+        self.d_model = d_model
+        self.seq_len = h * w
 
-    def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Conv2d)):
-            nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
-            if module.bias is not None:
-                module.bias.data.fill_(0.0)
+    def forward(self, x):
+        B, C, H, W = x.shape
+        
+        # Embed Features: (B, d_model, H, W)
+        x = self.encoder(x)
+        
+        # Add Positional Embeddings (Broadcasting B)
+        # We slice pos_embedding in case the layout is smaller than initialized max
+        pos = self.pos_embedding[:, :, :H, :W]
+        x = x + pos
+        
+        # Flatten for Transformer: (B, Seq_Len, d_model) where Seq_Len = H*W
+        x = x.flatten(2).transpose(1, 2)
+        
+        # Apply Transformer
+        x = self.transformer(x)
+        
+        # Global Average Pooling to get a single vector per agent
+        # (B, Seq_Len, d_model) -> (B, d_model)
+        x = x.mean(dim=1)
+        
+        return x
 
-    def get_action_and_value(self, obs, all_obs_list):
-        # 1. ACTOR PATH
-        # Uses its own private CNN to look for tactics
-        h_actor = self.actor_backbone(obs)
-        logits = self.actor_head(h_actor)
+class MAPPOAgent(nn.Module):
+    def __init__(self, obs_shape, action_dim, num_agents):
+        super().__init__()
+        self.num_agents = num_agents
         
-        dist = Categorical(logits=logits)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
+        # Transformer Hyperparameters
+        d_model = 128
+        nhead = 4
+        num_layers = 2
         
-        # 2. CRITIC PATH
-        # Uses its own private CNN to look for strategy
-        # Must merge observations first
-        if all_obs_list[0].dim() == 4:
-            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
-        else:
-            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
+        # --- Actor Network (Local Observation) ---
+        self.actor_body = TransformerBody(obs_shape, d_model, nhead, num_layers)
+        self.actor_head = layer_init(nn.Linear(d_model, action_dim), std=0.01)
+
+        # --- Critic Network (Global/Merged Observation) ---
+        # The critic uses a separate transformer to prevent gradient interference
+        self.critic_body = TransformerBody(obs_shape, d_model, nhead, num_layers)
+        self.critic_head = layer_init(nn.Linear(d_model, 1), std=1.0)
+
+    def _process_critic_input(self, critic_input):
+        """
+        Handles formatting inputs for the critic.
+        The training loop passes a list of tensors [obs1, obs2] during rollout,
+        but a single batched merged tensor during PPO updates.
+        """
+        if isinstance(critic_input, list):
+            # We need to merge them manually on the fly if passed as a list
+            # This logic mimics the 'merge_obs_for_critic' function provided in the prompt
+            # but handles Torch tensors directly.
             
-        h_critic = self.critic_backbone(merged.to(obs.device))
-        value = self.critic_head(h_critic).squeeze(-1)
-        
-        return action, log_prob, value, dist.entropy()
-
-    def get_value(self, all_obs_list):
-        if all_obs_list[0].dim() == 4:
-            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
+            # Assuming critic_input is [obs_tensor_1, obs_tensor_2]
+            # Obs shape: (B, C, H, W) or (C, H, W)
+            base = critic_input[0].clone()
+            
+            # If input is not batched (C, H, W), unsqueeze to (1, C, H, W)
+            if base.dim() == 3:
+                base = base.unsqueeze(0)
+                is_batched = False
+            else:
+                is_batched = True
+            
+            # Create team locations map (Channel 1 is self location in the env)
+            team_locs = torch.zeros_like(base[:, 1])
+            
+            for obs in critic_input:
+                o = obs if obs.dim() == 4 else obs.unsqueeze(0)
+                team_locs = torch.maximum(team_locs, o[:, 1])
+            
+            merged = base.clone()
+            merged[:, 1] = team_locs
+            # Clear Channel 4 (Ally locations) as it is now redundant/merged into ch1
+            merged[:, 4] = torch.zeros_like(merged[:, 4])
+            
+            if not is_batched:
+                merged = merged.squeeze(0)
+            return merged
         else:
-            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
-        
-        h_critic = self.critic_backbone(merged.to(all_obs_list[0].device))
-        return self.critic_head(h_critic).squeeze(-1)
+            # Already a merged tensor (from the replay buffer)
+            return critic_input
 
-    def evaluate(self, obs, merged_obs, action, num_agents, obs_shape):
-        # Re-evaluate actor actions
-        h_actor = self.actor_backbone(obs)
-        logits = self.actor_head(h_actor)
-        dist = Categorical(logits=logits)
-        log_prob = dist.log_prob(action)
-        entropy = dist.entropy()
+    def get_value(self, state):
+        """
+        state: Can be a list of observations (rollout) or a batched merged tensor (training).
+        """
+        x = self._process_critic_input(state)
+        hidden = self.critic_body(x)
+        return self.critic_head(hidden)
+
+    def get_action_and_value(self, x, state=None, action=None):
+        """
+        x: Local observation for the actor (B, C, H, W)
+        state: Global observation info for the critic
+        action: Specific action to evaluate (optional)
+        """
+        # 1. Actor Forward Pass
+        actor_hidden = self.actor_body(x)
+        logits = self.actor_head(actor_hidden)
+        probs = Categorical(logits=logits)
         
-        # Re-evaluate critic values
-        h_critic = self.critic_backbone(merged_obs)
-        value = self.critic_head(h_critic).squeeze(-1)
+        if action is None:
+            action = probs.sample()
+            
+        # 2. Critic Forward Pass
+        if state is None:
+            # If no state provided, use local obs (not recommended for MAPPO but fallback)
+            state = x 
+        value = self.get_value(state)
         
-        return value, log_prob, entropy
-    
-    def get_deterministic_action(self, obs):
-        with torch.no_grad():
-            h = self.actor_backbone(obs)
-            logits = self.actor_head(h)
-            return logits.argmax(dim=-1)
+        return action, probs.log_prob(action), value, probs.entropy()
+
+    def get_deterministic_action(self, x):
+        """For evaluation"""
+        hidden = self.actor_body(x)
+        logits = self.actor_head(hidden)
+        return torch.argmax(logits, dim=1)
+
+    def evaluate(self, b_obs, b_merged_obs, b_action, num_agents, obs_shape):
+        """
+        Used specifically in the PPO update loop.
+        b_obs: (Batch, C, H, W) - Local observations
+        b_merged_obs: (Batch, C, H, W) - Merged global observations
+        """
+        # Actor
+        actor_hidden = self.actor_body(b_obs)
+        logits = self.actor_head(actor_hidden)
+        probs = Categorical(logits=logits)
+        log_probs = probs.log_prob(b_action)
+        entropy = probs.entropy()
+        
+        # Critic
+        critic_hidden = self.critic_body(b_merged_obs)
+        values = self.critic_head(critic_hidden).squeeze(-1)
+        
+        return values, log_probs, entropy
 
 
 def canonicalize_obs(obs, is_red_agent):
