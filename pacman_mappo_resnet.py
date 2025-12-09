@@ -411,19 +411,12 @@ def train():
             merged_obs_buf[step] = merged_obs_batch
             
             with torch.no_grad():
-                all_obs_list = [learner_obs[i:i+1].to(device) for i in range(num_agents)]
+                merged = merged_obs.unsqueeze(0).to(device)  # (1, C, H, W)
                 actions, log_probs, values = [], [], []
                 for i in range(num_agents):
                     act, lp, val, _ = agent.get_action_and_value(
-                        learner_obs[i:i+1].to(device), all_obs_list
+                        learner_obs[i:i+1].to(device), merged
                     )
-                    actions.append(act)
-                    log_probs.append(lp)
-                    values.append(val)
-                actions = torch.cat(actions)
-                log_probs = torch.cat(log_probs)
-                values = torch.cat(values)
-            
             action_buf[step] = actions.cpu()
             logprob_buf[step] = log_probs.cpu()
             value_buf[step] = values.cpu()
