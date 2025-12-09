@@ -476,23 +476,26 @@ def train():
             merged_obs_buf[step] = merged_obs_batch
 
             with torch.no_grad():
-                # DELETE THIS LINE: all_obs_list = ... we don't need the list anymore
-                
                 actions, log_probs, values = [], [], []
                 for i in range(num_agents):
-                    # FIX: Pass the pre-merged tensor slice [i] to the agent
-                    # We unsqueeze(0) to keep it as (1, C, H, W)
-                    global_state = merged_obs_batch[i].unsqueeze(0).to(device)
+                    # 1. Prepare inputs
+                    # learner_obs is (Num_Agents, C, H, W), slice to get (1, C, H, W)
+                    local_obs = learner_obs[i:i+1].to(device)
+                    # merged_obs_batch is (Num_Agents, C, H, W), slice to get (1, C, H, W)
+                    global_obs = merged_obs_batch[i].unsqueeze(0).to(device)
                     
-                    act, lp, val, _ = agent.get_action_and_value(
-                        learner_obs[i:i+1].to(device), 
-                        global_state  # <--- Pass the Tensor, not the List
-                    )
-                                   # === ADD THESE LINES ===
-                    actions = torch.cat(actions)
-                    log_probs = torch.cat(log_probs)
-                    values = torch.cat(values)
-                # =======================
+                    # 2. Get action from agent
+                    act, lp, val, _ = agent.get_action_and_value(local_obs, global_obs)
+                    
+                    # 3. Append to lists (CRITICAL STEP)
+                    actions.append(act)
+                    log_probs.append(lp)
+                    values.append(val)
+                
+                # 4. Concatenate lists into tensors (MUST BE DONE AFTER LOOP)
+                actions = torch.cat(actions)
+                log_probs = torch.cat(log_probs)
+                values = torch.cat(values)
             
             action_buf[step] = actions.cpu()
             logprob_buf[step] = log_probs.cpu()
