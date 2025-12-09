@@ -52,167 +52,163 @@ START_UPDATES = 0
 
 BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
 
-class PositionalEncoding2D(nn.Module):
-    def __init__(self, d_model, max_h=50, max_w=50):
-        super().__init__()
-        d_model_half = d_model // 2
-        
-        y_pos = torch.arange(max_h).unsqueeze(1)
-        y_den = torch.exp(torch.arange(0, d_model_half, 2) * -(math.log(10000.0) / d_model_half))
-        y_enc = torch.zeros(max_h, d_model_half)
-        y_enc[:, 0::2] = torch.sin(y_pos * y_den)
-        y_enc[:, 1::2] = torch.cos(y_pos * y_den)
-        
-        x_pos = torch.arange(max_w).unsqueeze(1)
-        x_den = torch.exp(torch.arange(0, d_model_half, 2) * -(math.log(10000.0) / d_model_half))
-        x_enc = torch.zeros(max_w, d_model_half)
-        x_enc[:, 0::2] = torch.sin(x_pos * x_den)
-        x_enc[:, 1::2] = torch.cos(x_pos * x_den)
-        
-        self.register_buffer('y_enc', y_enc)
-        self.register_buffer('x_enc', x_enc)
+import torch
+import torch.nn as nn
+from torch.distributions.categorical import Categorical
+import numpy as np
 
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    """Helper to initialize layers for RL stability."""
+    torch.nn.init.orthogonal_(layer.weight, std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+class TransformerBody(nn.Module):
+    def __init__(self, obs_shape, d_model=64, nhead=4, num_layers=2):
+        super().__init__()
+        print(obs_shape)
+        c, h, w = obs_shape
+        
+        # --- 1. Coordinate Channels (The "Simple" Position Approach) ---
+        # We create a static grid of X and Y values from -1 to 1.
+        # This tells the network "This pixel is Top-Left" or "This pixel is Center".
+        y_grid, x_grid = torch.meshgrid(
+            torch.linspace(-1, 1, h), 
+            torch.linspace(-1, 1, w), 
+            indexing='ij'
+        )
+        # Register as a buffer so it moves to GPU automatically, but isn't a trainable parameter
+        self.register_buffer('coord_grid', torch.stack([y_grid, x_grid], dim=0).unsqueeze(0))
+        
+        # --- 2. Feature Extractor (1x1 Grid Cells) ---
+        # We take (Input Channels + 2 Coords) -> project to d_model
+        # Kernel=3, Padding=1, Stride=1 ensures we KEEP the grid size exactly same.
+        self.input_proj = nn.Sequential(
+            layer_init(nn.Conv2d(c + 2, 32, kernel_size=3, padding=1)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(32, d_model, kernel_size=3, padding=1)),
+            nn.ReLU()
+        )
+        
+        # --- 3. Transformer Encoder ---
+        # "Batch First" means input is (Batch, Seq_Len, Features)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, 
+            nhead=nhead, 
+            dim_feedforward=d_model * 2, 
+            dropout=0.0, 
+            batch_first=True,
+            norm_first=True # Pre-LN is more stable for RL
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
     def forward(self, x):
         B, C, H, W = x.shape
-        y_emb = self.y_enc[:H, :].unsqueeze(1).repeat(1, W, 1)
-        x_emb = self.x_enc[:W, :].unsqueeze(0).repeat(H, 1, 1)
-        pos = torch.cat([y_emb, x_emb], dim=2)
-        pos = pos.permute(2, 0, 1).unsqueeze(0).repeat(B, 1, 1, 1)
-        return x + pos
-
-class MAPPOAgent(nn.Module):
-    def __init__(self, obs_shape, action_dim, num_agents=2):
-        super().__init__()
-        self.obs_shape = obs_shape
         
-        # --- HYPERPARAMETERS ---
-        self.d_model = 64     # Increased from 128
-        nhead = 4
-        num_layers = 2
-        dim_ff = 1024          # Increased from 512
+        # Step 1: Add Coordinate Channels
+        # x is (B, C, H, W)
+        # coords is (1, 2, H, W) expanded to (B, 2, H, W)
+        x_with_coords = torch.cat([x, self.coord_grid.expand(B, -1, -1, -1)], dim=1)
         
-        # Shared Positional Encoder
-        self.pos_encoder = PositionalEncoding2D(self.d_model)
-
-        # =====================================================================
-        # ACTOR (Transformer)
-        # =====================================================================
-        self.actor_projector = nn.Sequential(
-            nn.Conv2d(obs_shape[0], 32, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(32, self.d_model, kernel_size=1)
-        )
+        # Step 2: Project features (CNN)
+        # Output: (B, d_model, H, W)
+        x = self.input_proj(x_with_coords)
         
-        actor_layer = nn.TransformerEncoderLayer(
-            d_model=self.d_model, nhead=nhead, dim_feedforward=dim_ff, 
-            dropout=0.0, batch_first=False, norm_first=True
-        )
-        self.actor_transformer = nn.TransformerEncoder(actor_layer, num_layers=num_layers)
+        # Step 3: Flatten into a sequence of grid cells
+        # (B, d_model, H, W) -> (B, d_model, H*W) -> (B, H*W, d_model)
+        x = x.flatten(2).transpose(1, 2)
         
-        self.actor_head = nn.Sequential(
-            nn.Linear(self.d_model, 1024),
-            nn.LayerNorm(1024),
-            nn.GELU(),
-            nn.Linear(1024, action_dim)
-        )
-
-        # =====================================================================
-        # CRITIC (Transformer)
-        # =====================================================================
-        # Note: We use obs_shape[0] assuming channels are consistent or handled via merging
-        self.critic_projector = nn.Sequential(
-            nn.Conv2d(obs_shape[0], 32, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(32, self.d_model, kernel_size=1)
-        )
+        # Step 4: Apply Transformer
+        # The transformer lets every grid cell "talk" to every other grid cell
+        x = self.transformer(x)
         
-        critic_layer = nn.TransformerEncoderLayer(
-            d_model=self.d_model, nhead=nhead, dim_feedforward=dim_ff, 
-            dropout=0.0, batch_first=False, norm_first=True
-        )
-        self.critic_transformer = nn.TransformerEncoder(critic_layer, num_layers=num_layers)
+        # Step 5: Global Average Pooling
+        # Smash the sequence into a single vector describing the whole situation
+        # (B, Seq_Len, d_model) -> (B, d_model)
+        x = x.mean(dim=1)
         
-        self.critic_head = nn.Sequential(
-            nn.Linear(self.d_model, 1024),
-            nn.GELU(),
-            nn.Linear(1024, 1)
-        )
-        
-        self.apply(self._init_weights)
-        nn.init.orthogonal_(self.actor_head[-1].weight, gain=0.01)
-        nn.init.orthogonal_(self.critic_head[-1].weight, gain=1.0)
-
-    def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Conv2d)):
-            nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
-            if module.bias is not None:
-                module.bias.data.fill_(0.0)
-
-    def _forward_transformer(self, obs, projector, transformer):
-        # 1. Project to d_model
-        x = projector(obs)
-        
-        # 2. Add Positional Encoding
-        x = self.pos_encoder(x)
-        
-        # 3. Reshape: [Batch, Dim, H, W] -> [Sequence, Batch, Dim]
-        # (batch_first=False in encoder layer, so Sequence is dim 0)
-        x = x.flatten(2).permute(2, 0, 1)
-        
-        # 4. Transformer
-        x = transformer(x)
-        
-        # 5. Global Average Pooling (over sequence dimension 0)
-        x = x.mean(dim=0)
         return x
 
-    def get_action_and_value(self, obs, all_obs_list):
-        # --- ACTOR ---
-        h_actor = self._forward_transformer(obs, self.actor_projector, self.actor_transformer)
-        logits = self.actor_head(h_actor)
-        dist = Categorical(logits=logits)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
+class MAPPOAgent(nn.Module):
+    def __init__(self, obs_shape, action_dim, num_agents):
+        super().__init__()
         
-        # --- CRITIC ---
-        if all_obs_list[0].dim() == 4:
-            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
-        else:
-            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
+        # Settings for the transformer
+        d_model = 64
+        nhead = 4
+        num_layers = 2
+        
+        # Actor Network (Policy) - Sees Local Obs
+        self.actor_body = TransformerBody(obs_shape, d_model, nhead, num_layers)
+        self.actor_head = layer_init(nn.Linear(d_model, action_dim), std=0.01)
+
+        # Critic Network (Value) - Sees Global/Merged Obs
+        self.critic_body = TransformerBody(obs_shape, d_model, nhead, num_layers)
+        self.critic_head = layer_init(nn.Linear(d_model, 1), std=1.0)
+
+    def _process_critic_input(self, critic_input):
+        """Standard MAPPO helper to merge observations for the critic."""
+        if isinstance(critic_input, list):
+            base = critic_input[0].clone()
+            is_batched = (base.dim() == 4)
+            if not is_batched: base = base.unsqueeze(0)
             
-        h_critic = self._forward_transformer(merged.to(obs.device), self.critic_projector, self.critic_transformer)
-        value = self.critic_head(h_critic).squeeze(-1)
-        
-        return action, log_prob, value, dist.entropy()
+            team_locs = torch.zeros_like(base[:, 1])
+            for obs in critic_input:
+                o = obs if obs.dim() == 4 else obs.unsqueeze(0)
+                team_locs = torch.maximum(team_locs, o[:, 1])
+            
+            merged = base.clone()
+            merged[:, 1] = team_locs
+            merged[:, 4] = torch.zeros_like(merged[:, 4])
+            
+            if not is_batched: merged = merged.squeeze(0)
+            return merged
+        return critic_input
 
-    def get_value(self, all_obs_list):
-        if all_obs_list[0].dim() == 4:
-            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
-        else:
-            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
-        
-        h_critic = self._forward_transformer(merged.to(all_obs_list[0].device), self.critic_projector, self.critic_transformer)
-        return self.critic_head(h_critic).squeeze(-1)
+    def get_value(self, state):
+        x = self._process_critic_input(state)
+        hidden = self.critic_body(x)
+        # FIX: Squeeze the last dimension so it returns (Batch,) instead of (Batch, 1)
+        return self.critic_head(hidden).squeeze(-1)
 
-    def evaluate(self, obs, merged_obs, action, num_agents, obs_shape):
-        # Actor
-        h_actor = self._forward_transformer(obs, self.actor_projector, self.actor_transformer)
-        logits = self.actor_head(h_actor)
-        dist = Categorical(logits=logits)
-        log_prob = dist.log_prob(action)
-        entropy = dist.entropy()
+    def get_action_and_value(self, x, state=None, action=None):
+        # 1. Actor
+        actor_hidden = self.actor_body(x)
+        logits = self.actor_head(actor_hidden)
+        probs = Categorical(logits=logits)
         
-        # Critic
-        h_critic = self._forward_transformer(merged_obs, self.critic_projector, self.critic_transformer)
-        value = self.critic_head(h_critic).squeeze(-1)
+        if action is None:
+            action = probs.sample()
+            
+        # 2. Critic
+        if state is None: state = x
+        value = self.get_value(state)
         
-        return value, log_prob, entropy
-    
-    def get_deterministic_action(self, obs):
-        with torch.no_grad():
-            h_actor = self._forward_transformer(obs, self.actor_projector, self.actor_transformer)
-            logits = self.actor_head(h_actor)
-            return logits.argmax(dim=-1)
+        # value is now (Batch,), log_prob is (Batch,), entropy is (Batch,)
+        return action, probs.log_prob(action), value, probs.entropy()
+
+    def get_deterministic_action(self, x):
+        hidden = self.actor_body(x)
+        logits = self.actor_head(hidden)
+        return torch.argmax(logits, dim=1)
+
+    def evaluate(self, b_obs, b_merged_obs, b_action, num_agents, obs_shape):
+        """Called during PPO update step"""
+        # Actor pass
+        actor_hidden = self.actor_body(b_obs)
+        logits = self.actor_head(actor_hidden)
+        probs = Categorical(logits=logits)
+        log_probs = probs.log_prob(b_action)
+        entropy = probs.entropy()
+        
+        # Critic pass
+        critic_hidden = self.critic_body(b_merged_obs)
+        # FIX: Squeeze here as well (was already correct in previous snippet, but kept for consistency)
+        values = self.critic_head(critic_hidden).squeeze(-1)
+        
+        return values, log_probs, entropy
+
 
 def canonicalize_obs(obs, is_red_agent):
     if not is_red_agent:
