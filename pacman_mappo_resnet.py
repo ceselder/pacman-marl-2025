@@ -61,15 +61,13 @@ class ResidualBlock(nn.Module):
         return self.act(x + self.net(x))
 
 
-def make_backbone(in_channels, hidden_dim=256):
+def make_backbone(in_channels, hidden_dim=512):
     return nn.Sequential(
-        nn.Conv2d(in_channels, 64, 3, padding=1),
+        nn.Conv2d(in_channels, hidden_dim, 3, padding=1),
         nn.GELU(),
-        ResidualBlock(64),
-        nn.Conv2d(64, 128, 3, stride=2, padding=1),
-        nn.GELU(),
-        ResidualBlock(128),
-        nn.Conv2d(128, hidden_dim, 3, stride=2, padding=1),
+        ResidualBlock(hidden_dim),
+        ResidualBlock(hidden_dim),
+        nn.Conv2d(hidden_dim, hidden_dim, 3, stride=2, padding=1),  # 20→10
         nn.GELU(),
         ResidualBlock(hidden_dim),
         nn.AdaptiveAvgPool2d(1),
