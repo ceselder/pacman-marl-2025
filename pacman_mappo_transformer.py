@@ -58,92 +58,97 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
-class TransformerBody(nn.Module):
-    def __init__(self, obs_shape, d_model=64, nhead=4, num_layers=2):
+class ViTBody(nn.Module):
+    def __init__(self, obs_shape, d_model=64, nhead=4, num_layers=2, patch_size=1):
         super().__init__()
         c, h, w = obs_shape
         
-        # --- 1. Coordinate Channels (The "Simple" Position Approach) ---
-        # We create a static grid of X and Y values from -1 to 1.
-        # This tells the network "This pixel is Top-Left" or "This pixel is Center".
-        y_grid, x_grid = torch.meshgrid(
-            torch.linspace(-1, 1, h), 
-            torch.linspace(-1, 1, w), 
-            indexing='ij'
-        )
-        # Register as a buffer so it moves to GPU automatically, but isn't a trainable parameter
-        self.register_buffer('coord_grid', torch.stack([y_grid, x_grid], dim=0).unsqueeze(0))
+        # 1. Patch Embedding (The "Linear Projection" from the paper)
+        # For Pacman, we treat every 1x1 pixel as a patch to keep precision.
+        # This is mathematically equivalent to a Linear layer on every pixel.
+        self.patch_embed = nn.Conv2d(c, d_model, kernel_size=patch_size, stride=patch_size)
         
-        # --- 2. Feature Extractor (1x1 Grid Cells) ---
-        # We take (Input Channels + 2 Coords) -> project to d_model
-        # Kernel=3, Padding=1, Stride=1 ensures we KEEP the grid size exactly same.
-        self.input_proj = nn.Sequential(
-            layer_init(nn.Conv2d(c + 2, 32, kernel_size=3, padding=1)),
-            nn.ReLU(),
-            layer_init(nn.Conv2d(32, d_model, kernel_size=3, padding=1)),
-            nn.ReLU()
-        )
+        # Calculate sequence length (Number of patches)
+        self.num_patches = (h // patch_size) * (w // patch_size)
         
-        # --- 3. Transformer Encoder ---
-        # "Batch First" means input is (Batch, Seq_Len, Features)
+        # 2. Learnable Class Token (The [CLASS] token from BERT/ViT)
+        # Shape: (1, 1, d_model)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        
+        # 3. Learnable Position Embeddings (Standard ViT)
+        # We add 1 to num_patches to account for the cls_token
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, d_model))
+        
+        # 4. Transformer Encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, 
             nhead=nhead, 
             dim_feedforward=d_model * 4, 
             dropout=0.0, 
+            activation="gelu", # Paper uses GELU
             batch_first=True,
-            norm_first=True # Pre-LN is more stable for RL
+            norm_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
+        # Initialize parameters (Truncated Normal is standard for ViT)
+        nn.init.normal_(self.pos_embed, std=0.02)
+        nn.init.normal_(self.cls_token, std=0.02)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out')
+
     def forward(self, x):
         B, C, H, W = x.shape
         
-        # Step 1: Add Coordinate Channels
-        # x is (B, C, H, W)
-        # coords is (1, 2, H, W) expanded to (B, 2, H, W)
-        x_with_coords = torch.cat([x, self.coord_grid.expand(B, -1, -1, -1)], dim=1)
+        # 1. Patch Partition & Linear Projection
+        # x: (B, C, H, W) -> (B, d_model, H, W)
+        x = self.patch_embed(x)
         
-        # Step 2: Project features (CNN)
-        # Output: (B, d_model, H, W)
-        x = self.input_proj(x_with_coords)
-        
-        # Step 3: Flatten into a sequence of grid cells
-        # (B, d_model, H, W) -> (B, d_model, H*W) -> (B, H*W, d_model)
+        # 2. Flatten to Sequence
+        # (B, d_model, H, W) -> (B, d_model, Num_Patches) -> (B, Num_Patches, d_model)
         x = x.flatten(2).transpose(1, 2)
         
-        # Step 4: Apply Transformer
-        # The transformer lets every grid cell "talk" to every other grid cell
+        # 3. Append CLS Token
+        # Expand cls_token to match batch size: (B, 1, d_model)
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        # Cat: (B, Num_Patches + 1, d_model)
+        x = torch.cat((cls_tokens, x), dim=1)
+        
+        # 4. Add Position Embeddings
+        # ViT adds position info *after* flattening and concatenation
+        x = x + self.pos_embed
+        
+        # 5. Transformer
         x = self.transformer(x)
         
-        # Step 5: Global Average Pooling
-        # Smash the sequence into a single vector describing the whole situation
-        # (B, Seq_Len, d_model) -> (B, d_model)
-        x = x.mean(dim=1)
-        
-        return x
+        # 6. Output: Only take the CLS token (index 0)
+        # The paper says this token contains the "classification" embedding
+        return x[:, 0]
 
 class MAPPOAgent(nn.Module):
     def __init__(self, obs_shape, action_dim, num_agents):
         super().__init__()
         
-        # Settings for the transformer
         d_model = 64
         nhead = 4
         num_layers = 2
         
-        # Actor Network (Policy) - Sees Local Obs
-        self.actor_body = TransformerBody(obs_shape, d_model, nhead, num_layers)
+        self.actor_body = ViTBody(obs_shape, d_model, nhead, num_layers)
         self.actor_head = layer_init(nn.Linear(d_model, action_dim), std=0.01)
 
-        # Critic Network (Value) - Sees Global/Merged Obs
-        self.critic_body = TransformerBody(obs_shape, d_model, nhead, num_layers)
+        self.critic_body = ViTBody(obs_shape, d_model, nhead, num_layers)
         self.critic_head = layer_init(nn.Linear(d_model, 1), std=1.0)
 
 
     def get_value(self, state):
         hidden = self.critic_body(state)
-        # FIX: Squeeze the last dimension so it returns (Batch,) instead of (Batch, 1)
         return self.critic_head(hidden).squeeze(-1)
 
     def get_action_and_value(self, x, state=None, action=None):
