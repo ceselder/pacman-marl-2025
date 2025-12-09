@@ -52,11 +52,6 @@ START_UPDATES = 0
 
 BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
 
-import torch
-import torch.nn as nn
-from torch.distributions.categorical import Categorical
-import numpy as np
-
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     """Helper to initialize layers for RL stability."""
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -66,7 +61,6 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class TransformerBody(nn.Module):
     def __init__(self, obs_shape, d_model=64, nhead=4, num_layers=2):
         super().__init__()
-        print(obs_shape)
         c, h, w = obs_shape
         
         # --- 1. Coordinate Channels (The "Simple" Position Approach) ---
@@ -146,29 +140,9 @@ class MAPPOAgent(nn.Module):
         self.critic_body = TransformerBody(obs_shape, d_model, nhead, num_layers)
         self.critic_head = layer_init(nn.Linear(d_model, 1), std=1.0)
 
-    def _process_critic_input(self, critic_input):
-        """Standard MAPPO helper to merge observations for the critic."""
-        if isinstance(critic_input, list):
-            base = critic_input[0].clone()
-            is_batched = (base.dim() == 4)
-            if not is_batched: base = base.unsqueeze(0)
-            
-            team_locs = torch.zeros_like(base[:, 1])
-            for obs in critic_input:
-                o = obs if obs.dim() == 4 else obs.unsqueeze(0)
-                team_locs = torch.maximum(team_locs, o[:, 1])
-            
-            merged = base.clone()
-            merged[:, 1] = team_locs
-            merged[:, 4] = torch.zeros_like(merged[:, 4])
-            
-            if not is_batched: merged = merged.squeeze(0)
-            return merged
-        return critic_input
 
     def get_value(self, state):
-        x = self._process_critic_input(state)
-        hidden = self.critic_body(x)
+        hidden = self.critic_body(state)
         # FIX: Squeeze the last dimension so it returns (Batch,) instead of (Batch, 1)
         return self.critic_head(hidden).squeeze(-1)
 
@@ -496,23 +470,27 @@ def train():
             
             merged_obs = merge_obs_for_critic(learner_obs_canon)
             merged_obs_batch = merged_obs.unsqueeze(0).expand(num_agents, -1, -1, -1)
-            
+
+            # Store in buffer
             obs_buf[step] = learner_obs
             merged_obs_buf[step] = merged_obs_batch
-            
+
             with torch.no_grad():
-                all_obs_list = [learner_obs[i:i+1].to(device) for i in range(num_agents)]
+                # DELETE THIS LINE: all_obs_list = ... we don't need the list anymore
+                
                 actions, log_probs, values = [], [], []
                 for i in range(num_agents):
+                    # FIX: Pass the pre-merged tensor slice [i] to the agent
+                    # We unsqueeze(0) to keep it as (1, C, H, W)
+                    global_state = merged_obs_batch[i].unsqueeze(0).to(device)
+                    
                     act, lp, val, _ = agent.get_action_and_value(
-                        learner_obs[i:i+1].to(device), all_obs_list
+                        learner_obs[i:i+1].to(device), 
+                        global_state  # <--- Pass the Tensor, not the List
                     )
                     actions.append(act)
                     log_probs.append(lp)
                     values.append(val)
-                actions = torch.cat(actions)
-                log_probs = torch.cat(log_probs)
-                values = torch.cat(values)
             
             action_buf[step] = actions.cpu()
             logprob_buf[step] = log_probs.cpu()
@@ -527,6 +505,7 @@ def train():
                 pass 
             else:
                 # Self-play opponent
+                
                 opp_obs_raw = [obs_dict[env.agents[i]].float() for i in opponent_ids]
                 opp_obs_canon = [canonicalize_obs(o, not play_as_red) for o in opp_obs_raw]
                 opp_obs = torch.stack(opp_obs_canon)
@@ -574,14 +553,17 @@ def train():
                 episode_return = 0
                 obs_dict, _ = env.reset()
 
-        # GAE
+        
+        # GAE Setup
         learner_obs_raw = [obs_dict[env.agents[i]].float() for i in learner_ids]
         learner_obs_canon = [canonicalize_obs(o, play_as_red) for o in learner_obs_raw]
-        learner_obs = torch.stack(learner_obs_canon)
+        
+        # FIX: Manually merge the final observation for the critic
+        final_merged_obs = merge_obs_for_critic(learner_obs_canon).unsqueeze(0).to(device)
         
         with torch.no_grad():
-            all_list = [learner_obs[i:i+1].to(device) for i in range(num_agents)]
-            last_value = agent.get_value(all_list).cpu().item()
+            # Pass the single merged tensor
+            last_value = agent.get_value(final_merged_obs).cpu().item()
 
         advantages = torch.zeros_like(reward_buf)
         returns = torch.zeros_like(reward_buf)
