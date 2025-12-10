@@ -46,19 +46,31 @@ START_UPDATES = 0
 
 BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
 
-def make_actor_backbone(in_channels):
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.GroupNorm(8, channels),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.GroupNorm(8, channels),
+        )
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        return self.act(x + self.net(x))
+
+
+def make_backbone(in_channels):
     return nn.Sequential(
-        nn.Conv2d(in_channels, 16, 3, padding=1),
+        nn.Conv2d(in_channels, 32, 3, padding=1),
         nn.GELU(),
-        nn.Conv2d(16, 32, 3, padding=1),
-        nn.GELU(),
-        nn.Conv2d(32, 32, 3, stride=2, padding=1),  # 20 → 10
-        nn.GELU(),
-        nn.Conv2d(32, 64, 3, padding=1),
-        nn.GELU(),
-        nn.Conv2d(64, 64, 3, stride=2, padding=1),  # 10 → 5
-        nn.GELU(),
-        nn.Flatten(),  # 1600
+        ResidualBlock(16),
+        ResidualBlock(16),
+        ResidualBlock(16),
+        
+        nn.Flatten(),  # 16 × 20 × 20 = 12800
     )
 
 
@@ -68,9 +80,9 @@ class MAPPOAgent(nn.Module):
         c, h, w = obs_shape
         
         # === ACTOR (ConvNet) ===
-        self.actor_backbone = make_actor_backbone(c)
+        self.actor_backbone = make_backbone(c)
         self.actor_head = nn.Sequential(
-            nn.Linear(1600, 512),
+            nn.Linear(12800, 1024),
             nn.GELU(),
             nn.Linear(512, action_dim),
         )
