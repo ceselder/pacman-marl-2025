@@ -64,7 +64,7 @@ class ResidualBlock(nn.Module):
 
 def make_backbone(in_channels):
     return nn.Sequential(
-        nn.Conv2d(in_channels, 32, 3, padding=1),
+        nn.Conv2d(in_channels, 16, 3, padding=1),
         nn.GELU(),
         ResidualBlock(16),
         ResidualBlock(16),
