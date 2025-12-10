@@ -111,8 +111,6 @@ class MAPPOAgent(nn.Module):
         return self.critic_head(self.critic_backbone(state)).squeeze(-1)
 
     def get_action_and_value(self, obs, critic_obs):
-
-        print(f"Output Shape: {self.actor_backbone(obs).shape}")
         logits = self.actor_head(self.actor_backbone(obs))
         dist = Categorical(logits=logits)
         action = dist.sample()
