@@ -53,48 +53,16 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
-class ResidualBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1),
-            nn.GroupNorm(4, channels),
-            nn.GELU(),
-            nn.Conv2d(channels, channels, 3, padding=1),
-            nn.GroupNorm(4, channels),
-        )
-        self.act = nn.GELU()
-
-    def forward(self, x):
-        return self.act(x + self.net(x))
-
-
 class MAPPOAgent(nn.Module):
     def __init__(self, obs_shape, action_dim, num_agents=2):
         super().__init__()
         c, h, w = obs_shape
-        
-        # === ACTOR (CNN, full spatial) ===
-        self.actor_backbone = nn.Sequential(
-            nn.Conv2d(c, 16, 3, padding=1),
-            nn.GELU(),
-            ResidualBlock(16),
-            ResidualBlock(16),
-            ResidualBlock(16),
-            nn.Flatten(),  # 16 × 20 × 20 = 6400
-        )
-        
-        self.actor_head = nn.Sequential(
-            nn.Linear(6400, 512),
-            nn.GELU(),
-            nn.Linear(512, action_dim),
-        )
-        
-        # === CRITIC (Transformer) ===
         self.d_model = 64
-        self.critic_proj = nn.Conv2d(c, self.d_model, 1)
         
-        encoder_layer = nn.TransformerEncoderLayer(
+        # === ACTOR (Transformer) ===
+        self.actor_proj = nn.Conv2d(c, self.d_model, 1)
+        
+        actor_layer = nn.TransformerEncoderLayer(
             d_model=self.d_model,
             nhead=4,
             dim_feedforward=256,
@@ -102,7 +70,26 @@ class MAPPOAgent(nn.Module):
             activation='gelu',
             batch_first=True,
         )
-        self.critic_encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        self.actor_encoder = nn.TransformerEncoder(actor_layer, num_layers=2)
+        
+        self.actor_head = nn.Sequential(
+            nn.Linear(self.d_model, 256),
+            nn.GELU(),
+            nn.Linear(256, action_dim),
+        )
+        
+        # === CRITIC (Transformer) ===
+        self.critic_proj = nn.Conv2d(c, self.d_model, 1)
+        
+        critic_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=4,
+            dim_feedforward=256,
+            dropout=0.0,
+            activation='gelu',
+            batch_first=True,
+        )
+        self.critic_encoder = nn.TransformerEncoder(critic_layer, num_layers=2)
         
         self.critic_head = nn.Sequential(
             nn.Linear(self.d_model, 256),
@@ -112,6 +99,14 @@ class MAPPOAgent(nn.Module):
         
         nn.init.orthogonal_(self.actor_head[-1].weight, gain=0.01)
         nn.init.orthogonal_(self.critic_head[-1].weight, gain=1.0)
+
+    def _forward_actor(self, obs):
+        x = self.actor_proj(obs)
+        B, C, H, W = x.shape
+        x = x.flatten(2).transpose(1, 2)  # (B, 400, 64)
+        x = self.actor_encoder(x)
+        x = x.mean(dim=1)  # (B, 64)
+        return self.actor_head(x)
 
     def _forward_critic(self, obs):
         x = self.critic_proj(obs)
@@ -125,7 +120,7 @@ class MAPPOAgent(nn.Module):
         return self._forward_critic(state)
 
     def get_action_and_value(self, x, state=None, action=None, action_mask=None):
-        logits = self.actor_head(self.actor_backbone(x))
+        logits = self._forward_actor(x)
         
         if action_mask is not None:
             logits = logits.masked_fill(action_mask == 0, -1e9)
@@ -142,7 +137,7 @@ class MAPPOAgent(nn.Module):
         return action, dist.log_prob(action), value, dist.entropy()
 
     def evaluate(self, b_obs, b_merged_obs, b_action, num_agents, obs_shape, b_masks=None):
-        logits = self.actor_head(self.actor_backbone(b_obs))
+        logits = self._forward_actor(b_obs)
         
         if b_masks is not None:
             logits = logits.masked_fill(b_masks == 0, -1e9)
@@ -156,7 +151,7 @@ class MAPPOAgent(nn.Module):
         return values, log_probs, entropy
 
     def get_deterministic_action(self, obs):
-        logits = self.actor_head(self.actor_backbone(obs))
+        logits = self._forward_actor(obs)
         return logits.argmax(dim=-1)
 
 def canonicalize_obs(obs, is_red_agent):
