@@ -22,9 +22,9 @@ CLIP_EPS = 0.15
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 3        
-TOTAL_UPDATES = 2200
+TOTAL_UPDATES = 2000
 
-LR_START = 2e-4        
+LR_START = 1.5e-4        
 LR_END = 3e-5          
 ENT_COEF_START = 0.02    
 ENT_COEF_END = 0.005     
