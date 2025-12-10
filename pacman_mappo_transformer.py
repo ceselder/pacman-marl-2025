@@ -47,12 +47,6 @@ BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
 LOAD_CHECKPOINT = None
 START_UPDATES = 0
 
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    """Helper to initialize layers for RL stability."""
-    torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
-    return layer
-
 class MAPPOAgent(nn.Module):
     def __init__(self, obs_shape, action_dim, num_agents=2):
         super().__init__()
@@ -96,9 +90,6 @@ class MAPPOAgent(nn.Module):
             nn.GELU(),
             nn.Linear(256, 1),
         )
-        
-        nn.init.orthogonal_(self.actor_head[-1].weight, gain=0.01)
-        nn.init.orthogonal_(self.critic_head[-1].weight, gain=1.0)
 
     def _forward_actor(self, obs):
         x = self.actor_proj(obs)
