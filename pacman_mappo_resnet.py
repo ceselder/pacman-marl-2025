@@ -62,19 +62,17 @@ class ResidualBlock(nn.Module):
 
 def make_actor_backbone(in_channels):
     return nn.Sequential(
-        nn.Conv2d(in_channels, 32, 3, padding=1),
-        nn.GELU(),
-        ResidualBlock(32),
-        ResidualBlock(32),
-        
-        nn.Conv2d(32, 64, 3, padding=1),
+        nn.Conv2d(in_channels, 64, 3, padding=1),
         nn.GELU(),
         ResidualBlock(64),
-        ResidualBlock(64),
         
-        nn.Conv2d(64, 256, 3, padding=1),
+        nn.Conv2d(64, 128, 3, padding=1),
         nn.GELU(),
-        ResidualBlock(256),
+        ResidualBlock(128),
+        
+        nn.Conv2d(128, 512, 3, padding=1),
+        nn.GELU(),
+        ResidualBlock(512),
         
         nn.AdaptiveAvgPool2d(1),
         nn.Flatten(),
@@ -88,7 +86,11 @@ class MAPPOAgent(nn.Module):
         
         # === ACTOR (CNN) ===
         self.actor_backbone = make_actor_backbone(c)
-        self.actor_head = nn.Linear(256, action_dim)
+        self.actor_head = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.GELU(),
+            nn.Linear(256, action_dim),
+        )
         
         # === CRITIC (Transformer) ===
         self.d_model = 128
