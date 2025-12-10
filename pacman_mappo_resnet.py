@@ -82,9 +82,9 @@ class MAPPOAgent(nn.Module):
         # === ACTOR (ConvNet) ===
         self.actor_backbone = make_backbone(c)
         self.actor_head = nn.Sequential(
-            nn.Linear(12800, 1024),
+            nn.Linear(6400, 1024),
             nn.GELU(),
-            nn.Linear(512, action_dim),
+            nn.Linear(1024, action_dim),
         )
         
         # === CRITIC (Transformer) ===
