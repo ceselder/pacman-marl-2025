@@ -24,8 +24,8 @@ MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 3        
 TOTAL_UPDATES = 2200     # longer training
 
-LR_START = 1e-4        
-LR_END = 2e-5          
+LR_START = 1.5e-4        
+LR_END = 3e-5          
 ENT_COEF_START = 0.02    
 ENT_COEF_END = 0.005     
 
