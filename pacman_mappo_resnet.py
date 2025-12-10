@@ -548,11 +548,6 @@ def train():
                 optimizer.zero_grad()
                 loss.backward()
 
-                total_norm = 0
-                for p in agent.parameters():
-                    if p.grad is not None:
-                        total_norm += p.grad.norm().item() ** 2
-                print(f"Grad norm: {total_norm ** 0.5:.4f}")
                 nn.utils.clip_grad_norm_(agent.parameters(), MAX_GRAD_NORM)
                 optimizer.step()
                 
