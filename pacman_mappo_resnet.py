@@ -167,11 +167,11 @@ def compute_heuristic_shaping(obs_curr, obs_next):
     pos_curr, carry_curr = get_agent_state(obs_curr)
     pos_next, carry_next = get_agent_state(obs_next)
 
-    living_punishment = -0.25
+    living_punishment = -0.15
     
     dist_moved = abs(pos_curr[0] - pos_next[0]) + abs(pos_curr[1] - pos_next[1])
     if dist_moved > 1.5:
-        return living_punishment - 0.5 - (0.25 * carry_curr)
+        return living_punishment - 0.4 - (0.15 * carry_curr)
     
     if dist_moved < 0.1:
         return living_punishment - 0.05
