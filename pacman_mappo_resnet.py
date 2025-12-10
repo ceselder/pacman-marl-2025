@@ -195,7 +195,7 @@ class MAPPOAgent(nn.Module):
         
         return self._forward_critic(merged.to(all_obs_list[0].device)).squeeze(-1)
 
-    def evaluate(self, obs, merged_obs, action, num_agents, obs_shape):
+    def evaluate(self, obs, merged_obs, action, obs_shape):
         h_actor = self.actor_backbone(obs)
         logits = self.actor_head(h_actor)
         dist = Categorical(logits=logits)
