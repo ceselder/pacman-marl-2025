@@ -15,14 +15,14 @@ print(f"Using device: {device}")
 # HYPERPARAMETERS
 # ============================================
 NUM_STEPS = 2048
-BATCH_SIZE = 512          # bigger batches = more stable gradients
+BATCH_SIZE = 512
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
-CLIP_EPS = 0.15            # tighter clipping = smaller policy updates
+CLIP_EPS = 0.15
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 3        
-TOTAL_UPDATES = 2200     # longer training
+TOTAL_UPDATES = 2200
 
 LR_START = 2e-4        
 LR_END = 3e-5          
@@ -35,6 +35,8 @@ SHAPING_SCALE = 0.1
 EVAL_FREQ = 50
 EVAL_EPISODES = 10
 
+EMA_DECAY = 0.995
+
 EASY_TEAMS = ['randomTeam']
 MEDIUM_TEAMS = ['MCTSTeam', 'heuristicTeam']
 HARD_TEAMS = ['baselineTeam', 'AstarTeam', 'approxQTeam']
@@ -44,131 +46,86 @@ START_UPDATES = 0
 
 BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
 
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.GroupNorm(8, channels),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.GroupNorm(8, channels),
+        )
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        return self.act(x + self.net(x))
+
+
+def make_backbone(in_channels):
+    return nn.Sequential(
+        nn.Conv2d(in_channels, 64, 3, padding=1),
+        nn.GELU(),
+        ResidualBlock(64),
+        ResidualBlock(64),
+        
+        nn.Conv2d(64, 128, 3, padding=1),
+        nn.GELU(),
+        ResidualBlock(128),
+        ResidualBlock(128),
+        
+        nn.Conv2d(128, 256, 3, padding=1),
+        nn.GELU(),
+        ResidualBlock(256),
+        ResidualBlock(256),
+        
+        nn.AdaptiveAvgPool2d(1),
+        nn.Flatten(),
+    )
+
+
 class MAPPOAgent(nn.Module):
     def __init__(self, obs_shape, action_dim, num_agents=2):
         super().__init__()
         c, h, w = obs_shape
-        self.d_model = 128
         
-        # === ACTOR ENCODER ===
-        self.actor_proj = nn.Sequential(
-            nn.Conv2d(c, self.d_model, 1),
+        self.actor_backbone = make_backbone(c)
+        self.actor_head = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.Linear(128, action_dim),
         )
         
-        actor_encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.d_model,
-            nhead=4,
-            dim_feedforward=512,
-            dropout=0.0,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True,
-        )
-        self.actor_encoder = nn.TransformerEncoder(actor_encoder_layer, num_layers=3)
-        
-        self.action_queries = nn.Parameter(torch.randn(action_dim, self.d_model))
-        
-        actor_decoder_layer = nn.TransformerDecoderLayer(
-            d_model=self.d_model,
-            nhead=4,
-            dim_feedforward=512,
-            dropout=0.0,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True,
-        )
-        self.actor_decoder = nn.TransformerDecoder(actor_decoder_layer, num_layers=2)
-        self.actor_head = nn.Linear(self.d_model, 1)
-        
-        # === CRITIC ENCODER ===
-        self.critic_proj = nn.Sequential(
-           nn.Conv2d(c, self.d_model, 1),
+        self.critic_backbone = make_backbone(c)
+        self.critic_head = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.Linear(128, 1),
         )
         
-        critic_encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.d_model,
-            nhead=4,
-            dim_feedforward=256,
-            dropout=0.0,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True,
-        )
-        self.critic_encoder = nn.TransformerEncoder(critic_encoder_layer, num_layers=3)
-        
-        self.value_query = nn.Parameter(torch.randn(1, self.d_model))
-        
-        critic_decoder_layer = nn.TransformerDecoderLayer(
-            d_model=self.d_model,
-            nhead=4,
-            dim_feedforward=256,
-            dropout=0.0,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True,
-        )
-        self.critic_decoder = nn.TransformerDecoder(critic_decoder_layer, num_layers=2)
-        self.critic_head = nn.Linear(self.d_model, 1)
-        
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-        
-        nn.init.orthogonal_(self.actor_head.weight, gain=0.1)
-        nn.init.orthogonal_(self.critic_head.weight, gain=1.0)
-        nn.init.normal_(self.action_queries, std=0.02)
-        nn.init.normal_(self.value_query, std=0.02)
-
-    def _forward_actor(self, obs):
-        x = self.actor_proj(obs)
-        B, C, H, W = x.shape
-        x = x.flatten(2).transpose(1, 2)  # (B, 400, 64)
-        memory = self.actor_encoder(x)
-        
-        queries = self.action_queries.unsqueeze(0).expand(B, -1, -1)  # (B, 5, 64)
-        decoded = self.actor_decoder(queries, memory)
-        logits = self.actor_head(decoded).squeeze(-1)  # (B, 5)
-        return logits
-
-    def _forward_critic(self, obs):
-        x = self.critic_proj(obs)
-        B, C, H, W = x.shape
-        x = x.flatten(2).transpose(1, 2)
-        memory = self.critic_encoder(x)
-        
-        query = self.value_query.unsqueeze(0).expand(B, -1, -1)  # (B, 1, 64)
-        decoded = self.critic_decoder(query, memory)
-        value = self.critic_head(decoded).squeeze(-1).squeeze(-1)  # (B,)
-        return value
+        nn.init.orthogonal_(self.actor_head[-1].weight, gain=0.01)
+        nn.init.orthogonal_(self.critic_head[-1].weight, gain=1.0)
 
     def get_value(self, state):
-        return self._forward_critic(state)
+        return self.critic_head(self.critic_backbone(state)).squeeze(-1)
 
     def get_action_and_value(self, obs, critic_obs):
-        logits = self._forward_actor(obs)
+        logits = self.actor_head(self.actor_backbone(obs))
         dist = Categorical(logits=logits)
         action = dist.sample()
-        value = self._forward_critic(critic_obs)
+        value = self.get_value(critic_obs)
         return action, dist.log_prob(action), value, dist.entropy()
 
     def evaluate(self, obs, critic_obs, action):
-        logits = self._forward_actor(obs)
+        logits = self.actor_head(self.actor_backbone(obs))
         dist = Categorical(logits=logits)
-        value = self._forward_critic(critic_obs)
+        value = self.get_value(critic_obs)
         return value, dist.log_prob(action), dist.entropy()
 
     def get_deterministic_action(self, obs):
-        logits = self._forward_actor(obs)
+        logits = self.actor_head(self.actor_backbone(obs))
         return logits.argmax(dim=-1)
+
 
 def canonicalize_obs(obs, is_red_agent):
     if not is_red_agent:
@@ -210,14 +167,14 @@ def compute_heuristic_shaping(obs_curr, obs_next):
     pos_curr, carry_curr = get_agent_state(obs_curr)
     pos_next, carry_next = get_agent_state(obs_next)
 
-    living_punishment = -0.25 #make it hate being alive so cant just go farm yeah
+    living_punishment = -0.25
     
     dist_moved = abs(pos_curr[0] - pos_next[0]) + abs(pos_curr[1] - pos_next[1])
     if dist_moved > 1.5:
         return living_punishment - 0.5 - (0.25 * carry_curr)
     
     if dist_moved < 0.1:
-        return living_punishment - 0.05 #small nudge to not stand still
+        return living_punishment - 0.05
 
     return living_punishment
 
@@ -320,15 +277,17 @@ def train():
     num_agents = 2
     
     agent = MAPPOAgent(obs_shape, 5, num_agents).to(device)
+    ema_agent = copy.deepcopy(agent)  # EMA copy
     optimizer = torch.optim.Adam(agent.parameters(), lr=LR_START, eps=1e-5)
     
     if LOAD_CHECKPOINT is not None:
         print(f"Loading checkpoint: {LOAD_CHECKPOINT}")
         state_dict = torch.load(LOAD_CHECKPOINT, map_location=device)
         agent.load_state_dict(state_dict)
+        ema_agent.load_state_dict(state_dict)
     
     opponent_pool = deque(maxlen=OPPONENT_POOL_SIZE)
-    opponent_pool.append(copy.deepcopy(agent.state_dict()))
+    opponent_pool.append(copy.deepcopy(ema_agent.state_dict()))
     
     log = {
         'update': [], 'reward': [], 'ep_return': [],
@@ -342,6 +301,9 @@ def train():
         progress = update / TOTAL_UPDATES
         lr = LR_START - (LR_START - LR_END) * progress
         ent_coef = ENT_COEF_START - (ENT_COEF_START - ENT_COEF_END) * progress
+        
+        # Tighter clipping after self-play phase
+        clip_eps = 0.1 if update > 800 else CLIP_EPS
         
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
@@ -532,24 +494,29 @@ def train():
                 
                 pg = -torch.min(
                     norm_adv.to(device) * ratio,
-                    norm_adv.to(device) * torch.clamp(ratio, 1-CLIP_EPS, 1+CLIP_EPS)
+                    norm_adv.to(device) * torch.clamp(ratio, 1-clip_eps, 1+clip_eps)
                 ).mean()
                 vl = 0.5 * ((vals - b_ret[mb].to(device))**2).mean()
                 loss = pg + VF_COEF*vl - ent_coef*ent.mean()
                 
                 optimizer.zero_grad()
                 loss.backward()
-
                 nn.utils.clip_grad_norm_(agent.parameters(), MAX_GRAD_NORM)
                 optimizer.step()
+                
+                # Update EMA after each gradient step
+                with torch.no_grad():
+                    for ema_p, p in zip(ema_agent.parameters(), agent.parameters()):
+                        ema_p.data.mul_(EMA_DECAY).add_(p.data, alpha=1 - EMA_DECAY)
                 
                 pg_l.append(pg.item())
                 v_l.append(vl.item())
                 ent_l.append(ent.mean().item())
-                clip_l.append(((ratio - 1).abs() > CLIP_EPS).float().mean().item())
+                clip_l.append(((ratio - 1).abs() > clip_eps).float().mean().item())
 
+        # Use EMA for opponent pool
         if update % OPPONENT_UPDATE_FREQ == 0:
-            opponent_pool.append(copy.deepcopy(agent.state_dict()))
+            opponent_pool.append(copy.deepcopy(ema_agent.state_dict()))
         
         if len(batch_wins) > 0:
             current_win_rate = np.mean(batch_wins)
@@ -557,8 +524,9 @@ def train():
             current_win_rate = log['train_winrate'][-1] if log['train_winrate'] else 0.0
         log['train_winrate'].append(current_win_rate)
 
+        # Use EMA for evaluation
         if update > 0 and update % EVAL_FREQ == 0:
-            eval_ret, eval_std, eval_wr = evaluate_vs_bots(agent, EVAL_EPISODES)
+            eval_ret, eval_std, eval_wr = evaluate_vs_bots(ema_agent, EVAL_EPISODES)
             log['eval_return'].append(eval_ret)
             log['eval_winrate'].append(eval_wr)
         else:
@@ -579,20 +547,23 @@ def train():
         log['ent_coef'].append(ent_coef)
         
         side = "Red " if play_as_red else "Blue"
-        eval_str = f"| Eval(MCTS): {log['eval_return'][-1]:6.1f} ({log['eval_winrate'][-1]*100:4.1f}%)" if update % EVAL_FREQ == 0 else ""
-        print(f"Upd {update:4d} [{side}|{opp_name:10s}] | "
-              f"Win: {current_win_rate*100:5.1f}% | "
-              f"Rew: {mean_reward:7.1f} | "
-              f"EpRet: {mean_ep_return:6.1f} | "
-              f"Ent: {np.mean(ent_l):.3f} | "
-              f"Clip: {np.mean(clip_l):.3f} | "
-              f"LR: {lr:.2e} "
-              f"{eval_str}")
+        if update < 100 or update % EVAL_FREQ == 1: #anders afgeleid
+            eval_str = f"| Eval: {log['eval_return'][-1]:6.1f} ({log['eval_winrate'][-1]*100:4.1f}%)" if update % EVAL_FREQ == 0 else ""
+            print(f"Upd {update:4d} [{side}|{opp_name:10s}] | "
+                f"Win: {current_win_rate*100:5.1f}% | "
+                f"Rew: {mean_reward:7.1f} | "
+                f"EpRet: {mean_ep_return:6.1f} | "
+                f"Ent: {np.mean(ent_l):.3f} | "
+                f"Clip: {np.mean(clip_l):.3f} | "
+                f"LR: {lr:.2e} "
+                f"{eval_str}")
         
+        # Save EMA checkpoints
         if update % 250 == 0:
-            torch.save(agent.state_dict(), f"mappo_resnet_{update}.pt")
+            torch.save(ema_agent.state_dict(), f"mappo_resnet_{update}.pt")
 
-    torch.save(agent.state_dict(), "mappo_resnet_final.pt")
+    # Save EMA final
+    torch.save(ema_agent.state_dict(), "mappo_resnet_final.pt")
     
     fig, axes = plt.subplots(3, 3, figsize=(15, 12))
     
@@ -606,7 +577,7 @@ def train():
     axes[0, 1].set_xlabel('Update')
     
     axes[0, 2].plot(log['update'], log['eval_return'], label='Return')
-    axes[0, 2].set_title('Eval vs MCTS')
+    axes[0, 2].set_title('Eval vs Bots')
     axes[0, 2].set_xlabel('Update')
     ax2 = axes[0, 2].twinx()
     ax2.plot(log['update'], [w*100 for w in log['eval_winrate']], 'r-', alpha=0.5, label='Win%')
@@ -643,7 +614,7 @@ def train():
     plt.close()
     
     print(f"\n{'='*60}")
-    print(f"Final eval (MCTS): {log['eval_return'][-1]:.1f} return, {log['eval_winrate'][-1]*100:.1f}% winrate")
+    print(f"Final eval: {log['eval_return'][-1]:.1f} return, {log['eval_winrate'][-1]*100:.1f}% winrate")
     print(f"{'='*60}")
 
 
