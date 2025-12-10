@@ -48,68 +48,113 @@ class MAPPOAgent(nn.Module):
     def __init__(self, obs_shape, action_dim, num_agents=2):
         super().__init__()
         c, h, w = obs_shape
-        self.d_model = 128
+        self.d_model = 64
         
-        self.proj = nn.Sequential(
-            nn.Conv2d(c, 32, 3, padding=1),
+        # === ACTOR ENCODER ===
+        self.actor_proj = nn.Sequential(
+            nn.Conv2d(c, 16, 3, padding=1),
             nn.GELU(),
-            nn.Conv2d(32, 64, 3, padding=1),
+            nn.Conv2d(16, 32, 3, padding=1),
             nn.GELU(),
-            nn.Conv2d(64, self.d_model, 1),
+            nn.Conv2d(32, self.d_model, 1),
         )
         
-        encoder_layer = nn.TransformerEncoderLayer(
+        actor_encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.d_model,
             nhead=4,
-            dim_feedforward=512,
+            dim_feedforward=256,
             dropout=0.0,
             activation='gelu',
             batch_first=True,
             norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=3)
+        self.actor_encoder = nn.TransformerEncoder(actor_encoder_layer, num_layers=3)
         
-        # === ACTOR (learnable action queries) ===
         self.action_queries = nn.Parameter(torch.randn(action_dim, self.d_model))
         
-        decoder_layer = nn.TransformerDecoderLayer(
+        actor_decoder_layer = nn.TransformerDecoderLayer(
             d_model=self.d_model,
             nhead=4,
-            dim_feedforward=512,
+            dim_feedforward=256,
             dropout=0.0,
             activation='gelu',
             batch_first=True,
             norm_first=True,
         )
-        self.actor_decoder = nn.TransformerDecoder(decoder_layer, num_layers=2)
-        self.actor_head = nn.Linear(self.d_model, 1)  # each query → one logit
+        self.actor_decoder = nn.TransformerDecoder(actor_decoder_layer, num_layers=2)
+        self.actor_head = nn.Linear(self.d_model, 1)
         
-        # === CRITIC (learnable value query) ===
+        # === CRITIC ENCODER ===
+        self.critic_proj = nn.Sequential(
+            nn.Conv2d(c, 16, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(16, 32, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(32, self.d_model, 1),
+        )
+        
+        critic_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=4,
+            dim_feedforward=256,
+            dropout=0.0,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
+        )
+        self.critic_encoder = nn.TransformerEncoder(critic_encoder_layer, num_layers=3)
+        
         self.value_query = nn.Parameter(torch.randn(1, self.d_model))
-        self.critic_decoder = nn.TransformerDecoder(decoder_layer, num_layers=2)
+        
+        critic_decoder_layer = nn.TransformerDecoderLayer(
+            d_model=self.d_model,
+            nhead=4,
+            dim_feedforward=256,
+            dropout=0.0,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
+        )
+        self.critic_decoder = nn.TransformerDecoder(critic_decoder_layer, num_layers=2)
         self.critic_head = nn.Linear(self.d_model, 1)
+        
+        self._init_weights()
 
-    def _encode(self, obs):
-        x = self.proj(obs)
-        B, C, H, W = x.shape
-        x = x.flatten(2).transpose(1, 2)  # (B, H*W, d_model)
-        return self.encoder(x)
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
+        nn.init.orthogonal_(self.actor_head.weight, gain=0.01)
+        nn.init.orthogonal_(self.critic_head.weight, gain=1.0)
+        nn.init.normal_(self.action_queries, std=0.02)
+        nn.init.normal_(self.value_query, std=0.02)
 
     def _forward_actor(self, obs):
-        memory = self._encode(obs)  # (B, 400, 128)
-        B = memory.shape[0]
+        x = self.actor_proj(obs)
+        B, C, H, W = x.shape
+        x = x.flatten(2).transpose(1, 2)  # (B, 400, 64)
+        memory = self.actor_encoder(x)
         
-        queries = self.action_queries.unsqueeze(0).expand(B, -1, -1)  # (B, 5, 128)
-        decoded = self.actor_decoder(queries, memory)  # (B, 5, 128)
+        queries = self.action_queries.unsqueeze(0).expand(B, -1, -1)  # (B, 5, 64)
+        decoded = self.actor_decoder(queries, memory)
         logits = self.actor_head(decoded).squeeze(-1)  # (B, 5)
         return logits
 
     def _forward_critic(self, obs):
-        memory = self._encode(obs)
-        B = memory.shape[0]
+        x = self.critic_proj(obs)
+        B, C, H, W = x.shape
+        x = x.flatten(2).transpose(1, 2)
+        memory = self.critic_encoder(x)
         
-        query = self.value_query.unsqueeze(0).expand(B, -1, -1)  # (B, 1, 128)
-        decoded = self.critic_decoder(query, memory)  # (B, 1, 128)
+        query = self.value_query.unsqueeze(0).expand(B, -1, -1)  # (B, 1, 64)
+        decoded = self.critic_decoder(query, memory)
         value = self.critic_head(decoded).squeeze(-1).squeeze(-1)  # (B,)
         return value
 
@@ -132,7 +177,6 @@ class MAPPOAgent(nn.Module):
     def get_deterministic_action(self, obs):
         logits = self._forward_actor(obs)
         return logits.argmax(dim=-1)
-
 
 def canonicalize_obs(obs, is_red_agent):
     if not is_red_agent:
