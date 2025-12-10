@@ -54,7 +54,11 @@ class MAPPOAgent(nn.Module):
         self.d_model = 64
         
         # === ACTOR (Transformer) ===
-        self.actor_proj = nn.Conv2d(c, self.d_model, 1)
+        self.actor_proj = nn.Sequential(
+            nn.Conv2d(c, 32, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(32, self.d_model, kernel_size=1)
+        )
         
         actor_layer = nn.TransformerEncoderLayer(
             d_model=self.d_model,
@@ -73,7 +77,11 @@ class MAPPOAgent(nn.Module):
         )
         
         # === CRITIC (Transformer) ===
-        self.critic_proj = nn.Conv2d(c, self.d_model, 1)
+        self.critic_proj = nn.Sequential(
+            nn.Conv2d(c, 32, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(32, self.d_model, kernel_size=1)
+        )
         
         critic_layer = nn.TransformerEncoderLayer(
             d_model=self.d_model,
