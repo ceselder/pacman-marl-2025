@@ -102,7 +102,9 @@ class MAPPOAgent(nn.Module):
         # --- ACTOR (CNN) ---
         C_actor = 32
         self.actor_backbone = nn.Sequential(
-            nn.Conv2d(obs_shape[0], C_actor, kernel_size=3, padding=1),
+            nn.Conv2d(obs_shape[0], 16, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(16, C_actor, kernel_size=3, padding=1),
             nn.GELU(),
             ResidualBlock(C_actor),
             ResidualBlock(C_actor),
