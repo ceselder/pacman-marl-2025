@@ -18,13 +18,13 @@ NUM_STEPS = 2048
 BATCH_SIZE = 512          # bigger batches = more stable gradients
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
-CLIP_EPS = 0.12            # tighter clipping = smaller policy updates
+CLIP_EPS = 0.15            # tighter clipping = smaller policy updates
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 UPDATE_EPOCHS = 3        
 TOTAL_UPDATES = 2200     # longer training
 
-LR_START = 1.5e-4        
+LR_START = 2e-4        
 LR_END = 3e-5          
 ENT_COEF_START = 0.02    
 ENT_COEF_END = 0.005     
@@ -547,6 +547,12 @@ def train():
                 
                 optimizer.zero_grad()
                 loss.backward()
+
+                total_norm = 0
+                for p in agent.parameters():
+                    if p.grad is not None:
+                        total_norm += p.grad.norm().item() ** 2
+                print(f"Grad norm: {total_norm ** 0.5:.4f}")
                 nn.utils.clip_grad_norm_(agent.parameters(), MAX_GRAD_NORM)
                 optimizer.step()
                 
