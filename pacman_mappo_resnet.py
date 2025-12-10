@@ -131,7 +131,7 @@ class MAPPOAgent(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
         
-        nn.init.orthogonal_(self.actor_head.weight, gain=0.01)
+        nn.init.orthogonal_(self.actor_head.weight, gain=0.1)
         nn.init.orthogonal_(self.critic_head.weight, gain=1.0)
         nn.init.normal_(self.action_queries, std=0.02)
         nn.init.normal_(self.value_query, std=0.02)
