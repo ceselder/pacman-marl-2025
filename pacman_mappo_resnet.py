@@ -122,15 +122,13 @@ class MAPPOAgent(nn.Module):
         )
 
         # --- CRITIC (DETR / Transformer) ---
-        self.d_model = 128
+        self.d_model = 32
         nhead = 4
         num_layers = 2
-        dim_ff = 512
+        dim_ff = 128
         
         self.critic_projector = nn.Sequential(
             nn.Conv2d(obs_shape[0], 32, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(32, self.d_model, kernel_size=1)
         )
         
         self.pos_encoder = PositionalEncoding2D(self.d_model)
