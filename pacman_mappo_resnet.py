@@ -26,7 +26,7 @@ TOTAL_UPDATES = 2000
 
 LR_START = 2e-4        
 LR_END = 4e-5          
-ENT_COEF_START = 0.015    
+ENT_COEF_START = 0.02    
 ENT_COEF_END = 0.004     
 
 OPPONENT_POOL_SIZE = 80  
