@@ -161,7 +161,6 @@ class MAPPOAgent(nn.Module):
 
     def _forward_critic(self, obs):
         x = self.critic_projector(obs)
-        x = self.pos_encoder(x)
         
         # Reshape for transformer: [Sequence, Batch, Dim]
         x = x.flatten(2).permute(2, 0, 1)
