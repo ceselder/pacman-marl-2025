@@ -48,21 +48,21 @@ class MAPPOAgent(nn.Module):
     def __init__(self, obs_shape, action_dim, num_agents=2):
         super().__init__()
         c, h, w = obs_shape
-        self.d_model = 64
+        self.d_model = 128
         
         # === ACTOR ENCODER ===
         self.actor_proj = nn.Sequential(
-            nn.Conv2d(c, 16, 3, padding=1),
+            nn.Conv2d(c, 32, 3, padding=1),
             nn.GELU(),
-            nn.Conv2d(16, 32, 3, padding=1),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),  # 20→10
             nn.GELU(),
-            nn.Conv2d(32, self.d_model, 1),
+            nn.Conv2d(64, self.d_model, 1),
         )
         
         actor_encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.d_model,
             nhead=4,
-            dim_feedforward=256,
+            dim_feedforward=512,
             dropout=0.0,
             activation='gelu',
             batch_first=True,
@@ -75,7 +75,7 @@ class MAPPOAgent(nn.Module):
         actor_decoder_layer = nn.TransformerDecoderLayer(
             d_model=self.d_model,
             nhead=4,
-            dim_feedforward=256,
+            dim_feedforward=512,
             dropout=0.0,
             activation='gelu',
             batch_first=True,
