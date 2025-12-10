@@ -151,6 +151,67 @@ class MAPPOAgent(nn.Module):
         nn.init.orthogonal_(self.critic_head[-1].weight, gain=1.0)
 
 
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
+            nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+            if module.bias is not None:
+                module.bias.data.fill_(0.0)
+
+    def _forward_critic(self, obs):
+        x = self.critic_projector(obs)
+        x = self.pos_encoder(x)
+        
+        # Reshape for transformer: [Sequence, Batch, Dim]
+        x = x.flatten(2).permute(2, 0, 1)
+        
+        x = self.critic_transformer(x)
+        x = x.mean(dim=0) # Global Average Pooling
+        
+        return self.critic_head(x)
+
+    def get_action_and_value(self, obs, all_obs_list):
+        h_actor = self.actor_backbone(obs)
+        logits = self.actor_head(h_actor)
+        dist = Categorical(logits=logits)
+        action = dist.sample()
+        log_prob = dist.log_prob(action)
+        
+        if all_obs_list[0].dim() == 4:
+            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
+        else:
+            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
+            
+        value = self._forward_critic(merged.to(obs.device)).squeeze(-1)
+        
+        return action, log_prob, value, dist.entropy()
+
+    def get_value(self, all_obs_list):
+        if all_obs_list[0].dim() == 4:
+            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
+        else:
+            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
+        
+        return self._forward_critic(merged.to(all_obs_list[0].device)).squeeze(-1)
+
+    def evaluate(self, obs, merged_obs, action, num_agents, obs_shape):
+        h_actor = self.actor_backbone(obs)
+        logits = self.actor_head(h_actor)
+        dist = Categorical(logits=logits)
+        log_prob = dist.log_prob(action)
+        entropy = dist.entropy()
+        
+        value = self._forward_critic(merged_obs).squeeze(-1)
+        
+        return value, log_prob, entropy
+    
+    def get_deterministic_action(self, obs):
+        with torch.no_grad():
+            h = self.actor_backbone(obs)
+            logits = self.actor_head(h)
+            return logits.argmax(dim=-1)
+
+
+
 def canonicalize_obs(obs, is_red_agent):
     if not is_red_agent:
         return obs
