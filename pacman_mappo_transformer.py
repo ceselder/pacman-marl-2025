@@ -53,126 +53,111 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
-class ViTBody(nn.Module):
-    def __init__(self, obs_shape, d_model=64, nhead=4, num_layers=2):
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
         super().__init__()
-        c, h, w = obs_shape
-        self.num_patches = h * w
-        
-        # 1. The "Hybrid" Stem (CNN)
-        self.feature_extractor = nn.Sequential(
-            layer_init(nn.Conv2d(c, 32, kernel_size=3, padding=1)),
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.GroupNorm(4, channels),
             nn.GELU(),
-            layer_init(nn.Conv2d(32, d_model, kernel_size=3, padding=1)),
-            nn.GELU(),
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.GroupNorm(4, channels),
         )
-        
-        # 2. Learned Position Embeddings
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, d_model))
-        
-        # 3. Transformer Encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, 
-            nhead=nhead, 
-            dim_feedforward=d_model * 4, 
-            dropout=0.0, 
-            activation="gelu",
-            batch_first=True,
-            norm_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-        # Init position embeds
-        nn.init.normal_(self.pos_embed, std=0.02)
+        self.act = nn.GELU()
 
     def forward(self, x):
-        B, C, H, W = x.shape
-        
-        # 1. Extract Local Features (CNN)
-        x = self.feature_extractor(x) # (B, d_model, H, W)
-        
-        # 2. Flatten spatial dims
-        x = x.flatten(2).transpose(1, 2)
-        
-        # 3. Add Position Embeddings
-        x = x + self.pos_embed
-        
-        # 4. Transformer (Global Mixing)
-        x = self.transformer(x)
-        
-        # 5. Global Average Pooling
-        x = x.mean(dim=1)
-        
-        return x
+        return self.act(x + self.net(x))
+
 
 class MAPPOAgent(nn.Module):
-    def __init__(self, obs_shape, action_dim, num_agents):
+    def __init__(self, obs_shape, action_dim, num_agents=2):
         super().__init__()
+        c, h, w = obs_shape
         
-        d_model = 64
-        nhead = 4
-        num_layers = 2
+        # === ACTOR (CNN, full spatial) ===
+        self.actor_backbone = nn.Sequential(
+            nn.Conv2d(c, 16, 3, padding=1),
+            nn.GELU(),
+            ResidualBlock(16),
+            ResidualBlock(16),
+            ResidualBlock(16),
+            nn.Flatten(),  # 16 × 20 × 20 = 6400
+        )
         
-        self.actor_body = ViTBody(obs_shape, d_model, nhead, num_layers)
-        self.actor_head = layer_init(nn.Linear(d_model, action_dim), std=0.01)
+        self.actor_head = nn.Sequential(
+            nn.Linear(6400, 512),
+            nn.GELU(),
+            nn.Linear(512, action_dim),
+        )
+        
+        # === CRITIC (Transformer) ===
+        self.d_model = 64
+        self.critic_proj = nn.Conv2d(c, self.d_model, 1)
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=4,
+            dim_feedforward=256,
+            dropout=0.0,
+            activation='gelu',
+            batch_first=True,
+        )
+        self.critic_encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        
+        self.critic_head = nn.Sequential(
+            nn.Linear(self.d_model, 256),
+            nn.GELU(),
+            nn.Linear(256, 1),
+        )
+        
+        nn.init.orthogonal_(self.actor_head[-1].weight, gain=0.01)
+        nn.init.orthogonal_(self.critic_head[-1].weight, gain=1.0)
 
-        self.critic_body = ViTBody(obs_shape, d_model, nhead, num_layers)
-        self.critic_head = layer_init(nn.Linear(d_model, 1), std=1.0)
+    def _forward_critic(self, obs):
+        x = self.critic_proj(obs)
+        B, C, H, W = x.shape
+        x = x.flatten(2).transpose(1, 2)
+        x = self.critic_encoder(x)
+        x = x.mean(dim=1)
+        return self.critic_head(x).squeeze(-1)
 
     def get_value(self, state):
-        hidden = self.critic_body(state)
-        return self.critic_head(hidden).squeeze(-1)
+        return self._forward_critic(state)
 
-    # === CHANGED: Added action_mask argument ===
     def get_action_and_value(self, x, state=None, action=None, action_mask=None):
-        # 1. Actor
-        actor_hidden = self.actor_body(x)
-        logits = self.actor_head(actor_hidden)
+        logits = self.actor_head(self.actor_backbone(x))
         
-        # --- MASKING LOGIC ---
         if action_mask is not None:
-            # Set illegal actions to negative infinity
             logits = logits.masked_fill(action_mask == 0, -1e9)
-        # ---------------------
-
-        probs = Categorical(logits=logits)
+        
+        dist = Categorical(logits=logits)
         
         if action is None:
-            action = probs.sample()
-            
-        # 2. Critic
-        if state is None: state = x
-        value = self.get_value(state)
+            action = dist.sample()
         
-        return action, probs.log_prob(action), value, probs.entropy()
+        if state is None:
+            state = x
+        value = self._forward_critic(state)
+        
+        return action, dist.log_prob(action), value, dist.entropy()
 
-    def get_deterministic_action(self, x):
-        hidden = self.actor_body(x)
-        logits = self.actor_head(hidden)
-        return torch.argmax(logits, dim=1)
-
-    # === CHANGED: Added b_masks argument ===
     def evaluate(self, b_obs, b_merged_obs, b_action, num_agents, obs_shape, b_masks=None):
-        """Called during PPO update step"""
-        # Actor pass
-        actor_hidden = self.actor_body(b_obs)
-        logits = self.actor_head(actor_hidden)
+        logits = self.actor_head(self.actor_backbone(b_obs))
         
-        # --- MASKING LOGIC ---
         if b_masks is not None:
             logits = logits.masked_fill(b_masks == 0, -1e9)
-        # ---------------------
         
-        probs = Categorical(logits=logits)
-        log_probs = probs.log_prob(b_action)
-        entropy = probs.entropy()
+        dist = Categorical(logits=logits)
+        log_probs = dist.log_prob(b_action)
+        entropy = dist.entropy()
         
-        # Critic pass
-        critic_hidden = self.critic_body(b_merged_obs)
-        values = self.critic_head(critic_hidden).squeeze(-1)
+        values = self._forward_critic(b_merged_obs)
         
         return values, log_probs, entropy
 
+    def get_deterministic_action(self, obs):
+        logits = self.actor_head(self.actor_backbone(obs))
+        return logits.argmax(dim=-1)
 
 def canonicalize_obs(obs, is_red_agent):
     if not is_red_agent:

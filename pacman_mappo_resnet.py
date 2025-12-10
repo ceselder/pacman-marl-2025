@@ -70,7 +70,7 @@ def make_backbone(in_channels):
         ResidualBlock(16),
         ResidualBlock(16),
         
-        nn.Flatten(),  # 16 × 20 × 20 = 12800
+        nn.Flatten(),  # 16 × 20 × 20 = 6400
     )
 
 
