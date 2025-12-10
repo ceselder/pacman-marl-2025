@@ -15,22 +15,22 @@ print(f"Using device: {device}")
 # HYPERPARAMETERS
 # ============================================
 NUM_STEPS = 2048
-BATCH_SIZE = 256
+BATCH_SIZE = 512          # bigger batches = more stable gradients
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
-CLIP_EPS = 0.15
+CLIP_EPS = 0.12            # tighter clipping = smaller policy updates
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
-UPDATE_EPOCHS = 4
-TOTAL_UPDATES = 1800
+UPDATE_EPOCHS = 3        
+TOTAL_UPDATES = 2200     # longer training
 
-LR_START = 1.5e-4
-LR_END = 5e-5
-ENT_COEF_START = 0.0175
-ENT_COEF_END = 0.0025
+LR_START = 1e-4        
+LR_END = 2e-5          
+ENT_COEF_START = 0.02    
+ENT_COEF_END = 0.005     
 
-OPPONENT_POOL_SIZE = 100 
-OPPONENT_UPDATE_FREQ = 10 
+OPPONENT_POOL_SIZE = 150  
+OPPONENT_UPDATE_FREQ = 15 
 SHAPING_SCALE = 0.1
 EVAL_FREQ = 50
 EVAL_EPISODES = 10
@@ -87,7 +87,7 @@ class MAPPOAgent(nn.Module):
         # === ACTOR (CNN) ===
         self.actor_backbone = make_actor_backbone(c)
         self.actor_head = nn.Sequential(
-            nn.Linear(256, 256),
+            nn.Linear(512, 256),
             nn.GELU(),
             nn.Linear(256, action_dim),
         )
@@ -112,7 +112,11 @@ class MAPPOAgent(nn.Module):
         )
         self.critic_transformer = nn.TransformerEncoder(encoder_layer, num_layers=3)
         
-        self.critic_head = nn.Linear(self.d_model, 1)
+        self.critic_head = nn.Sequential(
+            nn.Linear(self.d_model, 128),
+            nn.GELU(),
+            nn.Linear(128, 1),
+        )
         
         self._init_weights()
 
@@ -362,7 +366,7 @@ def train():
                 opponent.load_state_dict(agent.state_dict())
                 opponent.eval()
                 
-            elif rand_val < 0.65:
+            elif rand_val < 0.6:
                 use_bot_opponent = False
                 play_as_red = np.random.rand() > 0.5
                 opp_name = "Self(Old)"
