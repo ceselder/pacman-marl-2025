@@ -46,6 +46,8 @@ START_UPDATES = 0
 
 BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
 
+
+
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -66,84 +68,149 @@ class ResidualBlock(nn.Module):
         out = self.act(out)
         return out
 
-
-def make_backbone(in_channels):
-    return nn.Sequential(
-        # 8 → 64, full res
-        nn.Conv2d(in_channels, 32, 3, padding=1),
-        nn.GELU(),
-        ResidualBlock(32),
-        ResidualBlock(32),
-        ResidualBlock(32),
+class PositionalEncoding2D(nn.Module):
+    def __init__(self, d_model, max_h=50, max_w=50):
+        super().__init__()
+        d_model_half = d_model // 2
         
-        nn.Conv2d(32,64, 3, stride=2, padding=1),
-        nn.GELU(),
-        ResidualBlock(64),
-        ResidualBlock(64),
+        y_pos = torch.arange(max_h).unsqueeze(1)
+        y_den = torch.exp(torch.arange(0, d_model_half, 2) * -(math.log(10000.0) / d_model_half))
+        y_enc = torch.zeros(max_h, d_model_half)
+        y_enc[:, 0::2] = torch.sin(y_pos * y_den)
+        y_enc[:, 1::2] = torch.cos(y_pos * y_den)
         
-        nn.Conv2d(64, 128, 3, stride=2, padding=1),
-        nn.GELU(),
-        ResidualBlock(128),
-        ResidualBlock(128),
+        x_pos = torch.arange(max_w).unsqueeze(1)
+        x_den = torch.exp(torch.arange(0, d_model_half, 2) * -(math.log(10000.0) / d_model_half))
+        x_enc = torch.zeros(max_w, d_model_half)
+        x_enc[:, 0::2] = torch.sin(x_pos * x_den)
+        x_enc[:, 1::2] = torch.cos(x_pos * x_den)
         
-        nn.Conv2d(128, 256, 3, stride=2, padding=1),
-        nn.GELU(),
-        ResidualBlock(256),
-        ResidualBlock(256),
+        self.register_buffer('y_enc', y_enc)
+        self.register_buffer('x_enc', x_enc)
 
-        nn.AdaptiveAvgPool2d(1),
-
-        nn.Flatten(),  # → 256
-    )
-
+    def forward(self, x):
+        B, C, H, W = x.shape
+        y_emb = self.y_enc[:H, :].unsqueeze(1).repeat(1, W, 1)
+        x_emb = self.x_enc[:W, :].unsqueeze(0).repeat(H, 1, 1)
+        pos = torch.cat([y_emb, x_emb], dim=2)
+        pos = pos.permute(2, 0, 1).unsqueeze(0).repeat(B, 1, 1, 1)
+        return x + pos
 
 class MAPPOAgent(nn.Module):
     def __init__(self, obs_shape, action_dim, num_agents=2):
         super().__init__()
-        c, h, w = obs_shape
-
-        self.actor_backbone = make_backbone(c)
-        self.actor_head = nn.Linear(256, action_dim)
-
-        self.critic_backbone = make_backbone(c)
-        self.critic_head = nn.Linear(256, 1)
-
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        self.obs_shape = obs_shape
         
-        # PPO-specific: small init for policy, normal for value
-        nn.init.orthogonal_(self.actor_head.weight, gain=0.01)
-        nn.init.orthogonal_(self.critic_head.weight, gain=1.0)
+        # --- ACTOR (CNN) ---
+        C_actor = 16
+        self.actor_backbone = nn.Sequential(
+            nn.Conv2d(obs_shape[0], C_actor, kernel_size=3, padding=1),
+            nn.GELU(),
+            ResidualBlock(C_actor),
+            ResidualBlock(C_actor),
+            ResidualBlock(C_actor),
+            
+            nn.Flatten()
+        )
+        
+        with torch.no_grad():
+            dummy = torch.zeros(1, *obs_shape)
+            actor_flat_dim = self.actor_backbone(dummy).shape[1]
 
-    def get_value(self, state):
-        return self.critic_head(self.critic_backbone(state)).squeeze(-1)
+        self.actor_head = nn.Sequential(
+            nn.Linear(actor_flat_dim, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Linear(512, action_dim)
+        )
 
-    def get_action_and_value(self, obs, critic_obs):
-        logits = self.actor_head(self.actor_backbone(obs))
+        # --- CRITIC (DETR / Transformer) ---
+        self.d_model = 128
+        nhead = 4
+        num_layers = 2
+        dim_ff = 512
+        
+        self.critic_projector = nn.Sequential(
+            nn.Conv2d(obs_shape[0], 32, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(32, self.d_model, kernel_size=1)
+        )
+        
+        self.pos_encoder = PositionalEncoding2D(self.d_model)
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model, nhead=nhead, dim_feedforward=dim_ff, dropout=0.0, batch_first=False
+        )
+        self.critic_transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        self.critic_head = nn.Sequential(
+            nn.Linear(self.d_model, 512),
+            nn.GELU(),
+            nn.Linear(512, 1)
+        )
+        
+        self.apply(self._init_weights)
+        nn.init.orthogonal_(self.actor_head[-1].weight, gain=0.01)
+        nn.init.orthogonal_(self.critic_head[-1].weight, gain=1.0)
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
+            nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+            if module.bias is not None:
+                module.bias.data.fill_(0.0)
+
+    def _forward_critic(self, obs):
+        x = self.critic_projector(obs)
+        x = self.pos_encoder(x)
+        
+        # Reshape for transformer: [Sequence, Batch, Dim]
+        x = x.flatten(2).permute(2, 0, 1)
+        
+        x = self.critic_transformer(x)
+        x = x.mean(dim=0) # Global Average Pooling
+        
+        return self.critic_head(x)
+
+    def get_action_and_value(self, obs, all_obs_list):
+        h_actor = self.actor_backbone(obs)
+        logits = self.actor_head(h_actor)
         dist = Categorical(logits=logits)
         action = dist.sample()
-        value = self.get_value(critic_obs)
-        return action, dist.log_prob(action), value, dist.entropy()
+        log_prob = dist.log_prob(action)
+        
+        if all_obs_list[0].dim() == 4:
+            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
+        else:
+            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
+            
+        value = self._forward_critic(merged.to(obs.device)).squeeze(-1)
+        
+        return action, log_prob, value, dist.entropy()
 
-    def evaluate(self, obs, critic_obs, action):
-        logits = self.actor_head(self.actor_backbone(obs))
+    def get_value(self, all_obs_list):
+        if all_obs_list[0].dim() == 4:
+            merged = merge_obs_for_critic([o.squeeze(0) for o in all_obs_list]).unsqueeze(0)
+        else:
+            merged = merge_obs_for_critic(all_obs_list).unsqueeze(0)
+        
+        return self._forward_critic(merged.to(all_obs_list[0].device)).squeeze(-1)
+
+    def evaluate(self, obs, merged_obs, action, num_agents, obs_shape):
+        h_actor = self.actor_backbone(obs)
+        logits = self.actor_head(h_actor)
         dist = Categorical(logits=logits)
-        value = self.get_value(critic_obs)
-        return value, dist.log_prob(action), dist.entropy()
-
+        log_prob = dist.log_prob(action)
+        entropy = dist.entropy()
+        
+        value = self._forward_critic(merged_obs).squeeze(-1)
+        
+        return value, log_prob, entropy
+    
     def get_deterministic_action(self, obs):
-        logits = self.actor_head(self.actor_backbone(obs))
-        return logits.argmax(dim=-1)
+        with torch.no_grad():
+            h = self.actor_backbone(obs)
+            logits = self.actor_head(h)
+            return logits.argmax(dim=-1)
 
 
 def canonicalize_obs(obs, is_red_agent):
