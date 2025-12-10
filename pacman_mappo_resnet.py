@@ -49,17 +49,22 @@ BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1),
-            nn.GroupNorm(8, channels),
-            nn.GELU(),
-            nn.Conv2d(channels, channels, 3, padding=1),
-            nn.GroupNorm(8, channels),
-        )
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, stride=1)
+        self.gn1 = nn.GroupNorm(4, channels) 
         self.act = nn.GELU()
-
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, stride=1)
+        self.gn2 = nn.GroupNorm(4, channels)
+        
     def forward(self, x):
-        return self.act(x + self.net(x))
+        residual = x
+        out = self.conv1(x)
+        out = self.gn1(out)
+        out = self.act(out)
+        out = self.conv2(out)
+        out = self.gn2(out)
+        out += residual
+        out = self.act(out)
+        return out
 
 
 def make_backbone(in_channels):
@@ -69,8 +74,14 @@ def make_backbone(in_channels):
         nn.GELU(),
         ResidualBlock(32),
         ResidualBlock(32),
+        ResidualBlock(32),
         
         nn.Conv2d(32,64, 3, stride=2, padding=1),
+        nn.GELU(),
+        ResidualBlock(64),
+        ResidualBlock(64),
+        
+        nn.Conv2d(64, 128, 3, stride=2, padding=1),
         nn.GELU(),
         ResidualBlock(128),
         ResidualBlock(128),
@@ -79,8 +90,9 @@ def make_backbone(in_channels):
         nn.GELU(),
         ResidualBlock(256),
         ResidualBlock(256),
-        
+
         nn.AdaptiveAvgPool2d(1),
+
         nn.Flatten(),  # → 256
     )
 
