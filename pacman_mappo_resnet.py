@@ -64,13 +64,24 @@ class ResidualBlock(nn.Module):
 
 def make_backbone(in_channels):
     return nn.Sequential(
+        # 8 → 64, full res
         nn.Conv2d(in_channels, 32, 3, padding=1),
         nn.GELU(),
         ResidualBlock(32),
         ResidualBlock(32),
-        ResidualBlock(32),
         
-        nn.Flatten(),  # 16 × 20 × 20 = 6400
+        nn.Conv2d(32,64, 3, stride=2, padding=1),
+        nn.GELU(),
+        ResidualBlock(128),
+        ResidualBlock(128),
+        
+        nn.Conv2d(128, 256, 3, stride=2, padding=1),
+        nn.GELU(),
+        ResidualBlock(256),
+        ResidualBlock(256),
+        
+        nn.AdaptiveAvgPool2d(1),
+        nn.Flatten(),  # → 256
     )
 
 
@@ -78,60 +89,44 @@ class MAPPOAgent(nn.Module):
     def __init__(self, obs_shape, action_dim, num_agents=2):
         super().__init__()
         c, h, w = obs_shape
-        
-        # === ACTOR (ConvNet) ===
-        self.actor_backbone = make_backbone(c)
-        self.actor_head = nn.Sequential(
-            nn.Linear(12800, 512),
-            nn.GELU(),
-            nn.Linear(512, action_dim),
-        )
-        
-        # === CRITIC (Transformer) ===
-        self.d_model = 64
-        self.critic_proj = nn.Conv2d(c, self.d_model, 1)
-        
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.d_model,
-            nhead=4,
-            dim_feedforward=256,
-            dropout=0.0,
-            activation='gelu',
-            batch_first=True,
-        )
-        self.critic_encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
-        
-        self.critic_head = nn.Sequential(
-            nn.Linear(self.d_model, 256),
-            nn.GELU(),
-            nn.Linear(256, 1),
-        )
-        
-        nn.init.orthogonal_(self.actor_head[-1].weight, gain=0.01)
-        nn.init.orthogonal_(self.critic_head[-1].weight, gain=1.0)
 
-    def _forward_critic(self, obs):
-        x = self.critic_proj(obs)
-        B, C, H, W = x.shape
-        x = x.flatten(2).transpose(1, 2)  # (B, 400, 64)
-        x = self.critic_encoder(x)
-        x = x.mean(dim=1)  # global pool
-        return self.critic_head(x).squeeze(-1)
+        self.actor_backbone = make_backbone(c)
+        self.actor_head = nn.Linear(256, action_dim)
+
+        self.critic_backbone = make_backbone(c)
+        self.critic_head = nn.Linear(256, 1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
+        # PPO-specific: small init for policy, normal for value
+        nn.init.orthogonal_(self.actor_head.weight, gain=0.01)
+        nn.init.orthogonal_(self.critic_head.weight, gain=1.0)
 
     def get_value(self, state):
-        return self._forward_critic(state)
+        return self.critic_head(self.critic_backbone(state)).squeeze(-1)
 
     def get_action_and_value(self, obs, critic_obs):
         logits = self.actor_head(self.actor_backbone(obs))
         dist = Categorical(logits=logits)
         action = dist.sample()
-        value = self._forward_critic(critic_obs)
+        value = self.get_value(critic_obs)
         return action, dist.log_prob(action), value, dist.entropy()
 
     def evaluate(self, obs, critic_obs, action):
         logits = self.actor_head(self.actor_backbone(obs))
         dist = Categorical(logits=logits)
-        value = self._forward_critic(critic_obs)
+        value = self.get_value(critic_obs)
         return value, dist.log_prob(action), dist.entropy()
 
     def get_deterministic_action(self, obs):
