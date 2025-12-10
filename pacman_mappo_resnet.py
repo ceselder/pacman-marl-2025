@@ -44,59 +44,16 @@ START_UPDATES = 0
 
 BENCH_TEAMS = ['AstarTeam', 'approxQTeam', 'baselineTeam', 'MCTSTeam']
 
-
-class ResidualBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1),
-            nn.GroupNorm(8, channels),
-            nn.GELU(),
-            nn.Conv2d(channels, channels, 3, padding=1),
-            nn.GroupNorm(8, channels),
-        )
-        self.act = nn.GELU()
-
-    def forward(self, x):
-        return self.act(x + self.net(x))
-
-def make_actor_backbone(in_channels):
-    return nn.Sequential(
-        nn.Conv2d(in_channels, 64, 3, padding=1),
-        nn.GELU(),
-        ResidualBlock(64),
-        
-        nn.Conv2d(64, 128, 3, padding=1),
-        nn.GELU(),
-        ResidualBlock(128),
-        
-        nn.Conv2d(128, 512, 3, padding=1),
-        nn.GELU(),
-        ResidualBlock(512),
-        
-        nn.AdaptiveAvgPool2d(1),
-        nn.Flatten(),
-    )
-
-
 class MAPPOAgent(nn.Module):
     def __init__(self, obs_shape, action_dim, num_agents=2):
         super().__init__()
         c, h, w = obs_shape
-        
-        # === ACTOR (CNN) ===
-        self.actor_backbone = make_actor_backbone(c)
-        self.actor_head = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.GELU(),
-            nn.Linear(256, action_dim),
-        )
-        
-        # === CRITIC (Transformer) ===
         self.d_model = 128
         
-        self.critic_proj = nn.Sequential(
-            nn.Conv2d(c, 64, 3, padding=1),
+        self.proj = nn.Sequential(
+            nn.Conv2d(c, 32, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(32, 64, 3, padding=1),
             nn.GELU(),
             nn.Conv2d(64, self.d_model, 1),
         )
@@ -104,62 +61,76 @@ class MAPPOAgent(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.d_model,
             nhead=4,
-            dim_feedforward=(self.d_model * 4),
+            dim_feedforward=512,
             dropout=0.0,
             activation='gelu',
             batch_first=True,
             norm_first=True,
         )
-        self.critic_transformer = nn.TransformerEncoder(encoder_layer, num_layers=3)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=3)
         
-        self.critic_head = nn.Sequential(
-            nn.Linear(self.d_model, 128),
-            nn.GELU(),
-            nn.Linear(128, 1),
+        # === ACTOR (learnable action queries) ===
+        self.action_queries = nn.Parameter(torch.randn(action_dim, self.d_model))
+        
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=self.d_model,
+            nhead=4,
+            dim_feedforward=512,
+            dropout=0.0,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
         )
+        self.actor_decoder = nn.TransformerDecoder(decoder_layer, num_layers=2)
+        self.actor_head = nn.Linear(self.d_model, 1)  # each query → one logit
         
-        self._init_weights()
+        # === CRITIC (learnable value query) ===
+        self.value_query = nn.Parameter(torch.randn(1, self.d_model))
+        self.critic_decoder = nn.TransformerDecoder(decoder_layer, num_layers=2)
+        self.critic_head = nn.Linear(self.d_model, 1)
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-        
-        nn.init.orthogonal_(self.actor_head[-1].weight, gain=0.01)
-        nn.init.orthogonal_(self.critic_head[-1].weight, gain=1.0)
-
-    def _forward_critic(self, state):
-        x = self.critic_proj(state)
+    def _encode(self, obs):
+        x = self.proj(obs)
         B, C, H, W = x.shape
-        x = x.flatten(2).transpose(1, 2)
-        x = self.critic_transformer(x)
-        x = x.mean(dim=1)
-        return self.critic_head(x).squeeze(-1)
+        x = x.flatten(2).transpose(1, 2)  # (B, H*W, d_model)
+        return self.encoder(x)
+
+    def _forward_actor(self, obs):
+        memory = self._encode(obs)  # (B, 400, 128)
+        B = memory.shape[0]
+        
+        queries = self.action_queries.unsqueeze(0).expand(B, -1, -1)  # (B, 5, 128)
+        decoded = self.actor_decoder(queries, memory)  # (B, 5, 128)
+        logits = self.actor_head(decoded).squeeze(-1)  # (B, 5)
+        return logits
+
+    def _forward_critic(self, obs):
+        memory = self._encode(obs)
+        B = memory.shape[0]
+        
+        query = self.value_query.unsqueeze(0).expand(B, -1, -1)  # (B, 1, 128)
+        decoded = self.critic_decoder(query, memory)  # (B, 1, 128)
+        value = self.critic_head(decoded).squeeze(-1).squeeze(-1)  # (B,)
+        return value
 
     def get_value(self, state):
         return self._forward_critic(state)
 
     def get_action_and_value(self, obs, critic_obs):
-        logits = self.actor_head(self.actor_backbone(obs))
+        logits = self._forward_actor(obs)
         dist = Categorical(logits=logits)
         action = dist.sample()
         value = self._forward_critic(critic_obs)
         return action, dist.log_prob(action), value, dist.entropy()
 
     def evaluate(self, obs, critic_obs, action):
-        logits = self.actor_head(self.actor_backbone(obs))
+        logits = self._forward_actor(obs)
         dist = Categorical(logits=logits)
         value = self._forward_critic(critic_obs)
         return value, dist.log_prob(action), dist.entropy()
 
     def get_deterministic_action(self, obs):
-        logits = self.actor_head(self.actor_backbone(obs))
+        logits = self._forward_actor(obs)
         return logits.argmax(dim=-1)
 
 
@@ -203,14 +174,14 @@ def compute_heuristic_shaping(obs_curr, obs_next):
     pos_curr, carry_curr = get_agent_state(obs_curr)
     pos_next, carry_next = get_agent_state(obs_next)
 
-    living_punishment = -0.1
+    living_punishment = -0.15
     
     dist_moved = abs(pos_curr[0] - pos_next[0]) + abs(pos_curr[1] - pos_next[1])
     if dist_moved > 1.5:
         return living_punishment - 0.5 - (0.25 * carry_curr)
     
     if dist_moved < 0.1:
-        return living_punishment - 0.075 
+        return living_punishment - 0.05 #small nudge to not stand still
 
     return living_punishment
 
