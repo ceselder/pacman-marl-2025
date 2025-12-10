@@ -64,24 +64,24 @@ class ResidualBlock(nn.Module):
 
 def make_backbone(in_channels):
     return nn.Sequential(
-        nn.Conv2d(in_channels, 64, 3, padding=1),
+        nn.Conv2d(in_channels, 16, 3, padding=1),
+        nn.GELU(),
+        ResidualBlock(16),
+        ResidualBlock(16),
+        
+        nn.Conv2d(16, 32, 3, stride=2, padding=1),  # 20 → 10
+        nn.GELU(),
+        ResidualBlock(32),
+        ResidualBlock(32),
+        
+        nn.Conv2d(32, 64, 3, stride=2, padding=1),  # 10 → 5
         nn.GELU(),
         ResidualBlock(64),
         ResidualBlock(64),
         
-        nn.Conv2d(64, 128, 3, padding=1),
-        nn.GELU(),
-        ResidualBlock(128),
-        ResidualBlock(128),
-        
-        nn.Conv2d(128, 256, 3, padding=1),
-        nn.GELU(),
-        ResidualBlock(256),
-        ResidualBlock(256),
-        
-        nn.AdaptiveAvgPool2d(1),
-        nn.Flatten(),
+        nn.Flatten(),  # 64 × 5 × 5 = 1600
     )
+
 
 
 class MAPPOAgent(nn.Module):
@@ -90,19 +90,20 @@ class MAPPOAgent(nn.Module):
         c, h, w = obs_shape
         
         self.actor_backbone = make_backbone(c)
+        
         self.actor_head = nn.Sequential(
-            nn.Linear(256, 128),
+            nn.Linear(1600, 512),
             nn.GELU(),
-            nn.Linear(128, action_dim),
+            nn.Linear(512, action_dim),
         )
-        
-        self.critic_backbone = make_backbone(c)
+
         self.critic_head = nn.Sequential(
-            nn.Linear(256, 128),
+            nn.Linear(1600, 512),
             nn.GELU(),
-            nn.Linear(128, 1),
+            nn.Linear(512, 1),
         )
-        
+                
+        self.critic_backbone = make_backbone(c)
         nn.init.orthogonal_(self.actor_head[-1].weight, gain=0.01)
         nn.init.orthogonal_(self.critic_head[-1].weight, gain=1.0)
 
@@ -110,6 +111,8 @@ class MAPPOAgent(nn.Module):
         return self.critic_head(self.critic_backbone(state)).squeeze(-1)
 
     def get_action_and_value(self, obs, critic_obs):
+
+        print(f"Output Shape: {self.actor_backbone(obs).shape}")
         logits = self.actor_head(self.actor_backbone(obs))
         dist = Categorical(logits=logits)
         action = dist.sample()
