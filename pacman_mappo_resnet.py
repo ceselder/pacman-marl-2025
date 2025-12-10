@@ -82,11 +82,7 @@ class MAPPOAgent(nn.Module):
         
         # === CRITIC ENCODER ===
         self.critic_proj = nn.Sequential(
-            nn.Conv2d(c, 16, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(16, 32, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(32, self.d_model, 1),
+           nn.Conv2d(c, self.d_model, 1),
         )
         
         critic_encoder_layer = nn.TransformerEncoderLayer(
