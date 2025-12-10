@@ -52,11 +52,7 @@ class MAPPOAgent(nn.Module):
         
         # === ACTOR ENCODER ===
         self.actor_proj = nn.Sequential(
-            nn.Conv2d(c, 32, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(32, 64, 3,  padding=1),
-            nn.GELU(),
-            nn.Conv2d(64, self.d_model, 1),
+            nn.Conv2d(c, self.d_model, 1),
         )
         
         actor_encoder_layer = nn.TransformerEncoderLayer(
