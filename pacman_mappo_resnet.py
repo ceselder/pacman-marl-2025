@@ -54,7 +54,7 @@ class MAPPOAgent(nn.Module):
         self.actor_proj = nn.Sequential(
             nn.Conv2d(c, 32, 3, padding=1),
             nn.GELU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1),  # 20→10
+            nn.Conv2d(32, 64, 3,  padding=1),
             nn.GELU(),
             nn.Conv2d(64, self.d_model, 1),
         )
@@ -218,7 +218,7 @@ def compute_heuristic_shaping(obs_curr, obs_next):
     pos_curr, carry_curr = get_agent_state(obs_curr)
     pos_next, carry_next = get_agent_state(obs_next)
 
-    living_punishment = -0.15
+    living_punishment = -0.25 #make it hate being alive so cant just go farm yeah
     
     dist_moved = abs(pos_curr[0] - pos_next[0]) + abs(pos_curr[1] - pos_next[1])
     if dist_moved > 1.5:
